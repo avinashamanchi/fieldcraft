@@ -12,6 +12,7 @@ import Expenses from './pages/Expenses'
 import Settings from './pages/Settings'
 import VoiceInvoice from './pages/VoiceInvoice'
 import Onboarding from './pages/Onboarding'
+import DemoTour from './pages/DemoTour'
 import Landing from './pages/Landing'
 import Login from './pages/Login'
 import Signup from './pages/Signup'
@@ -82,7 +83,18 @@ export default function App() {
     )
   }
 
-  // Fully authenticated + onboarded → full app
+  // Onboarded but hasn't seen the demo tour → show it once
+  if (!userProfile.hasSeenDemo) {
+    return (
+      <HashRouter>
+        <Routes>
+          <Route path="*" element={<DemoTour />} />
+        </Routes>
+      </HashRouter>
+    )
+  }
+
+  // Fully authenticated + onboarded + demo seen → full app
   return (
     <HashRouter>
       <Routes>

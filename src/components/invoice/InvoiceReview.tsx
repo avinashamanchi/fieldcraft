@@ -1,8 +1,9 @@
 import { useState } from 'react'
-import { motion } from 'framer-motion'
-import { Plus, Trash2, FileText, Printer } from 'lucide-react'
+import { motion, AnimatePresence } from 'framer-motion'
+import { Plus, Trash2, FileText, Printer, ChevronDown, Clock, DollarSign } from 'lucide-react'
 import { v4 as uuid } from 'uuid'
 import Button from '../ui/Button'
+import { useStore } from '../../store/useStore'
 import type { ParsedInvoice } from '../../lib/groq'
 import type { LineItem, TradeType } from '../../types'
 
@@ -15,7 +16,9 @@ interface InvoiceReviewProps {
 }
 
 export default function InvoiceReview({ parsed, onConfirm, onBack, onExportPDF, isSubmitting }: InvoiceReviewProps) {
+  const { services } = useStore()
   const [data, setData] = useState<ParsedInvoice>(parsed)
+  const [showServices, setShowServices] = useState(false)
 
   const formatCurrency = (n: number) =>
     new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(n)
@@ -46,6 +49,39 @@ export default function InvoiceReview({ parsed, onConfirm, onBack, onExportPDF, 
   const addLineItem = () => {
     const newItem: LineItem = { id: uuid(), description: '', quantity: 1, unitPrice: 0, total: 0, type: 'material' }
     setData((d) => ({ ...d, lineItems: [...d.lineItems, newItem] }))
+  }
+
+  const addServiceAsLineItem = (svcId: string) => {
+    const svc = services.find((s) => s.id === svcId)
+    if (!svc) return
+
+    const newItems: LineItem[] = [...data.lineItems]
+
+    // Add the service line item
+    newItems.push({
+      id: uuid(),
+      description: svc.description ? `${svc.name} — ${svc.description}` : svc.name,
+      quantity: 1,
+      unitPrice: svc.defaultPrice,
+      total: svc.defaultPrice,
+      type: 'material',
+    })
+
+    // Optionally add labor if estimated hours > 0
+    if (svc.estimatedHours > 0) {
+      newItems.push({
+        id: uuid(),
+        description: `Labor — ${svc.name} (${svc.estimatedHours}h)`,
+        quantity: svc.estimatedHours,
+        unitPrice: data.laborRate,
+        total: svc.estimatedHours * data.laborRate,
+        type: 'labor',
+      })
+    }
+
+    const { subtotal, taxAmount, total } = recalculate(newItems)
+    setData((d) => ({ ...d, lineItems: newItems, subtotal, taxAmount, total }))
+    setShowServices(false)
   }
 
   return (
@@ -98,10 +134,65 @@ export default function InvoiceReview({ parsed, onConfirm, onBack, onExportPDF, 
       <div>
         <div className="flex items-center justify-between mb-2">
           <label className="text-xs text-gray-400 font-medium">LINE ITEMS</label>
-          <button onClick={addLineItem} className="text-orange-400 hover:text-orange-300 flex items-center gap-1 text-xs font-medium">
-            <Plus size={13} /> Add item
-          </button>
+          <div className="flex items-center gap-2">
+            {services.length > 0 && (
+              <button
+                onClick={() => setShowServices(!showServices)}
+                className="flex items-center gap-1 text-blue-400 hover:text-blue-300 text-xs font-medium cursor-pointer"
+              >
+                From Services
+                <motion.span animate={{ rotate: showServices ? 180 : 0 }} transition={{ duration: 0.2 }}>
+                  <ChevronDown size={12} />
+                </motion.span>
+              </button>
+            )}
+            <button onClick={addLineItem} className="text-orange-400 hover:text-orange-300 flex items-center gap-1 text-xs font-medium cursor-pointer">
+              <Plus size={13} /> Add item
+            </button>
+          </div>
         </div>
+
+        {/* Services quick-add panel */}
+        <AnimatePresence>
+          {showServices && services.length > 0 && (
+            <motion.div
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: 'auto', opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              transition={{ duration: 0.2 }}
+              className="overflow-hidden mb-2"
+            >
+              <div className="bg-[#1A1A1A] border border-blue-500/20 rounded-xl p-3 space-y-2">
+                <p className="text-blue-400 text-[10px] font-bold uppercase tracking-wider mb-2">Tap to add service</p>
+                {services.map((svc) => (
+                  <button
+                    key={svc.id}
+                    onClick={() => addServiceAsLineItem(svc.id)}
+                    className="w-full flex items-center justify-between bg-white/5 hover:bg-white/10 border border-white/5 hover:border-blue-500/30 rounded-lg px-3 py-2.5 text-left transition-colors cursor-pointer"
+                  >
+                    <div className="flex-1 min-w-0 mr-3">
+                      <p className="text-warm-white text-xs font-semibold truncate">{svc.name}</p>
+                      {svc.description && (
+                        <p className="text-gray-500 text-[10px] truncate mt-0.5">{svc.description}</p>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-2 flex-shrink-0">
+                      {svc.estimatedHours > 0 && (
+                        <div className="flex items-center gap-0.5 text-gray-500 text-[10px]">
+                          <Clock size={9} />{svc.estimatedHours}h
+                        </div>
+                      )}
+                      <div className="flex items-center gap-0.5 text-orange-400 text-xs font-bold">
+                        <DollarSign size={10} />{svc.defaultPrice.toFixed(0)}
+                      </div>
+                      <Plus size={13} className="text-blue-400" />
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
 
         <div className="space-y-2">
           {data.lineItems.map((item, idx) => (
@@ -126,7 +217,7 @@ export default function InvoiceReview({ parsed, onConfirm, onBack, onExportPDF, 
                   placeholder="Description"
                   className="flex-1 bg-transparent text-warm-white text-sm focus:outline-none placeholder-gray-500"
                 />
-                <button onClick={() => removeLineItem(idx)} className="text-gray-600 hover:text-red-400 flex-shrink-0">
+                <button onClick={() => removeLineItem(idx)} className="text-gray-600 hover:text-red-400 flex-shrink-0 cursor-pointer">
                   <Trash2 size={14} />
                 </button>
               </div>

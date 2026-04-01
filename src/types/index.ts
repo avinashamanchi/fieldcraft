@@ -80,6 +80,15 @@ export interface Job {
   updatedAt: string
 }
 
+export interface Service {
+  id: string
+  name: string
+  description: string       // what's included
+  estimatedHours: number
+  defaultPrice: number
+  category?: string
+}
+
 export interface UserProfile {
   name: string
   businessName: string
@@ -90,7 +99,9 @@ export interface UserProfile {
   address?: string
   taxRate: number
   licenseNumber?: string
+  logoDataUrl?: string
   onboardingComplete: boolean
+  hasSeenDemo?: boolean
 }
 
 export interface InventoryItem {

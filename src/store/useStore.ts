@@ -1,14 +1,16 @@
 import { create } from 'zustand'
 import { persist, createJSONStorage } from 'zustand/middleware'
-import type { Job, Client, Expense, Invoice, UserProfile, InventoryItem } from '../types'
-import {
-  SEED_JOBS,
-  SEED_CLIENTS,
-  SEED_EXPENSES,
-  SEED_INVOICES,
-  SEED_INVENTORY,
-  SEED_USER,
-} from '../constants/seed-data'
+import type { Job, Client, Expense, Invoice, UserProfile, InventoryItem, Service, TradeType } from '../types'
+
+const DEFAULT_PROFILE: UserProfile = {
+  name: '',
+  businessName: '',
+  tradeType: 'General' as TradeType,
+  hourlyRate: 95,
+  taxRate: 0.08,
+  onboardingComplete: false,
+  hasSeenDemo: false,
+}
 
 interface AppState {
   jobs: Job[]
@@ -16,6 +18,7 @@ interface AppState {
   expenses: Expense[]
   invoices: Invoice[]
   inventory: InventoryItem[]
+  services: Service[]
   userProfile: UserProfile
   hydrated: boolean
 
@@ -43,6 +46,11 @@ interface AppState {
   updateInventoryItem: (id: string, updates: Partial<InventoryItem>) => void
   deleteInventoryItem: (id: string) => void
 
+  // Services
+  addService: (service: Service) => void
+  updateService: (id: string, updates: Partial<Service>) => void
+  deleteService: (id: string) => void
+
   // User
   updateUserProfile: (updates: Partial<UserProfile>) => void
 
@@ -52,12 +60,13 @@ interface AppState {
 export const useStore = create<AppState>()(
   persist(
     (set) => ({
-      jobs: SEED_JOBS,
-      clients: SEED_CLIENTS,
-      expenses: SEED_EXPENSES,
-      invoices: SEED_INVOICES,
-      inventory: SEED_INVENTORY,
-      userProfile: { ...SEED_USER, onboardingComplete: false },
+      jobs: [],
+      clients: [],
+      expenses: [],
+      invoices: [],
+      inventory: [],
+      services: [],
+      userProfile: { ...DEFAULT_PROFILE },
       hydrated: false,
 
       addJob: (job) => set((s) => ({ jobs: [job, ...s.jobs] })),
@@ -85,6 +94,11 @@ export const useStore = create<AppState>()(
       updateInventoryItem: (id, updates) =>
         set((s) => ({ inventory: s.inventory.map((i) => (i.id === id ? { ...i, ...updates } : i)) })),
       deleteInventoryItem: (id) => set((s) => ({ inventory: s.inventory.filter((i) => i.id !== id) })),
+
+      addService: (service) => set((s) => ({ services: [service, ...s.services] })),
+      updateService: (id, updates) =>
+        set((s) => ({ services: s.services.map((sv) => (sv.id === id ? { ...sv, ...updates } : sv)) })),
+      deleteService: (id) => set((s) => ({ services: s.services.filter((sv) => sv.id !== id) })),
 
       updateUserProfile: (updates) =>
         set((s) => ({ userProfile: { ...s.userProfile, ...updates } })),

@@ -29,11 +29,24 @@ export function generateInvoicePDF(invoice: Invoice, job: Job, userProfile: User
   doc.setFillColor(...orange)
   doc.rect(0, 0, pageW, 12, 'F')
 
-  // Business name in header
+  // Logo or business name in header
   doc.setTextColor(255, 255, 255)
   doc.setFontSize(11)
   doc.setFont('helvetica', 'bold')
-  doc.text(userProfile.businessName.toUpperCase(), margin, 8)
+
+  if (userProfile.logoDataUrl) {
+    try {
+      // Determine image format from data URL
+      const fmt = userProfile.logoDataUrl.startsWith('data:image/png') ? 'PNG'
+        : userProfile.logoDataUrl.startsWith('data:image/svg') ? 'SVG'
+        : 'JPEG'
+      doc.addImage(userProfile.logoDataUrl, fmt, margin, 1, 0, 10)
+    } catch {
+      doc.text(userProfile.businessName.toUpperCase(), margin, 8)
+    }
+  } else {
+    doc.text(userProfile.businessName.toUpperCase(), margin, 8)
+  }
 
   y = 24
 
