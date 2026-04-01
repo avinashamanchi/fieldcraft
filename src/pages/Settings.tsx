@@ -1,7 +1,8 @@
 import { useState } from 'react'
 import { motion } from 'framer-motion'
-import { User, Briefcase, DollarSign, Phone, CheckCircle, Package } from 'lucide-react'
+import { User, Briefcase, CheckCircle, Package, LogOut } from 'lucide-react'
 import { useStore } from '../store/useStore'
+import { logout, getAccount } from '../lib/auth'
 import Button from '../components/ui/Button'
 import type { TradeType } from '../types'
 
@@ -13,6 +14,8 @@ export default function Settings() {
   const [saved, setSaved] = useState(false)
   const [newItem, setNewItem] = useState({ name: '', quantity: 0, unit: 'ea', minStock: 1 })
   const [showAddItem, setShowAddItem] = useState(false)
+  const [showLogoutConfirm, setShowLogoutConfirm] = useState(false)
+  const account = getAccount()
 
   const handleSave = () => {
     updateUserProfile({ ...form, onboardingComplete: true })
@@ -150,6 +153,42 @@ export default function Settings() {
               )
             })}
           </div>
+        </div>
+
+        {/* Account */}
+        <div className="bg-[#242424] border border-white/5 rounded-2xl p-4">
+          <h2 className="text-sm font-semibold text-warm-white flex items-center gap-2 mb-3">
+            <User size={14} className="text-gray-400" /> Account
+          </h2>
+          {account && (
+            <p className="text-gray-400 text-xs mb-3">Signed in as <span className="text-warm-white">{account.email}</span></p>
+          )}
+          {!showLogoutConfirm ? (
+            <button
+              onClick={() => setShowLogoutConfirm(true)}
+              className="flex items-center gap-2 text-red-400 hover:text-red-300 text-sm font-medium transition-colors cursor-pointer"
+            >
+              <LogOut size={15} /> Sign Out
+            </button>
+          ) : (
+            <div className="space-y-2">
+              <p className="text-gray-400 text-xs">Are you sure you want to sign out?</p>
+              <div className="flex gap-2">
+                <button
+                  onClick={logout}
+                  className="flex-1 py-2.5 rounded-xl bg-red-500/15 border border-red-500/20 text-red-400 text-sm font-semibold hover:bg-red-500/25 transition-colors cursor-pointer"
+                >
+                  Yes, Sign Out
+                </button>
+                <button
+                  onClick={() => setShowLogoutConfirm(false)}
+                  className="flex-1 py-2.5 rounded-xl bg-white/5 border border-white/10 text-gray-400 text-sm font-semibold hover:bg-white/10 transition-colors cursor-pointer"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* About */}
