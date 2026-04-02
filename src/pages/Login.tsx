@@ -2,12 +2,11 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { motion } from 'framer-motion'
 import { Wrench, Eye, EyeOff, ArrowLeft, Loader2, AlertCircle } from 'lucide-react'
-import { loginWithPassword, getAccount } from '../lib/auth'
+import { signIn } from '../lib/auth'
 
 export default function Login() {
   const navigate = useNavigate()
-  const account = getAccount()
-  const [form, setForm] = useState({ email: account?.email ?? '', password: '' })
+  const [form, setForm] = useState({ email: '', password: '' })
   const [showPw, setShowPw] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
@@ -18,12 +17,12 @@ export default function Login() {
     setLoading(true)
 
     try {
-      const ok = await loginWithPassword(form.email, form.password)
-      if (!ok) {
-        setError('Incorrect email or password.')
+      const { error: signInError } = await signIn(form.email.trim().toLowerCase(), form.password)
+      if (signInError) {
+        setError(signInError === 'Invalid login credentials' ? 'Incorrect email or password.' : signInError)
         setLoading(false)
       }
-      // On success: loginWithPassword dispatches auth change event → App.tsx re-renders
+      // On success: supabase.auth.onAuthStateChange fires → App.tsx re-renders
     } catch {
       setError('Something went wrong. Please try again.')
       setLoading(false)
@@ -56,18 +55,12 @@ export default function Login() {
           transition={{ duration: 0.4 }}
         >
           <h1 className="text-3xl font-black text-warm-white mb-1">Welcome back.</h1>
-          {account ? (
-            <p className="text-gray-400 text-sm mb-8">
-              Signed in as <span className="text-orange-400 font-medium">{account.email}</span>
-            </p>
-          ) : (
-            <p className="text-gray-400 text-sm mb-8">
-              New here?{' '}
-              <button onClick={() => navigate('/signup')} className="text-orange-400 hover:text-orange-300 font-semibold cursor-pointer">
-                Create account
-              </button>
-            </p>
-          )}
+          <p className="text-gray-400 text-sm mb-8">
+            New here?{' '}
+            <button onClick={() => navigate('/signup')} className="text-orange-400 hover:text-orange-300 font-semibold cursor-pointer">
+              Create account
+            </button>
+          </p>
 
           <form onSubmit={handleSubmit} className="space-y-4">
             {/* Email */}
@@ -81,9 +74,8 @@ export default function Login() {
                 onChange={(e) => setForm({ ...form, email: e.target.value })}
                 placeholder="you@example.com"
                 autoComplete="email"
-                autoFocus={!account}
-                disabled={!!account}
-                className="w-full bg-[#242424] border border-white/10 rounded-2xl px-4 py-3.5 text-warm-white text-base placeholder-gray-500 focus:outline-none focus:border-orange-500 transition-colors disabled:opacity-50"
+                autoFocus
+                className="w-full bg-[#242424] border border-white/10 rounded-2xl px-4 py-3.5 text-warm-white text-base placeholder-gray-500 focus:outline-none focus:border-orange-500 transition-colors"
               />
             </div>
 
@@ -99,7 +91,6 @@ export default function Login() {
                   onChange={(e) => setForm({ ...form, password: e.target.value })}
                   placeholder="Your password"
                   autoComplete="current-password"
-                  autoFocus={!!account}
                   className="w-full bg-[#242424] border border-white/10 rounded-2xl px-4 py-3.5 pr-12 text-warm-white text-base placeholder-gray-500 focus:outline-none focus:border-orange-500 transition-colors"
                 />
                 <button
@@ -133,21 +124,6 @@ export default function Login() {
               {loading ? <Loader2 size={18} className="animate-spin" /> : 'Log In'}
             </button>
           </form>
-
-          {/* Divider + alternate account */}
-          {account && (
-            <div className="mt-6 text-center">
-              <p className="text-gray-600 text-xs">
-                Not {account.email}?{' '}
-                <button
-                  onClick={() => navigate('/signup')}
-                  className="text-gray-500 hover:text-gray-300 underline cursor-pointer"
-                >
-                  Create new account
-                </button>
-              </p>
-            </div>
-          )}
         </motion.div>
       </div>
     </div>

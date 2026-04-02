@@ -1,0 +1,44 @@
+name: Setup Supabase Backend
+
+on:
+  workflow_dispatch:
+    inputs:
+      supabase_token:
+        description: |
+          Supabase Personal Access Token
+          Get it from: supabase.com/dashboard/account/tokens
+        required: true
+        type: string
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: pip install PyNaCl
+
+      - name: Run Supabase setup
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+          GITHUB_REPO: ${{ github.repository }}
+        run: python scripts/setup-supabase.py
+
+      - name: Trigger redeploy
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GH_PAT }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'deploy.yml',
+              ref: 'main'
+            })
+            console.log('Triggered deploy workflow — site will be live in ~2 minutes')

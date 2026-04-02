@@ -2,7 +2,8 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { motion } from 'framer-motion'
 import { Wrench, Eye, EyeOff, ArrowLeft, Loader2, AlertCircle } from 'lucide-react'
-import { createAccount, getAccount } from '../lib/auth'
+import { signUp } from '../lib/auth'
+import VerifyEmail from './VerifyEmail'
 
 export default function Signup() {
   const navigate = useNavigate()
@@ -10,6 +11,8 @@ export default function Signup() {
   const [showPw, setShowPw] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const [pendingVerification, setPendingVerification] = useState(false)
+  const [submittedEmail, setSubmittedEmail] = useState('')
 
   const passwordStrength = (() => {
     const p = form.password
@@ -39,24 +42,30 @@ export default function Signup() {
       return
     }
     if (form.password !== form.confirm) {
-      setError('Passwords don\'t match.')
-      return
-    }
-
-    const existing = getAccount()
-    if (existing) {
-      setError('An account already exists on this device. Log in instead.')
+      setError("Passwords don't match.")
       return
     }
 
     setLoading(true)
     try {
-      await createAccount(emailTrimmed, form.password)
-      // createAccount dispatches auth change event → App.tsx re-renders → shows Onboarding
+      const { error: signUpError } = await signUp(emailTrimmed, form.password)
+      if (signUpError) {
+        setError(signUpError)
+        setLoading(false)
+        return
+      }
+      // Show email verification screen
+      setSubmittedEmail(emailTrimmed)
+      setPendingVerification(true)
     } catch {
       setError('Something went wrong. Please try again.')
       setLoading(false)
     }
+  }
+
+  // Show verification pending screen after signup
+  if (pendingVerification) {
+    return <VerifyEmail email={submittedEmail} />
   }
 
   return (
