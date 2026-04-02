@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import { motion } from 'framer-motion'
 import { User, Briefcase, CheckCircle, Package, LogOut, ImagePlus, X, Pencil, Trash2, Clock, DollarSign, List } from 'lucide-react'
 import { useStore } from '../store/useStore'
@@ -25,10 +25,16 @@ export default function Settings() {
   const logoInputRef = useRef<HTMLInputElement>(null)
   const [userEmail, setUserEmail] = useState<string>('')
 
-  // Get current user email from Supabase
-  supabase.auth.getUser().then(({ data }) => {
-    if (data.user?.email) setUserEmail(data.user.email)
-  })
+  useEffect(() => {
+    supabase.auth.getUser().then(({ data }) => {
+      if (data.user?.email) setUserEmail(data.user.email)
+    })
+  }, [])
+
+  // Keep form in sync when userProfile loads from Supabase
+  useEffect(() => {
+    setForm({ ...userProfile })
+  }, [userProfile.name, userProfile.businessName, userProfile.tradeType, userProfile.hourlyRate, userProfile.taxRate])
 
   const handleSave = () => {
     updateUserProfile({ ...form, onboardingComplete: true })

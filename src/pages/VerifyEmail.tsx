@@ -115,6 +115,13 @@ export default function VerifyEmail({ email }: VerifyEmailProps) {
             </a>{' '}
             to get started.
           </p>
+
+          <div className="mt-6 bg-blue-500/10 border border-blue-500/20 rounded-xl p-3 text-left">
+            <p className="text-blue-400 text-xs font-semibold mb-1">Link going to localhost?</p>
+            <p className="text-blue-300/70 text-xs leading-relaxed">
+              Run the "Setup Supabase Backend" workflow in GitHub Actions — it configures your Supabase project's redirect URLs to point to this app.
+            </p>
+          </div>
         </motion.div>
       </div>
     </div>

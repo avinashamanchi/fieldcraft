@@ -26,30 +26,50 @@ export function isSupabaseConfigured(): boolean {
 export async function handleAuthCallback(): Promise<void> {
   const search = window.location.search
   const hash = window.location.hash
+  const params = new URLSearchParams(search)
+
+  // Handle token_hash flow (Supabase v2 newer format for email verification)
+  const tokenHash = params.get('token_hash')
+  const type = params.get('type') as 'signup' | 'recovery' | 'email_change' | null
+  if (tokenHash && type) {
+    try {
+      await supabase.auth.verifyOtp({ token_hash: tokenHash, type })
+      window.history.replaceState(null, '', window.location.pathname + '#/')
+    } catch (err) {
+      console.error('token_hash verification error:', err)
+    }
+    return
+  }
 
   // Handle PKCE code exchange (Supabase v2 default)
   if (search.includes('code=')) {
-    const code = new URLSearchParams(search).get('code') ?? ''
+    const code = params.get('code') ?? ''
     if (code) {
-      const { data } = await supabase.auth.exchangeCodeForSession(code)
-      if (data.session) {
-        // Clean URL and redirect to home
-        window.history.replaceState(null, '', window.location.pathname + '#/')
+      try {
+        const { data } = await supabase.auth.exchangeCodeForSession(code)
+        if (data.session) {
+          window.history.replaceState(null, '', window.location.pathname + '#/')
+        }
+      } catch (err) {
+        console.error('exchangeCodeForSession error:', err)
       }
     }
     return
   }
 
-  // Handle implicit flow (access_token in hash fragment, outside of HashRouter path)
-  // With HashRouter the hash is like #/route, but auth callbacks come as #access_token=...
+  // Handle implicit flow (access_token in hash, before HashRouter can intercept)
+  // HashRouter uses #/route format; auth callbacks arrive as #access_token=...
   if (hash && hash.includes('access_token=') && !hash.startsWith('#/')) {
-    const hashContent = hash.slice(1)
-    const params = new URLSearchParams(hashContent)
-    const accessToken = params.get('access_token')
-    const refreshToken = params.get('refresh_token')
+    const hashParams = new URLSearchParams(hash.slice(1))
+    const accessToken = hashParams.get('access_token')
+    const refreshToken = hashParams.get('refresh_token')
     if (accessToken && refreshToken) {
-      await supabase.auth.setSession({ access_token: accessToken, refresh_token: refreshToken })
-      window.history.replaceState(null, '', window.location.pathname + '#/')
+      try {
+        await supabase.auth.setSession({ access_token: accessToken, refresh_token: refreshToken })
+        window.history.replaceState(null, '', window.location.pathname + '#/')
+      } catch (err) {
+        console.error('setSession error:', err)
+      }
     }
   }
 }

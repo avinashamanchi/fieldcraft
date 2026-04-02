@@ -47,7 +47,7 @@ export default function VoiceInvoice() {
       let clientId = clients.find((c) => c.name.toLowerCase() === data.clientName.toLowerCase())?.id
       if (!clientId) {
         clientId = uuid()
-        addClient({
+        await addClient({
           id: clientId,
           name: data.clientName,
           phone: '',
@@ -93,8 +93,8 @@ export default function VoiceInvoice() {
         updatedAt: now,
       }
 
-      addInvoice(invoice)
-      addJob(job)
+      await addInvoice(invoice)
+      await addJob(job)
       setSavedJobId(jobId)
       setStep('success')
     } finally {

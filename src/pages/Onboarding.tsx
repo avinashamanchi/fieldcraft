@@ -19,8 +19,8 @@ export default function Onboarding() {
     hourlyRate: 95,
   })
 
-  const handleFinish = () => {
-    updateUserProfile({
+  const handleFinish = async () => {
+    await updateUserProfile({
       ...form,
       onboardingComplete: true,
     })

@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import { supabase } from '../lib/supabase'
-import type { Job, Client, Expense, Invoice, UserProfile, InventoryItem, Service, TradeType } from '../types'
+import type { Job, Client, Expense, Invoice, UserProfile, InventoryItem, Service, TradeType, JobStatus } from '../types'
 
 const DEFAULT_PROFILE: UserProfile = {
   name: '',
@@ -58,7 +58,7 @@ function jobFromDb(r: Record<string, any>): Job {
     clientName: r.client_name ?? '',
     title: r.title ?? '',
     tradeType: (r.trade_type ?? 'General') as TradeType,
-    status: r.status ?? 'Quoted',
+    status: (r.status ?? 'Scheduled') as JobStatus,
     description: r.notes ?? '',
     address: r.address ?? '',
     laborHours: Number(r.labor_hours ?? 0),

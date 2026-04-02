@@ -62,7 +62,7 @@ function SetupRequired() {
     {
       num: '3',
       title: 'Run the Setup Workflow',
-      desc: 'Go to GitHub Actions → "Setup Supabase Backend" → click "Run workflow" → paste your token → Run',
+      desc: 'GitHub Actions → "Setup Supabase Backend" → Run workflow → paste your Supabase token → Run. Takes ~3 min, then site redeploys automatically.',
       link: 'https://github.com/avinashamanchi/fieldcraft/actions/workflows/setup-backend.yml',
       linkText: 'Open workflow →',
     },
@@ -164,8 +164,8 @@ export default function App() {
           loadUserData().catch(console.error)
         }
       } else if (event === 'TOKEN_REFRESHED' && newSession) {
-        // Session refreshed, make sure data is loaded
-        if (newSession.user.email_confirmed_at && !hydrated) {
+        // Session refreshed, make sure data is loaded (read current hydrated from store, not stale closure)
+        if (newSession.user.email_confirmed_at && !useStore.getState().hydrated) {
           loadUserData().catch(console.error)
         }
       }
