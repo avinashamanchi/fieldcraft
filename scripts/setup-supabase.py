@@ -22,9 +22,7 @@ import os
 import json
 import time
 import base64
-import urllib.request
-import urllib.error
-import urllib.parse
+import subprocess
 from pathlib import Path
 
 
@@ -38,24 +36,38 @@ FIELDCRAFT_SITE_URL = "https://avinashamanchi.github.io/fieldcraft"
 
 def http_request(url: str, method: str = "GET", data: dict | None = None,
                  headers: dict | None = None) -> dict:
-    """Make an HTTP request and return parsed JSON response."""
-    body = json.dumps(data).encode("utf-8") if data is not None else None
-    req_headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    """Make an HTTP request via curl and return parsed JSON response."""
+    cmd = [
+        "curl", "-s", "-S",
+        "-X", method,
+        "-H", "Content-Type: application/json",
+        "-H", "Accept: application/json",
+        "-w", "\n__HTTP_STATUS__%{http_code}",
+    ]
     if headers:
-        req_headers.update(headers)
+        for k, v in headers.items():
+            cmd.extend(["-H", f"{k}: {v}"])
+    if data is not None:
+        cmd.extend(["-d", json.dumps(data)])
+    cmd.append(url)
 
-    req = urllib.request.Request(url, data=body, headers=req_headers, method=method)
-    try:
-        with urllib.request.urlopen(req) as resp:
-            content = resp.read()
-            return json.loads(content) if content else {}
-    except urllib.error.HTTPError as e:
-        content = e.read()
-        try:
-            err_data = json.loads(content)
-        except Exception:
-            err_data = {"raw": content.decode("utf-8", errors="replace")}
-        raise RuntimeError(f"HTTP {e.code} {e.reason}: {json.dumps(err_data)}") from e
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    output = result.stdout
+
+    if "\n__HTTP_STATUS__" in output:
+        body, status_str = output.rsplit("\n__HTTP_STATUS__", 1)
+        status_code = int(status_str.strip())
+    else:
+        body, status_code = output, 0
+
+    body = body.strip()
+    if not body and result.returncode != 0:
+        raise RuntimeError(f"curl error: {result.stderr.strip()}")
+
+    parsed = json.loads(body) if body else {}
+    if status_code >= 400:
+        raise RuntimeError(f"HTTP {status_code}: {json.dumps(parsed)}")
+    return parsed
 
 
 def supabase_request(path: str, method: str = "GET", data: dict | None = None,
@@ -185,41 +197,11 @@ def get_repo_public_key(repo: str, token: str) -> tuple[str, str]:
 
 def encrypt_secret(public_key_b64: str, secret_value: str) -> str:
     """Encrypt a secret value using the repo's public key (NaCl sealed box)."""
-    try:
-        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
-        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-        # Try PyNaCl first
-        from nacl.public import PublicKey, SealedBox
-        pk = PublicKey(base64.b64decode(public_key_b64))
-        box = SealedBox(pk)
-        encrypted = box.encrypt(secret_value.encode("utf-8"))
-        return base64.b64encode(encrypted).decode("utf-8")
-    except ImportError:
-        pass
-
-    # Fallback: use PyNaCl via subprocess if available
-    import subprocess
-    try:
-        result = subprocess.run(
-            ["python3", "-c",
-             f"""
-import base64, sys
-from nacl.public import PublicKey, SealedBox
-pk = PublicKey(base64.b64decode('{public_key_b64}'))
-box = SealedBox(pk)
-encrypted = box.encrypt('{secret_value}'.encode())
-print(base64.b64encode(encrypted).decode())
-"""],
-            capture_output=True, text=True, check=True
-        )
-        return result.stdout.strip()
-    except Exception:
-        pass
-
-    # Last resort: return plaintext warning
-    print("  WARNING: Could not encrypt secret. Install PyNaCl: pip install PyNaCl")
-    print("  Manually set the GitHub secret or run: pip install PyNaCl")
-    return base64.b64encode(secret_value.encode()).decode()
+    from nacl.public import PublicKey, SealedBox
+    pk = PublicKey(base64.b64decode(public_key_b64))
+    box = SealedBox(pk)
+    encrypted = box.encrypt(secret_value.encode("utf-8"))
+    return base64.b64encode(encrypted).decode("utf-8")
 
 
 def set_github_secret(repo: str, secret_name: str, secret_value: str, token: str) -> None:
