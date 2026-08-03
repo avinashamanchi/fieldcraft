@@ -250,7 +250,7 @@ begin
       trade_type = p_payload #>> '{job,tradeType}',
       status = p_payload #>> '{job,status}',
       labor_hours_thousandths = case when (p_payload -> 'job') ? 'laborHoursThousandths'
-        then public.require_jsonb_integer(p_payload #> '{job,laborHoursThousandths}', 'job.laborHoursThousandths', 0, 10000000)::integer
+        then public.require_jsonb_integer(p_payload #> '{job,laborHoursThousandths}', 'job.laborHoursThousandths', 0, 10000)::integer
         else job.labor_hours_thousandths end,
       labor_rate_cents = case when (p_payload -> 'job') ? 'laborRateCents'
         then public.require_jsonb_integer(p_payload #> '{job,laborRateCents}', 'job.laborRateCents', 0, 100000000)
@@ -272,7 +272,7 @@ begin
       p_payload #>> '{job,tradeType}',
       p_payload #>> '{job,status}',
       case when (p_payload -> 'job') ? 'laborHoursThousandths'
-        then public.require_jsonb_integer(p_payload #> '{job,laborHoursThousandths}', 'job.laborHoursThousandths', 0, 10000000)::integer else 0 end,
+        then public.require_jsonb_integer(p_payload #> '{job,laborHoursThousandths}', 'job.laborHoursThousandths', 0, 10000)::integer else 0 end,
       case when (p_payload -> 'job') ? 'laborRateCents'
         then public.require_jsonb_integer(p_payload #> '{job,laborRateCents}', 'job.laborRateCents', 0, 100000000) else 0 end,
       nullif(p_payload #>> '{job,notes}', '')
@@ -448,7 +448,7 @@ begin
         ) values (
           p_entity_id, v_user_id, v_client_id, p_payload ->> 'title', nullif(p_payload ->> 'address', ''),
           nullif(p_payload ->> 'description', ''), p_payload ->> 'tradeType', coalesce(p_payload ->> 'status', 'Scheduled'),
-          case when p_payload ? 'laborHoursThousandths' then public.require_jsonb_integer(p_payload -> 'laborHoursThousandths', 'laborHoursThousandths', 0, 10000000)::integer else 0 end,
+          case when p_payload ? 'laborHoursThousandths' then public.require_jsonb_integer(p_payload -> 'laborHoursThousandths', 'laborHoursThousandths', 0, 10000)::integer else 0 end,
           case when p_payload ? 'laborRateCents' then public.require_jsonb_integer(p_payload -> 'laborRateCents', 'laborRateCents', 0, 100000000) else 0 end,
           nullif(p_payload ->> 'notes', ''), (p_payload ->> 'scheduledAt')::timestamptz, (p_payload ->> 'completedAt')::timestamptz
         ) returning to_jsonb(job) into v_cloud;
@@ -508,7 +508,7 @@ begin
           unit_price_cents, category
         ) values (
           p_entity_id, v_user_id, p_payload ->> 'name', nullif(p_payload ->> 'description', ''),
-          case when p_payload ? 'estimatedHoursThousandths' then public.require_jsonb_integer(p_payload -> 'estimatedHoursThousandths', 'estimatedHoursThousandths', 0, 10000000)::integer else 0 end,
+          case when p_payload ? 'estimatedHoursThousandths' then public.require_jsonb_integer(p_payload -> 'estimatedHoursThousandths', 'estimatedHoursThousandths', 0, 10000)::integer else 0 end,
           case when p_payload ? 'unitPriceCents' then public.require_jsonb_integer(p_payload -> 'unitPriceCents', 'unitPriceCents', 0, 100000000) else 0 end,
           nullif(p_payload ->> 'category', '')
         ) returning to_jsonb(service) into v_cloud;
@@ -519,9 +519,9 @@ begin
           unit_price_cents, last_used_at
         ) values (
           p_entity_id, v_user_id, p_payload ->> 'name',
-          case when p_payload ? 'quantityThousandths' then public.require_jsonb_integer(p_payload -> 'quantityThousandths', 'quantityThousandths', 0, 1000000000) else 0 end,
+          case when p_payload ? 'quantityThousandths' then public.require_jsonb_integer(p_payload -> 'quantityThousandths', 'quantityThousandths', 0, 10000) else 0 end,
           p_payload ->> 'unit',
-          case when p_payload ? 'minStockThousandths' then public.require_jsonb_integer(p_payload -> 'minStockThousandths', 'minStockThousandths', 0, 1000000000) else 0 end,
+          case when p_payload ? 'minStockThousandths' then public.require_jsonb_integer(p_payload -> 'minStockThousandths', 'minStockThousandths', 0, 10000) else 0 end,
           case when p_payload ? 'unitPriceCents' then public.require_jsonb_integer(p_payload -> 'unitPriceCents', 'unitPriceCents', 0, 100000000) else 0 end,
           (p_payload ->> 'lastUsedAt')::timestamptz
         ) returning to_jsonb(inventory) into v_cloud;
@@ -565,11 +565,15 @@ begin
     if v_cloud_version <> p_base_version then
       v_response := jsonb_build_object(
         'status', 'conflict',
+        'mutation_id', p_mutation_id,
         'entity', p_entity,
         'entity_id', p_entity_id,
         'base_version', p_base_version,
+        'local_version', p_base_version,
+        'local_payload', p_payload,
         'cloud_version', v_cloud_version,
-        'cloud', v_cloud
+        'cloud', v_cloud,
+        'cloud_payload', v_cloud
       );
       insert into public.mutation_receipts (user_id, mutation_id, response)
       values (v_user_id, p_mutation_id, v_response);
@@ -632,7 +636,7 @@ begin
             description = case when p_payload ? 'description' then nullif(p_payload ->> 'description', '') else job.description end,
             trade_type = case when p_payload ? 'tradeType' then p_payload ->> 'tradeType' else job.trade_type end,
             status = case when p_payload ? 'status' then p_payload ->> 'status' else job.status end,
-            labor_hours_thousandths = case when p_payload ? 'laborHoursThousandths' then public.require_jsonb_integer(p_payload -> 'laborHoursThousandths', 'laborHoursThousandths', 0, 10000000)::integer else job.labor_hours_thousandths end,
+            labor_hours_thousandths = case when p_payload ? 'laborHoursThousandths' then public.require_jsonb_integer(p_payload -> 'laborHoursThousandths', 'laborHoursThousandths', 0, 10000)::integer else job.labor_hours_thousandths end,
             labor_rate_cents = case when p_payload ? 'laborRateCents' then public.require_jsonb_integer(p_payload -> 'laborRateCents', 'laborRateCents', 0, 100000000) else job.labor_rate_cents end,
             notes = case when p_payload ? 'notes' then nullif(p_payload ->> 'notes', '') else job.notes end
           where job.id = p_entity_id and job.user_id = v_user_id returning to_jsonb(job) into v_cloud;
@@ -701,7 +705,7 @@ begin
           update public.services as service set
             name = case when p_payload ? 'name' then p_payload ->> 'name' else service.name end,
             description = case when p_payload ? 'description' then nullif(p_payload ->> 'description', '') else service.description end,
-            estimated_hours_thousandths = case when p_payload ? 'estimatedHoursThousandths' then public.require_jsonb_integer(p_payload -> 'estimatedHoursThousandths', 'estimatedHoursThousandths', 0, 10000000)::integer else service.estimated_hours_thousandths end,
+            estimated_hours_thousandths = case when p_payload ? 'estimatedHoursThousandths' then public.require_jsonb_integer(p_payload -> 'estimatedHoursThousandths', 'estimatedHoursThousandths', 0, 10000)::integer else service.estimated_hours_thousandths end,
             unit_price_cents = case when p_payload ? 'unitPriceCents' then public.require_jsonb_integer(p_payload -> 'unitPriceCents', 'unitPriceCents', 0, 100000000) else service.unit_price_cents end,
             category = case when p_payload ? 'category' then nullif(p_payload ->> 'category', '') else service.category end
           where service.id = p_entity_id and service.user_id = v_user_id returning to_jsonb(service) into v_cloud;
@@ -709,9 +713,9 @@ begin
         when 'inventory' then
           update public.inventory_items as inventory set
             name = case when p_payload ? 'name' then p_payload ->> 'name' else inventory.name end,
-            quantity_thousandths = case when p_payload ? 'quantityThousandths' then public.require_jsonb_integer(p_payload -> 'quantityThousandths', 'quantityThousandths', 0, 1000000000) else inventory.quantity_thousandths end,
+            quantity_thousandths = case when p_payload ? 'quantityThousandths' then public.require_jsonb_integer(p_payload -> 'quantityThousandths', 'quantityThousandths', 0, 10000) else inventory.quantity_thousandths end,
             unit = case when p_payload ? 'unit' then p_payload ->> 'unit' else inventory.unit end,
-            min_stock_thousandths = case when p_payload ? 'minStockThousandths' then public.require_jsonb_integer(p_payload -> 'minStockThousandths', 'minStockThousandths', 0, 1000000000) else inventory.min_stock_thousandths end,
+            min_stock_thousandths = case when p_payload ? 'minStockThousandths' then public.require_jsonb_integer(p_payload -> 'minStockThousandths', 'minStockThousandths', 0, 10000) else inventory.min_stock_thousandths end,
             unit_price_cents = case when p_payload ? 'unitPriceCents' then public.require_jsonb_integer(p_payload -> 'unitPriceCents', 'unitPriceCents', 0, 100000000) else inventory.unit_price_cents end,
             last_used_at = case when p_payload ? 'lastUsedAt' then (p_payload ->> 'lastUsedAt')::timestamptz else inventory.last_used_at end
           where inventory.id = p_entity_id and inventory.user_id = v_user_id returning to_jsonb(inventory) into v_cloud;

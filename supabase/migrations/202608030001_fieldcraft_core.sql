@@ -111,7 +111,7 @@ create table public.jobs (
     check (trade_type in ('Plumbing', 'Electrical', 'HVAC', 'Carpentry', 'General', 'Roofing', 'Flooring', 'Painting')),
   status text not null default 'Scheduled'
     check (status in ('Scheduled', 'In Progress', 'Invoiced', 'Paid')),
-  labor_hours_thousandths integer not null default 0 check (labor_hours_thousandths between 0 and 10000000),
+  labor_hours_thousandths integer not null default 0 check (labor_hours_thousandths between 0 and 10000),
   labor_rate_cents bigint not null default 0 check (labor_rate_cents between 0 and 100000000),
   notes text check (notes is null or char_length(notes) <= 4000),
   scheduled_at timestamptz,
@@ -181,7 +181,7 @@ create table public.services (
   user_id uuid not null references auth.users(id) on delete cascade,
   name text not null check (char_length(name) between 1 and 200),
   description text check (description is null or char_length(description) <= 4000),
-  estimated_hours_thousandths integer not null default 0 check (estimated_hours_thousandths between 0 and 10000000),
+  estimated_hours_thousandths integer not null default 0 check (estimated_hours_thousandths between 0 and 10000),
   unit_price_cents bigint not null default 0 check (unit_price_cents between 0 and 100000000),
   category text check (category is null or char_length(category) <= 100),
   version bigint not null default 1 check (version >= 1),
@@ -194,9 +194,9 @@ create table public.inventory_items (
   id uuid primary key default gen_random_uuid(),
   user_id uuid not null references auth.users(id) on delete cascade,
   name text not null check (char_length(name) between 1 and 200),
-  quantity_thousandths bigint not null default 0 check (quantity_thousandths between 0 and 1000000000),
+  quantity_thousandths bigint not null default 0 check (quantity_thousandths between 0 and 10000),
   unit text not null check (char_length(unit) between 1 and 32),
-  min_stock_thousandths bigint not null default 0 check (min_stock_thousandths between 0 and 1000000000),
+  min_stock_thousandths bigint not null default 0 check (min_stock_thousandths between 0 and 10000),
   unit_price_cents bigint not null default 0 check (unit_price_cents between 0 and 100000000),
   last_used_at timestamptz,
   version bigint not null default 1 check (version >= 1),
@@ -287,56 +287,24 @@ alter table public.mutation_receipts enable row level security;
 alter table public.ai_rate_limits enable row level security;
 
 create policy profiles_select_own on public.profiles for select using (auth.uid() = id);
-create policy profiles_insert_own on public.profiles for insert with check (auth.uid() = id);
-create policy profiles_update_own on public.profiles for update using (auth.uid() = id) with check (auth.uid() = id);
-create policy profiles_delete_own on public.profiles for delete using (auth.uid() = id);
 
 create policy clients_select_own on public.clients for select using (auth.uid() = user_id);
-create policy clients_insert_own on public.clients for insert with check (auth.uid() = user_id);
-create policy clients_update_own on public.clients for update using (auth.uid() = user_id) with check (auth.uid() = user_id);
-create policy clients_delete_own on public.clients for delete using (auth.uid() = user_id);
 
 create policy jobs_select_own on public.jobs for select using (auth.uid() = user_id);
-create policy jobs_insert_own on public.jobs for insert with check (auth.uid() = user_id);
-create policy jobs_update_own on public.jobs for update using (auth.uid() = user_id) with check (auth.uid() = user_id);
-create policy jobs_delete_own on public.jobs for delete using (auth.uid() = user_id);
 
 create policy invoices_select_own on public.invoices for select using (auth.uid() = user_id);
-create policy invoices_insert_own on public.invoices for insert with check (auth.uid() = user_id);
-create policy invoices_update_own on public.invoices for update using (auth.uid() = user_id) with check (auth.uid() = user_id);
-create policy invoices_delete_own on public.invoices for delete using (auth.uid() = user_id);
 
 create policy expenses_select_own on public.expenses for select using (auth.uid() = user_id);
-create policy expenses_insert_own on public.expenses for insert with check (auth.uid() = user_id);
-create policy expenses_update_own on public.expenses for update using (auth.uid() = user_id) with check (auth.uid() = user_id);
-create policy expenses_delete_own on public.expenses for delete using (auth.uid() = user_id);
 
 create policy services_select_own on public.services for select using (auth.uid() = user_id);
-create policy services_insert_own on public.services for insert with check (auth.uid() = user_id);
-create policy services_update_own on public.services for update using (auth.uid() = user_id) with check (auth.uid() = user_id);
-create policy services_delete_own on public.services for delete using (auth.uid() = user_id);
 
 create policy inventory_items_select_own on public.inventory_items for select using (auth.uid() = user_id);
-create policy inventory_items_insert_own on public.inventory_items for insert with check (auth.uid() = user_id);
-create policy inventory_items_update_own on public.inventory_items for update using (auth.uid() = user_id) with check (auth.uid() = user_id);
-create policy inventory_items_delete_own on public.inventory_items for delete using (auth.uid() = user_id);
-
-create policy mutation_receipts_select_own on public.mutation_receipts for select using (auth.uid() = user_id);
-create policy mutation_receipts_insert_own on public.mutation_receipts for insert with check (auth.uid() = user_id);
-create policy mutation_receipts_update_own on public.mutation_receipts for update using (auth.uid() = user_id) with check (auth.uid() = user_id);
-create policy mutation_receipts_delete_own on public.mutation_receipts for delete using (auth.uid() = user_id);
-
-create policy ai_rate_limits_select_own on public.ai_rate_limits for select using (auth.uid() = user_id);
-create policy ai_rate_limits_insert_own on public.ai_rate_limits for insert with check (auth.uid() = user_id);
-create policy ai_rate_limits_update_own on public.ai_rate_limits for update using (auth.uid() = user_id) with check (auth.uid() = user_id);
-create policy ai_rate_limits_delete_own on public.ai_rate_limits for delete using (auth.uid() = user_id);
 
 revoke all on public.profiles, public.clients, public.jobs, public.invoices,
   public.expenses, public.services, public.inventory_items,
-  public.mutation_receipts, public.ai_rate_limits from anon;
-grant select, insert, update, delete on public.profiles, public.clients, public.jobs,
-  public.invoices, public.expenses, public.services, public.inventory_items,
-  public.mutation_receipts, public.ai_rate_limits to authenticated;
+  public.mutation_receipts, public.ai_rate_limits from anon, authenticated;
+grant select on public.profiles, public.clients, public.jobs, public.invoices,
+  public.expenses, public.services, public.inventory_items to authenticated;
 
 revoke execute on function public.is_jsonb_integer_in_range(jsonb, numeric, numeric) from public, anon, authenticated;
 revoke execute on function public.is_valid_invoice_line_items(jsonb) from public, anon, authenticated;

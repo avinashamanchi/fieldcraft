@@ -2,7 +2,7 @@ begin;
 
 create extension if not exists pgtap with schema extensions;
 
-select plan(14);
+select plan(18);
 
 insert into auth.users (id, email)
 values
@@ -47,6 +47,66 @@ select throws_ok(
   '23514',
   null,
   'money above the reviewed maximum is rejected'
+);
+
+select throws_ok(
+  $$ insert into public.jobs (
+       user_id, client_id, title, trade_type, status, labor_hours_thousandths
+     ) values (
+       '10000000-0000-0000-0000-000000000001',
+       '11000000-0000-0000-0000-000000000001',
+       'Too many hours',
+       'General',
+       'Scheduled',
+       10001
+     ) $$,
+  '23514',
+  null,
+  'job hours above the Task 2 thousandths limit are rejected'
+);
+
+select throws_ok(
+  $$ insert into public.services (
+       user_id, name, estimated_hours_thousandths, unit_price_cents
+     ) values (
+       '10000000-0000-0000-0000-000000000001',
+       'Too many estimated hours',
+       10001,
+       100
+     ) $$,
+  '23514',
+  null,
+  'service hours above the Task 2 thousandths limit are rejected'
+);
+
+select throws_ok(
+  $$ insert into public.inventory_items (
+       user_id, name, quantity_thousandths, unit, unit_price_cents
+     ) values (
+       '10000000-0000-0000-0000-000000000001',
+       'Too much inventory',
+       10001,
+       'each',
+       100
+     ) $$,
+  '23514',
+  null,
+  'inventory quantity above the Task 2 thousandths limit is rejected'
+);
+
+select throws_ok(
+  $$ insert into public.inventory_items (
+       user_id, name, unit, min_stock_thousandths, unit_price_cents
+     ) values (
+       '10000000-0000-0000-0000-000000000001',
+       'Too much minimum stock',
+       'each',
+       10001,
+       100
+     ) $$,
+  '23514',
+  null,
+  'inventory minimum stock above the Task 2 thousandths limit is rejected'
 );
 
 select throws_ok(

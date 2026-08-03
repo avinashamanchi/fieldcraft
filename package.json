@@ -12,6 +12,7 @@
     "typecheck": "tsc -b --pretty false",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
+    "check:supabase-boundary": "node scripts/check-supabase-migration-boundary.mjs",
     "scan:secrets": "node scripts/scan-secrets.mjs",
     "preview": "vite preview"
   },
