@@ -1,4 +1,4 @@
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { motion } from 'framer-motion'
 import { Mic, DollarSign, Briefcase, TrendingUp, ChevronRight, AlertTriangle, Receipt, Users, Plus } from 'lucide-react'
 import { useStore } from '../store/useStore'

@@ -1,4 +1,4 @@
-import { useParams, useNavigate } from 'react-router-dom'
+import { useParams, useNavigate } from 'react-router'
 import { useState } from 'react'
 import { ArrowLeft, Phone, MapPin, Briefcase, MessageSquare } from 'lucide-react'
 import { useStore } from '../store/useStore'

@@ -9,4 +9,11 @@ describe('FieldCraft web baseline', () => {
   it('pins Node 22', () => {
     expect(readFileSync('.node-version', 'utf8').trim()).toBe('22')
   })
+
+  it('uses the patched React Router package directly', () => {
+    const packageJson = JSON.parse(readFileSync('package.json', 'utf8'))
+
+    expect(packageJson.dependencies['react-router-dom']).toBeUndefined()
+    expect(packageJson.dependencies['react-router']).toBe('8.3.0')
+  })
 })

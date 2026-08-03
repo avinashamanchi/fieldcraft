@@ -1,4 +1,4 @@
-import { useParams, useNavigate } from 'react-router-dom'
+import { useParams, useNavigate } from 'react-router'
 import { useState } from 'react'
 import { motion } from 'framer-motion'
 import { ArrowLeft, FileText, Wrench, Clock, MapPin, Printer, CheckCircle, MessageSquare, Package } from 'lucide-react'

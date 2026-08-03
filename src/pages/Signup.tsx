@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { motion } from 'framer-motion'
 import { Wrench, Eye, EyeOff, ArrowLeft, Loader2, AlertCircle } from 'lucide-react'
 import { signUp } from '../lib/auth'

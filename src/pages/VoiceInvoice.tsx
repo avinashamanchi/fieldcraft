@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { motion, AnimatePresence } from 'framer-motion'
 import { ArrowLeft, CheckCircle, AlertCircle } from 'lucide-react'
 import { v4 as uuid } from 'uuid'
