@@ -5,6 +5,10 @@ jest.mock('expo-crypto', () => ({
 }))
 
 import {
+  __failNextOwnerClear,
+  __getRawDatabase,
+  __pauseNextOwnerClear,
+  __pauseNextOutboxInsert,
   __pauseNextRecordsRead,
   __resetSQLiteMock,
 } from 'expo-sqlite'
@@ -116,4 +120,73 @@ it('lets an already-started owner clear finish before close releases the databas
 
   await expect(clear).resolves.toBeUndefined()
   await expect(close).resolves.toBeUndefined()
+})
+
+it('blocks new owner reads and mutations while clear is pending', async () => {
+  const repository = new SQLiteFieldCraftRepository({ databaseName: 'pending-clear.db' })
+  await repository.initialize('owner-a')
+  await repository.transactLocalMutation(mutationFor('owner-a', 'client-a'))
+  const paused = __pauseNextOwnerClear('pending-clear.db')
+
+  const clear = repository.clearOwner('owner-a')
+  await paused.started
+
+  await expect(repository.list('client')).rejects.toThrow(/clear/i)
+  await expect(
+    repository.transactLocalMutation({
+      ...mutationFor('owner-a', 'client-b'),
+      id: '00000000-0000-4000-8000-000000000012',
+    }),
+  ).rejects.toThrow(/clear/i)
+  paused.release()
+  await clear
+})
+
+it('keeps a failed clear fail-closed until an explicit clear retry succeeds', async () => {
+  const repository = new SQLiteFieldCraftRepository({ databaseName: 'failed-clear.db' })
+  await repository.initialize('owner-a')
+  await repository.transactLocalMutation(mutationFor('owner-a', 'client-a'))
+  __failNextOwnerClear('failed-clear.db')
+
+  await expect(repository.clearOwner('owner-a')).rejects.toThrow(/clear/i)
+  expect(__getRawDatabase('failed-clear.db').records).toHaveLength(1)
+  await expect(repository.get('client', 'client-a')).rejects.toThrow(/clear/i)
+  await expect(repository.clearOwner('owner-a')).resolves.toBeUndefined()
+  await expect(repository.get('client', 'client-a')).resolves.toBeNull()
+})
+
+it('rolls back a mutation already in flight when owner clear advances the epoch', async () => {
+  const repository = new SQLiteFieldCraftRepository({ databaseName: 'clear-mutation-race.db' })
+  await repository.initialize('owner-a')
+  const paused = __pauseNextOutboxInsert('clear-mutation-race.db')
+
+  const mutation = repository.transactLocalMutation(mutationFor('owner-a', 'client-a'))
+  await paused.started
+  const clear = repository.clearOwner('owner-a')
+  paused.release()
+
+  await expect(mutation).rejects.toThrow(/owner changed/i)
+  await expect(clear).resolves.toBeUndefined()
+  expect(__getRawDatabase('clear-mutation-race.db').records).toEqual([])
+  expect(__getRawDatabase('clear-mutation-race.db').outbox).toEqual([])
+})
+
+it('clears only the requested owner partition across owner-scoped tables', async () => {
+  const repository = new SQLiteFieldCraftRepository({ databaseName: 'scoped-clear.db' })
+  await repository.initialize('owner-a')
+  await repository.transactLocalMutation(mutationFor('owner-a', 'client-a'))
+  await repository.initialize('owner-b')
+  await repository.transactLocalMutation(mutationFor('owner-b', 'client-b'))
+  const raw = __getRawDatabase('scoped-clear.db')
+  raw.conflicts.push({ owner_id: 'owner-a' }, { owner_id: 'owner-b' })
+  raw.syncCursors.push({ owner_id: 'owner-a' }, { owner_id: 'owner-b' })
+  raw.metadata.push({ owner_id: 'owner-a' }, { owner_id: 'owner-b' })
+
+  await repository.clearOwner('owner-a')
+
+  expect(raw.records).toEqual([expect.objectContaining({ owner_id: 'owner-b' })])
+  expect(raw.outbox).toEqual([expect.objectContaining({ owner_id: 'owner-b' })])
+  expect(raw.conflicts).toEqual([{ owner_id: 'owner-b' }])
+  expect(raw.syncCursors).toEqual([{ owner_id: 'owner-b' }])
+  expect(raw.metadata).toEqual([{ owner_id: 'owner-b' }])
 })

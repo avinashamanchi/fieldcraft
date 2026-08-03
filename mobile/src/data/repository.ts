@@ -1,4 +1,11 @@
 import type { ConflictRecord, EntityName, MutationEnvelope } from '../domain/sync'
+import type { Client, Invoice, Job } from '../domain/entities'
+
+export type InvoiceBundlePayload = {
+  client: Client
+  job: Job
+  invoice: Invoice
+}
 
 export type CloudRowEnvelope = {
   ownerId: string

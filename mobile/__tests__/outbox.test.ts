@@ -4,7 +4,12 @@ jest.mock('expo-crypto', () => ({
   digestStringAsync: async (_algorithm: string, value: string) => `sha256:${value}`,
 }))
 
-import { __resetSQLiteMock } from 'expo-sqlite'
+import {
+  __getRawDatabase,
+  __pauseNextOutboxRead,
+  __resetSQLiteMock,
+  openDatabaseAsync,
+} from 'expo-sqlite'
 
 import { SQLiteFieldCraftRepository } from '../src/data/sqliteRepository'
 
@@ -66,6 +71,122 @@ it('scopes mutation IDs and FIFO sequences independently per owner', async () =>
     },
   })
 
-  await expect(repository.outbox.list('owner-a')).resolves.toHaveLength(1)
+  await expect(repository.outbox.list('owner-a')).rejects.toThrow(/active owner/i)
   await expect(repository.outbox.list('owner-b')).resolves.toHaveLength(1)
+  await repository.initialize('owner-a')
+  await expect(repository.outbox.list('owner-a')).resolves.toHaveLength(1)
+})
+
+it('serializes concurrent distinct mutations into unique FIFO sequences', async () => {
+  const repository = new SQLiteFieldCraftRepository({ databaseName: 'concurrent.db' })
+  await repository.initialize('owner-a')
+
+  await Promise.all([
+    repository.transactLocalMutation(
+      makeMutation('00000000-0000-4000-8000-000000000031', 'client-1'),
+    ),
+    repository.transactLocalMutation(
+      makeMutation('00000000-0000-4000-8000-000000000032', 'client-2'),
+    ),
+  ])
+
+  expect(__getRawDatabase('concurrent.db').outbox.map((row) => row.sequence)).toEqual([1, 2])
+  await expect(repository.outbox.list('owner-a')).resolves.toHaveLength(2)
+})
+
+it('serializes owner-local FIFO allocation across separate SQLite connections', async () => {
+  const firstRepository = new SQLiteFieldCraftRepository({ databaseName: 'multi-connection.db' })
+  const secondRepository = new SQLiteFieldCraftRepository({ databaseName: 'multi-connection.db' })
+  await Promise.all([
+    firstRepository.initialize('owner-a'),
+    secondRepository.initialize('owner-a'),
+  ])
+
+  await Promise.all([
+    firstRepository.transactLocalMutation(
+      makeMutation('00000000-0000-4000-8000-000000000033', 'client-3'),
+    ),
+    secondRepository.transactLocalMutation(
+      makeMutation('00000000-0000-4000-8000-000000000034', 'client-4'),
+    ),
+  ])
+
+  expect(__getRawDatabase('multi-connection.db').outbox.map((row) => row.sequence)).toEqual([1, 2])
+})
+
+it('rejects duplicate owner-local FIFO sequence values in the SQLite adapter', async () => {
+  const repository = new SQLiteFieldCraftRepository({ databaseName: 'sequence-constraint.db' })
+  await repository.initialize('owner-a')
+  await repository.transactLocalMutation(
+    makeMutation('00000000-0000-4000-8000-000000000041', 'client-1'),
+  )
+  const database = await openDatabaseAsync('sequence-constraint.db')
+
+  await expect(
+    database.runAsync(
+      `/* outbox:insert */ INSERT INTO outbox
+       (owner_id, mutation_id, sequence, entity, entity_id, kind, base_version,
+        payload_json, payload_hash, created_at, attempts)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        'owner-a',
+        '00000000-0000-4000-8000-000000000042',
+        1,
+        'client',
+        'client-2',
+        'create',
+        null,
+        '{}',
+        'hash',
+        '2026-08-03T10:00:00.000Z',
+        0,
+      ],
+    ),
+  ).rejects.toThrow(/sequence/i)
+})
+
+it('fails closed when schema-valid outbox content no longer matches its immutable hash', async () => {
+  const repository = new SQLiteFieldCraftRepository({ databaseName: 'hash-tamper.db' })
+  await repository.initialize('owner-a')
+  await repository.transactLocalMutation(
+    makeMutation('00000000-0000-4000-8000-000000000051', 'client-1'),
+  )
+  const row = __getRawDatabase('hash-tamper.db').outbox[0]
+  row.payload_json = JSON.stringify({ ...makeMutation(row.mutation_id, 'client-1').payload, name: 'Tampered' })
+
+  await expect(repository.outbox.list('owner-a')).rejects.toThrow(/corrupt/i)
+})
+
+it('discards an in-flight outbox read after the owner changes', async () => {
+  const repository = new SQLiteFieldCraftRepository({ databaseName: 'stale-outbox.db' })
+  await repository.initialize('owner-a')
+  await repository.transactLocalMutation(
+    makeMutation('00000000-0000-4000-8000-000000000061', 'client-1'),
+  )
+  const paused = __pauseNextOutboxRead('stale-outbox.db')
+
+  const stale = repository.outbox.list('owner-a')
+  await paused.started
+  const switched = repository.initialize('owner-b')
+  paused.release()
+  await switched
+
+  await expect(stale).resolves.toEqual([])
+})
+
+it('rejects comment-routed malformed SQL and ownerless queries in the SQLite adapter', async () => {
+  const repository = new SQLiteFieldCraftRepository({ databaseName: 'strict-sql.db' })
+  await repository.initialize('owner-a')
+  const database = await openDatabaseAsync('strict-sql.db')
+
+  await expect(database.runAsync('/* records:upsert */ SELECT 1', [])).rejects.toThrow(/SQL/i)
+  await expect(
+    database.getAllAsync(
+      '/* records:list */ SELECT entity_id, payload_json FROM records WHERE entity = ?',
+      ['client'],
+    ),
+  ).rejects.toThrow(/owner_id/i)
+  await expect(
+    database.execAsync('CREATE TABLE IF NOT EXISTS records (id TEXT PRIMARY KEY)'),
+  ).rejects.toThrow(/owner.scoped|owner_id/i)
 })

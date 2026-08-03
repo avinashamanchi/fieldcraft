@@ -28,6 +28,13 @@ export class OwnerBoundary {
     )
   }
 
+  isOwnerEpochCurrent(snapshot: OwnerSnapshot): boolean {
+    return (
+      snapshot.ownerId === this.snapshot.ownerId &&
+      snapshot.deleteEpoch === this.snapshot.deleteEpoch
+    )
+  }
+
   switchOwner(ownerId: string | null): void {
     if (this.snapshot.ownerId === ownerId) return
     this.publish({

@@ -41,6 +41,62 @@ const mutation = (overrides: Record<string, unknown> = {}) => ({
   ...overrides,
 })
 
+const invoiceBundle = () => ({
+  client: client(),
+  job: {
+    id: 'job-1',
+    ownerId: OWNER,
+    version: 1,
+    createdAt: '2026-08-03T10:00:00.000Z',
+    updatedAt: '2026-08-03T10:00:00.000Z',
+    syncState: 'pending',
+    clientId: 'client-1',
+    title: 'Replace valve',
+    status: 'Invoiced',
+  },
+  invoice: {
+    id: 'invoice-1',
+    ownerId: OWNER,
+    version: 1,
+    createdAt: '2026-08-03T10:00:00.000Z',
+    updatedAt: '2026-08-03T10:00:00.000Z',
+    syncState: 'pending',
+    clientId: 'client-1',
+    jobId: 'job-1',
+    draft: {
+      clientName: 'Jordan Lee',
+      jobTitle: 'Replace valve',
+      tradeType: 'Plumbing',
+      taxBasisPoints: 825,
+      paymentTerms: 'Net 30',
+      lineItems: [
+        {
+          description: 'Labor',
+          type: 'labor',
+          quantity: 1500,
+          unitPriceCents: 10000,
+        },
+      ],
+    },
+    subtotalCents: 15000,
+    taxCents: 1238,
+    totalCents: 16238,
+  },
+})
+
+const bundleMutation = (overrides: Record<string, unknown> = {}) => ({
+  id: '00000000-0000-4000-8000-000000000020',
+  ownerId: OWNER,
+  entity: 'invoice' as const,
+  entityId: 'invoice-1',
+  kind: 'save_invoice_bundle' as const,
+  baseVersion: null,
+  payload: invoiceBundle(),
+  createdAt: '2026-08-03T10:00:01.000Z',
+  attempts: 0,
+  ...overrides,
+})
+
 beforeEach(() => {
   __resetSQLiteMock()
 })
@@ -102,6 +158,18 @@ it('accepts a canonically equivalent duplicate mutation ID exactly once', async 
   )
 
   await expect(repository.outbox.list(OWNER)).resolves.toHaveLength(1)
+})
+
+it('treats mutable retry attempts as outside immutable duplicate content', async () => {
+  const repository = new SQLiteFieldCraftRepository({ databaseName: 'attempts.db' })
+  await repository.initialize(OWNER)
+
+  await repository.transactLocalMutation(mutation())
+  await repository.transactLocalMutation(mutation({ attempts: 4 }))
+
+  await expect(repository.outbox.list(OWNER)).resolves.toEqual([
+    expect.objectContaining({ id: MUTATION_ONE, attempts: 0 }),
+  ])
 })
 
 it('rejects a duplicate mutation ID whose canonical content differs', async () => {
@@ -185,4 +253,48 @@ it('rejects non-entity conflict payloads before persisting them', async () => {
   ).rejects.toThrow()
 
   expect(__getRawDatabase('conflict-validation.db').conflicts).toEqual([])
+})
+
+it('atomically caches a validated client, job, and invoice bundle with one outbox envelope', async () => {
+  const repository = new SQLiteFieldCraftRepository({ databaseName: 'bundle.db' })
+  await repository.initialize(OWNER)
+
+  await repository.transactLocalMutation(bundleMutation())
+
+  await expect(repository.get('client', 'client-1')).resolves.toMatchObject({ id: 'client-1' })
+  await expect(repository.get('job', 'job-1')).resolves.toMatchObject({ id: 'job-1' })
+  await expect(repository.get('invoice', 'invoice-1')).resolves.toMatchObject({ id: 'invoice-1' })
+  await expect(repository.outbox.list(OWNER)).resolves.toEqual([
+    expect.objectContaining({ kind: 'save_invoice_bundle', payload: invoiceBundle() }),
+  ])
+})
+
+it('rolls back every bundle row when its one outbox insertion fails', async () => {
+  const repository = new SQLiteFieldCraftRepository({ databaseName: 'bundle-rollback.db' })
+  await repository.initialize(OWNER)
+  __failNextOutboxInsert('bundle-rollback.db')
+
+  await expect(repository.transactLocalMutation(bundleMutation())).rejects.toThrow('outbox')
+
+  expect(__getRawDatabase('bundle-rollback.db').records).toEqual([])
+  expect(__getRawDatabase('bundle-rollback.db').outbox).toEqual([])
+})
+
+it('rejects invoice totals that disagree with deterministic invoice math', async () => {
+  const repository = new SQLiteFieldCraftRepository({ databaseName: 'invoice-math.db' })
+  await repository.initialize(OWNER)
+  const payload = invoiceBundle()
+  payload.invoice.totalCents += 1
+
+  await expect(repository.transactLocalMutation(bundleMutation({ payload }))).rejects.toThrow(/total/i)
+  expect(__getRawDatabase('invoice-math.db').records).toEqual([])
+})
+
+it('rejects a list row whose SQLite key disagrees with its validated payload ID', async () => {
+  const repository = new SQLiteFieldCraftRepository({ databaseName: 'key-mismatch.db' })
+  await repository.initialize(OWNER)
+  await repository.transactLocalMutation(mutation())
+  __getRawDatabase('key-mismatch.db').records[0].entity_id = 'different-client'
+
+  await expect(repository.list('client')).rejects.toThrow(/corrupt/i)
 })

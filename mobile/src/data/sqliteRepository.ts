@@ -1,18 +1,23 @@
-import * as Crypto from 'expo-crypto'
 import type { SQLiteDatabase } from 'expo-sqlite'
 import { z } from 'zod'
 
 import type { ConflictRecord, EntityName, MutationEnvelope } from '../domain/sync'
-import { InvoiceDraftSchema } from '../domain/invoice'
+import { calculateInvoice, InvoiceDraftSchema } from '../domain/invoice'
 import { MAX_MONEY_CENTS } from '../domain/limits'
 import { openFieldCraftDatabase } from './database'
 import { applyMigrations } from './migrations'
-import { SQLiteMutationOutbox, type MutationOutbox } from './outbox'
+import {
+  canonicalStringify,
+  hashMutationEnvelope,
+  SQLiteMutationOutbox,
+  type MutationOutbox,
+} from './outbox'
 import { OwnerBoundary } from './ownerBoundary'
 import {
   DataCorruptionError,
   type CloudRowEnvelope,
   type FieldCraftRepository,
+  type InvoiceBundlePayload,
 } from './repository'
 
 const EntityNameSchema = z.enum([
@@ -63,6 +68,14 @@ const entityPayloadSchemas: Record<EntityName, z.ZodType> = {
   }),
 }
 
+const InvoiceBundlePayloadSchema = z
+  .object({
+    client: entityPayloadSchemas.client,
+    job: entityPayloadSchemas.job,
+    invoice: entityPayloadSchemas.invoice,
+  })
+  .strict()
+
 const MutationEnvelopeSchema = z
   .object({
     id: z.uuid(),
@@ -101,6 +114,7 @@ const ConflictRecordSchema = z
   .strict()
 
 type RecordRow = {
+  entity_id: string
   payload_json: string
 }
 
@@ -112,38 +126,6 @@ type NextSequenceRow = {
   next_sequence: number
 }
 
-type CanonicalJson = null | boolean | number | string | CanonicalJson[] | { [key: string]: CanonicalJson }
-
-const normalizeCanonicalJson = (value: unknown, ancestors: Set<object>): CanonicalJson => {
-  if (value === null || typeof value === 'boolean' || typeof value === 'string') return value
-  if (typeof value === 'number') {
-    if (!Number.isFinite(value)) throw new TypeError('Canonical JSON rejects non-finite numbers')
-    return value
-  }
-  if (Array.isArray(value)) {
-    if (ancestors.has(value)) throw new TypeError('Canonical JSON rejects cyclic arrays')
-    const nextAncestors = new Set(ancestors).add(value)
-    return value.map((item) => {
-      if (item === undefined) throw new TypeError('Canonical JSON rejects undefined array items')
-      return normalizeCanonicalJson(item, nextAncestors)
-    })
-  }
-  if (typeof value === 'object' && value !== null) {
-    if (ancestors.has(value)) throw new TypeError('Canonical JSON rejects cyclic objects')
-    const nextAncestors = new Set(ancestors).add(value)
-    const result: { [key: string]: CanonicalJson } = {}
-    for (const key of Object.keys(value).sort()) {
-      const child = (value as Record<string, unknown>)[key]
-      if (child !== undefined) result[key] = normalizeCanonicalJson(child, nextAncestors)
-    }
-    return result
-  }
-  throw new TypeError(`Canonical JSON rejects ${typeof value} values`)
-}
-
-const canonicalStringify = (value: unknown): string =>
-  JSON.stringify(normalizeCanonicalJson(value, new Set()))
-
 const validateEntityPayload = (
   entity: EntityName,
   payload: unknown,
@@ -154,7 +136,42 @@ const validateEntityPayload = (
   if (parsed.ownerId !== ownerId || parsed.id !== entityId) {
     throw new Error('Entity payload owner and ID must match its mutation envelope')
   }
+  if (entity === 'invoice') {
+    const invoice = parsed as Record<string, unknown> & {
+      draft: Parameters<typeof calculateInvoice>[0]
+      subtotalCents: number
+      taxCents: number
+      totalCents: number
+    }
+    const calculated = calculateInvoice(invoice.draft)
+    if (
+      invoice.subtotalCents !== calculated.subtotalCents ||
+      invoice.taxCents !== calculated.taxCents ||
+      invoice.totalCents !== calculated.totalCents
+    ) {
+      throw new Error('Invoice subtotal, tax, and total must match deterministic invoice math')
+    }
+  }
   return parsed
+}
+
+const validateBundlePayload = (
+  payload: unknown,
+  ownerId: string,
+  invoiceId: string,
+): InvoiceBundlePayload => {
+  const parsed = InvoiceBundlePayloadSchema.parse(payload) as InvoiceBundlePayload
+  const client = validateEntityPayload('client', parsed.client, ownerId, parsed.client.id)
+  const job = validateEntityPayload('job', parsed.job, ownerId, parsed.job.id)
+  const invoice = validateEntityPayload('invoice', parsed.invoice, ownerId, invoiceId)
+  if (
+    job.clientId !== client.id ||
+    invoice.clientId !== client.id ||
+    invoice.jobId !== job.id
+  ) {
+    throw new Error('Invoice bundle client, job, and invoice relationships must match')
+  }
+  return { client, job, invoice } as InvoiceBundlePayload
 }
 
 export const validateMutationEnvelope = (input: MutationEnvelope): MutationEnvelope => {
@@ -162,6 +179,20 @@ export const validateMutationEnvelope = (input: MutationEnvelope): MutationEnvel
   if (mutation.kind === 'delete') {
     if (mutation.payload !== null) throw new Error('Delete mutations require a null tombstone payload')
     return mutation
+  }
+
+  if (mutation.kind === 'save_invoice_bundle') {
+    if (mutation.entity !== 'invoice') {
+      throw new Error('Invoice bundle mutations require entity invoice')
+    }
+    return {
+      ...mutation,
+      payload: validateBundlePayload(
+        mutation.payload,
+        mutation.ownerId,
+        mutation.entityId,
+      ),
+    }
   }
 
   return {
@@ -174,9 +205,6 @@ export const validateMutationEnvelope = (input: MutationEnvelope): MutationEnvel
     ),
   }
 }
-
-const mutationHash = async (mutation: MutationEnvelope): Promise<string> =>
-  Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, canonicalStringify(mutation))
 
 export type SQLiteFieldCraftRepositoryOptions = {
   databaseName?: string
@@ -195,10 +223,18 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
   private drainWaiters: (() => void)[] = []
   private ownerRequestGeneration = 0
   private readonly clearPromises = new Map<string, Promise<void>>()
+  private readonly clearingOwners = new Set<string>()
+  private readonly failedClearOwners = new Set<string>()
+  private writeTail: Promise<void> = Promise.resolve()
 
   constructor(options: SQLiteFieldCraftRepositoryOptions = {}) {
     this.databaseName = options.databaseName ?? 'fieldcraft.db'
-    this.outbox = new SQLiteMutationOutbox(this.accessDatabase, validateMutationEnvelope)
+    this.outbox = new SQLiteMutationOutbox(
+      this.accessDatabase,
+      validateMutationEnvelope,
+      this.ownerBoundary,
+      this.assertOwnerAvailable,
+    )
   }
 
   async initialize(ownerId: string): Promise<void> {
@@ -223,7 +259,7 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
     const rows = await this.accessDatabase((database) =>
       database.getAllAsync<RecordRow>(
         `/* records:list */
-         SELECT payload_json
+         SELECT entity_id, payload_json
          FROM records
          WHERE owner_id = ? AND entity = ? AND deleted = 0
          ORDER BY updated_at DESC, entity_id ASC`,
@@ -231,7 +267,9 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
       ),
     )
     if (!this.ownerBoundary.isCurrent(snapshot)) return []
-    return rows.map((row) => this.parsePersistedPayload<T>(entity, row.payload_json, snapshot.ownerId))
+    return rows.map((row) =>
+      this.parsePersistedPayload<T>(entity, row.payload_json, snapshot.ownerId, row.entity_id),
+    )
   }
 
   async get<T>(entity: EntityName, id: string): Promise<T | null> {
@@ -241,7 +279,7 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
     const row = await this.accessDatabase((database) =>
       database.getFirstAsync<RecordRow>(
         `/* records:get */
-         SELECT payload_json
+         SELECT entity_id, payload_json
          FROM records
          WHERE owner_id = ? AND entity = ? AND entity_id = ? AND deleted = 0`,
         [snapshot.ownerId, entity, id],
@@ -257,12 +295,17 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
     if (mutation.ownerId !== snapshot.ownerId) {
       throw new Error('Mutation owner does not match the active repository owner')
     }
-    const hash = await mutationHash(mutation)
+    const hash = await hashMutationEnvelope(mutation)
     const payloadJson = canonicalStringify(mutation.payload)
     let didWrite = false
 
-    await this.accessDatabase(async (database) => {
-      await database.withExclusiveTransactionAsync(async (transaction) => {
+    await this.serializeWrite(async () => {
+      this.assertOwnerAvailable(mutation.ownerId)
+      if (!this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
+        throw new Error('Owner changed while waiting to commit a local mutation')
+      }
+      await this.accessDatabase(async (database) => {
+        await database.withExclusiveTransactionAsync(async (transaction) => {
         const duplicate = await transaction.getFirstAsync<ExistingMutationRow>(
           `/* outbox:duplicate */
            SELECT payload_hash FROM outbox WHERE owner_id = ? AND mutation_id = ?`,
@@ -277,31 +320,46 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
           return
         }
 
-        const deleted = mutation.kind === 'delete' ? 1 : 0
-        const payloadVersion =
-          mutation.kind === 'delete'
+        const records = mutation.kind === 'save_invoice_bundle'
+          ? [
+              { entity: 'client' as const, payload: (mutation.payload as InvoiceBundlePayload).client },
+              { entity: 'job' as const, payload: (mutation.payload as InvoiceBundlePayload).job },
+              { entity: 'invoice' as const, payload: (mutation.payload as InvoiceBundlePayload).invoice },
+            ]
+          : [
+              {
+                entity: mutation.entity,
+                payload: mutation.payload as Record<string, unknown> | null,
+              },
+            ]
+        for (const record of records) {
+          const deleted = mutation.kind === 'delete' ? 1 : 0
+          const entityId = deleted ? mutation.entityId : String(record.payload?.id)
+          const version = deleted
             ? (mutation.baseVersion ?? 0)
-            : Number((mutation.payload as Record<string, unknown>).version)
-        await transaction.runAsync(
-          `/* records:upsert */
-           INSERT INTO records
-             (owner_id, entity, entity_id, payload_json, version, deleted, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(owner_id, entity, entity_id) DO UPDATE SET
-             payload_json = excluded.payload_json,
-             version = excluded.version,
-             deleted = excluded.deleted,
-             updated_at = excluded.updated_at`,
-          [
-            mutation.ownerId,
-            mutation.entity,
-            mutation.entityId,
-            payloadJson,
-            payloadVersion,
-            deleted,
-            mutation.createdAt,
-          ],
-        )
+            : Number(record.payload?.version)
+          const updatedAt = deleted ? mutation.createdAt : String(record.payload?.updatedAt)
+          await transaction.runAsync(
+            `/* records:upsert */
+             INSERT INTO records
+               (owner_id, entity, entity_id, payload_json, version, deleted, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(owner_id, entity, entity_id) DO UPDATE SET
+               payload_json = excluded.payload_json,
+               version = excluded.version,
+               deleted = excluded.deleted,
+               updated_at = excluded.updated_at`,
+            [
+              mutation.ownerId,
+              record.entity,
+              entityId,
+              canonicalStringify(record.payload),
+              version,
+              deleted,
+              updatedAt,
+            ],
+          )
+        }
 
         const sequence = await transaction.getFirstAsync<NextSequenceRow>(
           `/* outbox:next-sequence */
@@ -331,12 +389,15 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
         )
         didWrite = true
 
-        if (!this.ownerBoundary.isCurrent(snapshot)) {
+        if (!this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
           throw new Error('Owner changed while committing a local mutation')
         }
-      })
+        })
+      }, true)
     })
-    if (didWrite && this.ownerBoundary.isCurrent(snapshot)) this.ownerBoundary.markDataChanged()
+    if (didWrite && this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
+      this.ownerBoundary.markDataChanged()
+    }
   }
 
   async applyCloudRows(inputRows: CloudRowEnvelope[]): Promise<void> {
@@ -363,8 +424,10 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
       return { row, payloadJson: canonicalStringify(payload) }
     })
 
-    await this.accessDatabase(async (database) => {
-      await database.withExclusiveTransactionAsync(async (transaction) => {
+    await this.serializeWrite(async () => {
+      this.assertOwnerAvailable(snapshot.ownerId)
+      await this.accessDatabase(async (database) => {
+        await database.withExclusiveTransactionAsync(async (transaction) => {
         for (const { row, payloadJson } of prepared) {
           await transaction.runAsync(
             `/* records:upsert */
@@ -379,12 +442,13 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
             [row.ownerId, row.entity, row.entityId, payloadJson, row.version, row.deleted ? 1 : 0, row.updatedAt],
           )
         }
-        if (!this.ownerBoundary.isCurrent(snapshot)) {
+        if (!this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
           throw new Error('Owner changed while applying cloud rows')
         }
+        })
       })
     })
-    if (prepared.length > 0 && this.ownerBoundary.isCurrent(snapshot)) {
+    if (prepared.length > 0 && this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
       this.ownerBoundary.markDataChanged()
     }
   }
@@ -410,8 +474,10 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
     const localPayloadJson = canonicalStringify(localPayload)
     const cloudPayloadJson = canonicalStringify(cloudPayload)
 
-    await this.accessDatabase(async (database) => {
-      await database.withExclusiveTransactionAsync(async (transaction) => {
+    await this.serializeWrite(async () => {
+      this.assertOwnerAvailable(snapshot.ownerId)
+      await this.accessDatabase(async (database) => {
+        await database.withExclusiveTransactionAsync(async (transaction) => {
         await transaction.runAsync(
           `/* conflicts:upsert */
            INSERT INTO conflicts
@@ -434,29 +500,39 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
             conflict.cloudVersion,
           ],
         )
-        if (!this.ownerBoundary.isCurrent(snapshot)) {
+        if (!this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
           throw new Error('Owner changed while recording a conflict')
         }
+        })
       })
     })
-    if (this.ownerBoundary.isCurrent(snapshot)) this.ownerBoundary.markDataChanged()
+    if (this.ownerBoundary.isOwnerEpochCurrent(snapshot)) this.ownerBoundary.markDataChanged()
   }
 
   clearOwner(ownerId: string): Promise<void> {
     if (!ownerId) return Promise.reject(new Error('An owner ID is required to clear data'))
+    if (this.closing) return Promise.reject(new Error('The repository is closing or closed'))
     const existing = this.clearPromises.get(ownerId)
     if (existing) return existing
 
+    this.clearingOwners.add(ownerId)
     this.ownerBoundary.beginDelete(ownerId)
-    const clear = this.accessDatabase(async (database) => {
-      await database.withExclusiveTransactionAsync(async (transaction) => {
-        await transaction.runAsync('/* owner:clear:records */ DELETE FROM records WHERE owner_id = ?', [ownerId])
-        await transaction.runAsync('/* owner:clear:outbox */ DELETE FROM outbox WHERE owner_id = ?', [ownerId])
-        await transaction.runAsync('/* owner:clear:conflicts */ DELETE FROM conflicts WHERE owner_id = ?', [ownerId])
-        await transaction.runAsync('/* owner:clear:sync_cursors */ DELETE FROM sync_cursors WHERE owner_id = ?', [ownerId])
-        await transaction.runAsync('/* owner:clear:metadata */ DELETE FROM metadata WHERE owner_id = ?', [ownerId])
-      })
+    const clear = this.serializeWrite(async () => {
+      await this.accessDatabase(async (database) => {
+        await database.withExclusiveTransactionAsync(async (transaction) => {
+          await transaction.runAsync('/* owner:clear:records */ DELETE FROM records WHERE owner_id = ?', [ownerId])
+          await transaction.runAsync('/* owner:clear:outbox */ DELETE FROM outbox WHERE owner_id = ?', [ownerId])
+          await transaction.runAsync('/* owner:clear:conflicts */ DELETE FROM conflicts WHERE owner_id = ?', [ownerId])
+          await transaction.runAsync('/* owner:clear:sync_cursors */ DELETE FROM sync_cursors WHERE owner_id = ?', [ownerId])
+          await transaction.runAsync('/* owner:clear:metadata */ DELETE FROM metadata WHERE owner_id = ?', [ownerId])
+        })
+      }, true)
+      this.failedClearOwners.delete(ownerId)
+    }).catch((error) => {
+      this.failedClearOwners.add(ownerId)
+      throw error
     }).finally(() => {
+      this.clearingOwners.delete(ownerId)
       this.clearPromises.delete(ownerId)
     })
     this.clearPromises.set(ownerId, clear)
@@ -475,6 +551,7 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
           // Opening already reports its own failure to the initiating caller.
         }
       }
+      await this.writeTail
       if (this.activeOperations > 0) {
         await new Promise<void>((resolve) => this.drainWaiters.push(resolve))
       }
@@ -488,7 +565,26 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
   private requireOwnerSnapshot() {
     const snapshot = this.ownerBoundary.capture()
     if (!snapshot.ownerId) throw new Error('The repository has no active owner')
+    this.assertOwnerAvailable(snapshot.ownerId)
     return snapshot as typeof snapshot & { ownerId: string }
+  }
+
+  private assertOwnerAvailable = (ownerId: string): void => {
+    if (this.clearingOwners.has(ownerId)) {
+      throw new Error(`Owner ${ownerId} data clear is in progress`)
+    }
+    if (this.failedClearOwners.has(ownerId)) {
+      throw new Error(`Owner ${ownerId} data clear failed; retry clearOwner before access`)
+    }
+  }
+
+  private serializeWrite = <T>(work: () => Promise<T>): Promise<T> => {
+    const run = this.writeTail.then(work, work)
+    this.writeTail = run.then(
+      () => undefined,
+      () => undefined,
+    )
+    return run
   }
 
   private parsePersistedPayload<T>(
@@ -545,8 +641,9 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
 
   private accessDatabase = async <T>(
     work: (database: SQLiteDatabase) => Promise<T>,
+    allowClosing = false,
   ): Promise<T> => {
-    if (this.closing) throw new Error('The repository is closing or closed')
+    if (this.closing && !allowClosing) throw new Error('The repository is closing or closed')
     if (!this.database && !this.openPromise) throw new Error('The repository has not been initialized')
     this.activeOperations += 1
     try {
