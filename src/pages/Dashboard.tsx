@@ -51,7 +51,7 @@ export default function Dashboard() {
 
   const overdueCount = invoices.filter((i) => {
     if (i.paymentStatus === 'Paid') return false
-    return (Date.now() - new Date(i.createdAt).getTime()) / 86400000 > 30
+    return (now.getTime() - new Date(i.createdAt).getTime()) / 86400000 > 30
   }).length
 
   if (!hydrated) {

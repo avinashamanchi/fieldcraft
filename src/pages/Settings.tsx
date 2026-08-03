@@ -13,7 +13,7 @@ const TRADE_TYPES: TradeType[] = ['Plumbing', 'Electrical', 'HVAC', 'Carpentry',
 const BLANK_SERVICE: Omit<Service, 'id'> = { name: '', description: '', estimatedHours: 1, defaultPrice: 0, category: '' }
 
 export default function Settings() {
-  const { userProfile, updateUserProfile, inventory, addInventoryItem, updateInventoryItem, deleteInventoryItem, services, addService, updateService, deleteService } = useStore()
+  const { userProfile, updateUserProfile, inventory, addInventoryItem, updateInventoryItem, services, addService, updateService, deleteService } = useStore()
   const [form, setForm] = useState({ ...userProfile })
   const [saved, setSaved] = useState(false)
   const [newItem, setNewItem] = useState({ name: '', quantity: 0, unit: 'ea', minStock: 1 })
