@@ -174,6 +174,29 @@ it('discards an in-flight outbox read after the owner changes', async () => {
   await expect(stale).resolves.toEqual([])
 })
 
+it('drains an accepted outbox read before concurrent closes deactivate the shared owner', async () => {
+  const reading = new SQLiteFieldCraftRepository({ databaseName: 'closing-outbox.db' })
+  const idle = new SQLiteFieldCraftRepository({ databaseName: 'closing-outbox.db' })
+  await Promise.all([reading.initialize('owner-a'), idle.initialize('owner-a')])
+  await reading.transactLocalMutation(
+    makeMutation('00000000-0000-4000-8000-000000000062', 'client-1'),
+  )
+  const paused = __pauseNextOutboxRead('closing-outbox.db')
+
+  const inFlight = reading.outbox.list('owner-a')
+  await paused.started
+  const readingClose = reading.close()
+  await idle.close()
+  const ownerWhileReading = reading.ownerBoundary.getSnapshot().ownerId
+  paused.release()
+
+  await expect(inFlight).resolves.toHaveLength(1)
+  await readingClose
+  expect(ownerWhileReading).toBe('owner-a')
+  expect(reading.ownerBoundary.getSnapshot().ownerId).toBeNull()
+  expect(__getRawDatabase('closing-outbox.db').closeCount).toBe(2)
+})
+
 it('rejects comment-routed malformed SQL and ownerless queries in the SQLite adapter', async () => {
   const repository = new SQLiteFieldCraftRepository({ databaseName: 'strict-sql.db' })
   await repository.initialize('owner-a')

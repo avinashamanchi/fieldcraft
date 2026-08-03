@@ -217,7 +217,7 @@ type RepositoryControlPlane = {
   clearingOwners: Set<string>
   failedClearOwners: Set<string>
   writeTail: Promise<void>
-  attachments: Set<symbol>
+  attachments: Map<symbol, 'attached' | 'closing'>
 }
 
 const databaseControlPlanes = new Map<string, RepositoryControlPlane>()
@@ -232,7 +232,7 @@ const getDatabaseControlPlane = (databaseName: string): RepositoryControlPlane =
     clearingOwners: new Set(),
     failedClearOwners: new Set(),
     writeTail: Promise.resolve(),
-    attachments: new Set(),
+    attachments: new Map(),
   }
   databaseControlPlanes.set(databaseName, controlPlane)
   return controlPlane
@@ -279,7 +279,7 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
       if (this.closing) throw new Error('The repository is closing or closed')
       if (generation === this.control.ownerRequestGeneration) this.ownerBoundary.switchOwner(ownerId)
     } catch (error) {
-      if (attachedNow) this.detach()
+      if (attachedNow && !this.closing && this.detach()) this.deactivateOwner()
       throw error
     }
   }
@@ -331,8 +331,6 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
     if (mutation.ownerId !== snapshot.ownerId) {
       throw new Error('Mutation owner does not match the active repository owner')
     }
-    const hash = await hashMutationEnvelope(mutation)
-    const payloadJson = canonicalStringify(mutation.payload)
     let didWrite = false
 
     await this.serializeWrite(async () => {
@@ -340,6 +338,8 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
       if (!this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
         throw new Error('Owner changed while waiting to commit a local mutation')
       }
+      const hash = await hashMutationEnvelope(mutation)
+      const payloadJson = canonicalStringify(mutation.payload)
       await this.accessDatabase(async (database) => {
         await database.withExclusiveTransactionAsync(async (transaction) => {
         const duplicate = await transaction.getFirstAsync<ExistingMutationRow>(
@@ -482,7 +482,7 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
           throw new Error('Owner changed while applying cloud rows')
         }
         })
-      })
+      }, true)
     })
     if (prepared.length > 0 && this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
       this.ownerBoundary.markDataChanged()
@@ -540,7 +540,7 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
           throw new Error('Owner changed while recording a conflict')
         }
         })
-      })
+      }, true)
     })
     if (this.ownerBoundary.isOwnerEpochCurrent(snapshot)) this.ownerBoundary.markDataChanged()
   }
@@ -578,7 +578,7 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise
     this.closing = true
-    const lastAttachment = this.detach()
+    if (this.attached) this.control.attachments.set(this.attachmentToken, 'closing')
     this.closePromise = (async () => {
       if (this.openPromise) {
         try {
@@ -593,10 +593,13 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
       if (this.activeOperations > 0) {
         await new Promise<void>((resolve) => this.drainWaiters.push(resolve))
       }
-      if (lastAttachment && this.control.attachments.size === 0) this.deactivateOwner()
       const database = this.database
       this.database = null
-      if (database) await database.closeAsync()
+      try {
+        if (database) await database.closeAsync()
+      } finally {
+        if (this.detach()) this.deactivateOwner()
+      }
     })()
     return this.closePromise
   }
@@ -642,7 +645,7 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
   private attach(): boolean {
     if (this.attached) return false
     this.attached = true
-    this.control.attachments.add(this.attachmentToken)
+    this.control.attachments.set(this.attachmentToken, 'attached')
     return true
   }
 

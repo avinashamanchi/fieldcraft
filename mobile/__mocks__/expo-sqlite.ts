@@ -38,6 +38,7 @@ export type MockDatabaseState = {
   closeCount: number
   nextReadPause: ReadPause | null
   nextOutboxReadPause: ReadPause | null
+  nextMigrationReadPause: ReadPause | null
   nextOwnerClearPause: ReadPause | null
   nextOutboxInsertPause: ReadPause | null
   transactionTail: Promise<void>
@@ -66,6 +67,7 @@ const createState = (): MockDatabaseState => ({
   closeCount: 0,
   nextReadPause: null,
   nextOutboxReadPause: null,
+  nextMigrationReadPause: null,
   nextOwnerClearPause: null,
   nextOutboxInsertPause: null,
   transactionTail: Promise.resolve(),
@@ -85,6 +87,7 @@ const copyState = (state: MockDatabaseState): MockDatabaseState => ({
   closeCount: state.closeCount,
   nextReadPause: state.nextReadPause,
   nextOutboxReadPause: state.nextOutboxReadPause,
+  nextMigrationReadPause: state.nextMigrationReadPause,
   nextOwnerClearPause: state.nextOwnerClearPause,
   nextOutboxInsertPause: state.nextOutboxInsertPause,
   transactionTail: state.transactionTail,
@@ -376,6 +379,12 @@ class MockSQLiteDatabase {
     const sql = normalizeSql(source)
     if (/PRAGMA\s+user_version/i.test(source)) {
       requireExactSql(sql, 'pragma user_version', 'user version read')
+      const pause = this.control.nextMigrationReadPause
+      if (pause) {
+        this.control.nextMigrationReadPause = null
+        pause.markStarted()
+        await pause.wait
+      }
       return { user_version: this.state.userVersion } as T
     }
     if (source.includes('records:get')) {
@@ -538,6 +547,14 @@ export const __pauseNextOutboxRead = (
   return { started: pause.started, release: pause.release }
 }
 
+export const __pauseNextMigrationRead = (
+  name: string,
+): { started: Promise<void>; release: () => void } => {
+  const pause = createPause()
+  __getRawDatabase(name).nextMigrationReadPause = pause
+  return { started: pause.started, release: pause.release }
+}
+
 export const __pauseNextOwnerClear = (
   name: string,
 ): { started: Promise<void>; release: () => void } => {
@@ -568,6 +585,9 @@ declare module 'expo-sqlite' {
     name: string,
   ) => { started: Promise<void>; release: () => void }
   export const __pauseNextOutboxRead: (
+    name: string,
+  ) => { started: Promise<void>; release: () => void }
+  export const __pauseNextMigrationRead: (
     name: string,
   ) => { started: Promise<void>; release: () => void }
   export const __pauseNextOwnerClear: (

@@ -330,3 +330,31 @@ it('rejects schema-valid persisted invoice total corruption from both list and g
   await expect(repository.list('invoice')).rejects.toThrow(/corrupt/i)
   await expect(repository.get('invoice', 'invoice-1')).rejects.toThrow(/corrupt/i)
 })
+
+it('drains a failing accepted write before final owner deactivation and closes each connection once', async () => {
+  const writer = new SQLiteFieldCraftRepository({ databaseName: 'failed-write-close.db' })
+  const peer = new SQLiteFieldCraftRepository({ databaseName: 'failed-write-close.db' })
+  await Promise.all([writer.initialize(OWNER), peer.initialize(OWNER)])
+  const paused = __pauseNextOutboxInsert('failed-write-close.db')
+  __failNextOutboxInsert('failed-write-close.db')
+
+  const write = writer.transactLocalMutation(mutation())
+  await paused.started
+  const writerClose = writer.close()
+  await peer.close()
+  const ownerWhileWriteWasPending = writer.ownerBoundary.getSnapshot().ownerId
+  paused.release()
+
+  await expect(write).rejects.toThrow(/outbox/i)
+  await expect(writerClose).resolves.toBeUndefined()
+
+  const raw = __getRawDatabase('failed-write-close.db')
+  expect(ownerWhileWriteWasPending).toBe(OWNER)
+  expect(writer.ownerBoundary.getSnapshot().ownerId).toBeNull()
+  expect(raw.records).toEqual([])
+  expect(raw.outbox).toEqual([])
+  expect(raw.closeCount).toBe(2)
+
+  await Promise.all([writer.close(), peer.close()])
+  expect(raw.closeCount).toBe(2)
+})

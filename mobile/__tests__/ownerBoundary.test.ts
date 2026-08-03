@@ -7,6 +7,7 @@ jest.mock('expo-crypto', () => ({
 import {
   __failNextOwnerClear,
   __getRawDatabase,
+  __pauseNextMigrationRead,
   __pauseNextOwnerClear,
   __pauseNextOutboxInsert,
   __pauseNextRecordsRead,
@@ -271,4 +272,133 @@ it('a peer in-flight read completes when a different repository connection close
   await expect(inFlight).resolves.toHaveLength(1)
   await expect(reading.list('client')).resolves.toHaveLength(1)
   await reading.close()
+})
+
+it('drains a pre-database mutation before concurrent closes deactivate the shared owner', async () => {
+  const writing = new SQLiteFieldCraftRepository({ databaseName: 'concurrent-close-write.db' })
+  const idle = new SQLiteFieldCraftRepository({ databaseName: 'concurrent-close-write.db' })
+  await Promise.all([writing.initialize('owner-a'), idle.initialize('owner-a')])
+  let nullTransitions = 0
+  const unsubscribe = writing.ownerBoundary.subscribe(() => {
+    if (writing.ownerBoundary.getSnapshot().ownerId === null) nullTransitions += 1
+  })
+
+  // Hashing is asynchronous, so this operation has been accepted before it joins the write queue.
+  const mutation = writing.transactLocalMutation(mutationFor('owner-a', 'client-a'))
+  const writingClose = writing.close()
+  const deniedRead = writing.list('client')
+  const idleClose = idle.close()
+
+  await expect(deniedRead).rejects.toThrow(/closed|closing/i)
+  await expect(mutation).resolves.toBeUndefined()
+  await Promise.all([writingClose, idleClose])
+
+  expect(__getRawDatabase('concurrent-close-write.db').records).toHaveLength(1)
+  expect(__getRawDatabase('concurrent-close-write.db').outbox).toHaveLength(1)
+  expect(writing.ownerBoundary.getSnapshot().ownerId).toBeNull()
+  expect(nullTransitions).toBe(1)
+  expect(__getRawDatabase('concurrent-close-write.db').closeCount).toBe(2)
+
+  await Promise.all([writing.close(), idle.close()])
+  expect(__getRawDatabase('concurrent-close-write.db').closeCount).toBe(2)
+  unsubscribe()
+})
+
+it.each([
+  ['reading attachment closes first', 'concurrent-close-read-first.db', true],
+  ['idle attachment closes first', 'concurrent-close-idle-first.db', false],
+] as const)('keeps an in-flight read valid when the %s', async (_label, databaseName, readingClosesFirst) => {
+  const reading = new SQLiteFieldCraftRepository({ databaseName })
+  const idle = new SQLiteFieldCraftRepository({ databaseName })
+  await Promise.all([reading.initialize('owner-a'), idle.initialize('owner-a')])
+  await reading.transactLocalMutation(mutationFor('owner-a', 'client-a'))
+  const paused = __pauseNextRecordsRead(databaseName)
+
+  const inFlightRead = reading.list('client')
+  await paused.started
+  const firstClose = readingClosesFirst ? reading.close() : idle.close()
+  const secondClose = readingClosesFirst ? idle.close() : reading.close()
+  const readingClose = readingClosesFirst ? firstClose : secondClose
+  const idleClose = readingClosesFirst ? secondClose : firstClose
+  await idleClose
+  const ownerWhileReading = reading.ownerBoundary.getSnapshot().ownerId
+  paused.release()
+
+  await expect(inFlightRead).resolves.toHaveLength(1)
+  await readingClose
+  expect(ownerWhileReading).toBe('owner-a')
+  expect(reading.ownerBoundary.getSnapshot().ownerId).toBeNull()
+  expect(__getRawDatabase(databaseName).closeCount).toBe(2)
+})
+
+it('lets a replacement attachment arrive during shared drain without an owner deactivation gap', async () => {
+  const writing = new SQLiteFieldCraftRepository({ databaseName: 'replacement-during-drain.db' })
+  const idle = new SQLiteFieldCraftRepository({ databaseName: 'replacement-during-drain.db' })
+  await Promise.all([writing.initialize('owner-a'), idle.initialize('owner-a')])
+  const paused = __pauseNextOutboxInsert('replacement-during-drain.db')
+  let nullTransitions = 0
+  const unsubscribe = writing.ownerBoundary.subscribe(() => {
+    if (writing.ownerBoundary.getSnapshot().ownerId === null) nullTransitions += 1
+  })
+
+  const mutation = writing.transactLocalMutation(mutationFor('owner-a', 'client-a'))
+  await paused.started
+  const writingClose = writing.close()
+  await idle.close()
+
+  const replacement = new SQLiteFieldCraftRepository({ databaseName: 'replacement-during-drain.db' })
+  const replacementInitialization = replacement.initialize('owner-a')
+  const nullTransitionsBeforeFinalClose = nullTransitions
+  paused.release()
+
+  await expect(mutation).resolves.toBeUndefined()
+  await writingClose
+  await replacementInitialization
+  await expect(replacement.list('client')).resolves.toHaveLength(1)
+  expect(replacement.ownerBoundary.getSnapshot().ownerId).toBe('owner-a')
+  expect(nullTransitionsBeforeFinalClose).toBe(0)
+
+  await replacement.close()
+  expect(nullTransitions).toBe(1)
+  expect(__getRawDatabase('replacement-during-drain.db').closeCount).toBe(3)
+  unsubscribe()
+})
+
+it('deactivates exactly once when a replacement attachment fails initialization during drain', async () => {
+  const draining = new SQLiteFieldCraftRepository({ databaseName: 'failed-replacement.db' })
+  const idle = new SQLiteFieldCraftRepository({ databaseName: 'failed-replacement.db' })
+  await Promise.all([draining.initialize('owner-a'), idle.initialize('owner-a')])
+  await draining.transactLocalMutation(mutationFor('owner-a', 'client-a'))
+  const readPause = __pauseNextRecordsRead('failed-replacement.db')
+  const inFlightRead = draining.list('client')
+  await readPause.started
+  let nullTransitions = 0
+  const unsubscribe = draining.ownerBoundary.subscribe(() => {
+    if (draining.ownerBoundary.getSnapshot().ownerId === null) nullTransitions += 1
+  })
+
+  const drainingClose = draining.close()
+  await idle.close()
+  const raw = __getRawDatabase('failed-replacement.db')
+  raw.userVersion = 2
+  const migrationPause = __pauseNextMigrationRead('failed-replacement.db')
+  const replacement = new SQLiteFieldCraftRepository({ databaseName: 'failed-replacement.db' })
+  const replacementInitialization = replacement.initialize('owner-a')
+  await migrationPause.started
+
+  readPause.release()
+  await expect(inFlightRead).resolves.toHaveLength(1)
+  await drainingClose
+  const ownerWhileReplacementWasOpening = draining.ownerBoundary.getSnapshot().ownerId
+  migrationPause.release()
+
+  await expect(replacementInitialization).rejects.toThrow(/newer|schema/i)
+  expect(ownerWhileReplacementWasOpening).toBe('owner-a')
+  expect(draining.ownerBoundary.getSnapshot().ownerId).toBeNull()
+  expect(nullTransitions).toBe(1)
+  expect(raw.closeCount).toBe(3)
+
+  await replacement.close()
+  expect(raw.closeCount).toBe(3)
+  unsubscribe()
 })
