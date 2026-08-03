@@ -231,3 +231,44 @@ it('shares failed-clear denial and successful retry across repository instances'
     }),
   ).resolves.toBeUndefined()
 })
+
+it('closing one attached repository leaves its peer owner, reads, writes, and outbox active', async () => {
+  const first = new SQLiteFieldCraftRepository({ databaseName: 'peer-close.db' })
+  const second = new SQLiteFieldCraftRepository({ databaseName: 'peer-close.db' })
+  await Promise.all([first.initialize('owner-a'), second.initialize('owner-a')])
+  await first.transactLocalMutation(mutationFor('owner-a', 'client-a'))
+
+  await first.close()
+
+  await expect(first.list('client')).rejects.toThrow(/closed|closing/i)
+  await expect(first.outbox.list('owner-a')).rejects.toThrow(/closed|closing/i)
+  await expect(second.list('client')).resolves.toHaveLength(1)
+  await expect(
+    second.transactLocalMutation({
+      ...mutationFor('owner-a', 'client-b'),
+      id: '00000000-0000-4000-8000-000000000015',
+    }),
+  ).resolves.toBeUndefined()
+  await expect(second.outbox.list('owner-a')).resolves.toHaveLength(2)
+
+  await second.close()
+  expect(second.ownerBoundary.getSnapshot().ownerId).toBeNull()
+  await expect(second.list('client')).rejects.toThrow(/closed|closing|active owner/i)
+})
+
+it('a peer in-flight read completes when a different repository connection closes', async () => {
+  const closing = new SQLiteFieldCraftRepository({ databaseName: 'peer-inflight-close.db' })
+  const reading = new SQLiteFieldCraftRepository({ databaseName: 'peer-inflight-close.db' })
+  await Promise.all([closing.initialize('owner-a'), reading.initialize('owner-a')])
+  await reading.transactLocalMutation(mutationFor('owner-a', 'client-a'))
+  const paused = __pauseNextRecordsRead('peer-inflight-close.db')
+
+  const inFlight = reading.list('client')
+  await paused.started
+  await closing.close()
+  paused.release()
+
+  await expect(inFlight).resolves.toHaveLength(1)
+  await expect(reading.list('client')).resolves.toHaveLength(1)
+  await reading.close()
+})

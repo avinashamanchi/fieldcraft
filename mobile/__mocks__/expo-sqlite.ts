@@ -109,8 +109,63 @@ const asParams = (params: unknown[]): BindValue[] => {
 
 const normalizeSql = (source: string): string => source.replace(/\s+/g, ' ').trim().toLowerCase()
 
+const expectedSql = {
+  recordsUpsert: normalizeSql(`/* records:upsert */
+    INSERT INTO records
+      (owner_id, entity, entity_id, payload_json, version, deleted, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(owner_id, entity, entity_id) DO UPDATE SET
+      payload_json = excluded.payload_json,
+      version = excluded.version,
+      deleted = excluded.deleted,
+      updated_at = excluded.updated_at`),
+  outboxInsert: normalizeSql(`/* outbox:insert */
+    INSERT INTO outbox
+      (owner_id, mutation_id, sequence, entity, entity_id, kind, base_version,
+       payload_json, payload_hash, created_at, attempts)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
+  conflictUpsert: normalizeSql(`/* conflicts:upsert */
+    INSERT INTO conflicts
+      (owner_id, mutation_id, entity, entity_id, local_payload_json,
+       cloud_payload_json, cloud_version)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(owner_id, mutation_id) DO UPDATE SET
+      entity = excluded.entity,
+      entity_id = excluded.entity_id,
+      local_payload_json = excluded.local_payload_json,
+      cloud_payload_json = excluded.cloud_payload_json,
+      cloud_version = excluded.cloud_version`),
+  recordsClear: '/* owner:clear:records */ delete from records where owner_id = ?',
+  outboxClear: '/* owner:clear:outbox */ delete from outbox where owner_id = ?',
+  conflictsClear: '/* owner:clear:conflicts */ delete from conflicts where owner_id = ?',
+  cursorsClear: '/* owner:clear:sync_cursors */ delete from sync_cursors where owner_id = ?',
+  metadataClear: '/* owner:clear:metadata */ delete from metadata where owner_id = ?',
+  recordsGet: normalizeSql(`/* records:get */
+    SELECT entity_id, payload_json FROM records
+    WHERE owner_id = ? AND entity = ? AND entity_id = ? AND deleted = 0`),
+  duplicate: normalizeSql(`/* outbox:duplicate */
+    SELECT payload_hash FROM outbox WHERE owner_id = ? AND mutation_id = ?`),
+  nextSequence: normalizeSql(`/* outbox:next-sequence */
+    SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence
+    FROM outbox WHERE owner_id = ?`),
+  recordsList: normalizeSql(`/* records:list */
+    SELECT entity_id, payload_json FROM records
+    WHERE owner_id = ? AND entity = ? AND deleted = 0
+    ORDER BY updated_at DESC, entity_id ASC`),
+  outboxList: normalizeSql(`/* outbox:list */
+    SELECT owner_id, mutation_id, entity, entity_id, kind, base_version,
+           payload_json, payload_hash, created_at, attempts
+    FROM outbox
+    WHERE owner_id = ? AND state IN ('pending', 'failed')
+    ORDER BY sequence ASC`),
+} as const
+
 const assertSql = (condition: boolean, message: string): void => {
   if (!condition) throw new Error(`Invalid mock SQL: ${message}`)
+}
+
+const requireExactSql = (actual: string, expected: string, operation: string): void => {
+  assertSql(actual === expected, `${operation} must match its complete supported statement`)
 }
 
 const requireOwnerPredicate = (sql: string): void => {
@@ -181,6 +236,7 @@ class MockSQLiteDatabase {
     const params = asParams(rawParams)
     const sql = normalizeSql(source)
     if (source.includes('records:upsert')) {
+      requireExactSql(sql, expectedSql.recordsUpsert, 'records upsert')
       assertSql(sql.includes('insert into records'), 'records upsert must insert into records')
       assertSql(
         /on conflict\s*\(owner_id,\s*entity,\s*entity_id\)/.test(sql),
@@ -207,6 +263,7 @@ class MockSQLiteDatabase {
       return { changes: 1, lastInsertRowId: 0 }
     }
     if (source.includes('outbox:insert')) {
+      requireExactSql(sql, expectedSql.outboxInsert, 'outbox insert')
       assertSql(sql.includes('insert into outbox'), 'outbox insert must insert into outbox')
       assertSql(
         sql.includes('(owner_id, mutation_id, sequence, entity, entity_id, kind, base_version,'),
@@ -256,6 +313,7 @@ class MockSQLiteDatabase {
       return { changes: 1, lastInsertRowId: row.sequence }
     }
     if (source.includes('conflicts:upsert')) {
+      requireExactSql(sql, expectedSql.conflictUpsert, 'conflict upsert')
       assertSql(sql.includes('insert into conflicts'), 'conflict upsert must insert into conflicts')
       assertSql(
         /on conflict\s*\(owner_id,\s*mutation_id\)/.test(sql),
@@ -266,6 +324,7 @@ class MockSQLiteDatabase {
       return { changes: 1, lastInsertRowId: 0 }
     }
     if (source.includes('owner:clear:records')) {
+      requireExactSql(sql, expectedSql.recordsClear, 'records clear')
       assertSql(/^\/\* owner:clear:records \*\/ delete from records where owner_id = \?$/.test(sql), 'records clear SQL')
       const pause = this.control.nextOwnerClearPause
       if (pause) {
@@ -278,6 +337,7 @@ class MockSQLiteDatabase {
       return { changes: before - this.state.records.length, lastInsertRowId: 0 }
     }
     if (source.includes('owner:clear:outbox')) {
+      requireExactSql(sql, expectedSql.outboxClear, 'outbox clear')
       assertSql(/^\/\* owner:clear:outbox \*\/ delete from outbox where owner_id = \?$/.test(sql), 'outbox clear SQL')
       if (this.control.failNextOwnerClear) {
         this.control.failNextOwnerClear = false
@@ -288,18 +348,21 @@ class MockSQLiteDatabase {
       return { changes: before - this.state.outbox.length, lastInsertRowId: 0 }
     }
     if (source.includes('owner:clear:conflicts')) {
+      requireExactSql(sql, expectedSql.conflictsClear, 'conflicts clear')
       assertSql(/^\/\* owner:clear:conflicts \*\/ delete from conflicts where owner_id = \?$/.test(sql), 'conflicts clear SQL')
       requireOwnerPredicate(sql)
       this.state.conflicts = this.state.conflicts.filter((row) => row.owner_id !== params[0])
       return { changes: 1, lastInsertRowId: 0 }
     }
     if (source.includes('owner:clear:sync_cursors')) {
+      requireExactSql(sql, expectedSql.cursorsClear, 'sync cursor clear')
       assertSql(/^\/\* owner:clear:sync_cursors \*\/ delete from sync_cursors where owner_id = \?$/.test(sql), 'sync cursor clear SQL')
       requireOwnerPredicate(sql)
       this.state.syncCursors = this.state.syncCursors.filter((row) => row.owner_id !== params[0])
       return { changes: 1, lastInsertRowId: 0 }
     }
     if (source.includes('owner:clear:metadata')) {
+      requireExactSql(sql, expectedSql.metadataClear, 'metadata clear')
       assertSql(/^\/\* owner:clear:metadata \*\/ delete from metadata where owner_id = \?$/.test(sql), 'metadata clear SQL')
       requireOwnerPredicate(sql)
       this.state.metadata = this.state.metadata.filter((row) => row.owner_id !== params[0])
@@ -312,9 +375,11 @@ class MockSQLiteDatabase {
     const params = asParams(rawParams)
     const sql = normalizeSql(source)
     if (/PRAGMA\s+user_version/i.test(source)) {
+      requireExactSql(sql, 'pragma user_version', 'user version read')
       return { user_version: this.state.userVersion } as T
     }
     if (source.includes('records:get')) {
+      requireExactSql(sql, expectedSql.recordsGet, 'records get')
       requireOwnerPredicate(sql)
       assertSql(
         /where owner_id = \? and entity = \? and entity_id = \? and deleted = 0$/.test(sql),
@@ -335,6 +400,7 @@ class MockSQLiteDatabase {
       return (row ? { ...row } : null) as T | null
     }
     if (source.includes('outbox:duplicate')) {
+      requireExactSql(sql, expectedSql.duplicate, 'duplicate lookup')
       requireOwnerPredicate(sql)
       assertSql(
         /from outbox where owner_id = \? and mutation_id = \?$/.test(sql),
@@ -348,6 +414,7 @@ class MockSQLiteDatabase {
       return (row ? { payload_hash: row.payload_hash } : null) as T | null
     }
     if (source.includes('outbox:next-sequence')) {
+      requireExactSql(sql, expectedSql.nextSequence, 'next sequence lookup')
       requireOwnerPredicate(sql)
       assertSql(
         /from outbox where owner_id = \?$/.test(sql),
@@ -367,6 +434,7 @@ class MockSQLiteDatabase {
     const params = asParams(rawParams)
     const sql = normalizeSql(source)
     if (source.includes('records:list')) {
+      requireExactSql(sql, expectedSql.recordsList, 'records list')
       requireOwnerPredicate(sql)
       assertSql(
         /where owner_id = \? and entity = \? and deleted = 0 order by updated_at desc, entity_id asc$/.test(sql),
@@ -390,6 +458,7 @@ class MockSQLiteDatabase {
       return result as T[]
     }
     if (source.includes('outbox:list')) {
+      requireExactSql(sql, expectedSql.outboxList, 'outbox list')
       requireOwnerPredicate(sql)
       assertSql(
         /where owner_id = \? and state in \('pending', 'failed'\) order by sequence asc$/.test(sql),

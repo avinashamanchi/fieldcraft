@@ -185,7 +185,7 @@ it('rejects comment-routed malformed SQL and ownerless queries in the SQLite ada
       '/* records:list */ SELECT entity_id, payload_json FROM records WHERE entity = ?',
       ['client'],
     ),
-  ).rejects.toThrow(/owner_id/i)
+  ).rejects.toThrow(/SQL|statement|owner_id/i)
   await expect(
     database.execAsync('CREATE TABLE IF NOT EXISTS records (id TEXT PRIMARY KEY)'),
   ).rejects.toThrow(/owner.scoped|owner_id/i)
@@ -196,4 +196,25 @@ it('rejects comment-routed malformed SQL and ownerless queries in the SQLite ada
       ['owner-a', 'client'],
     ),
   ).rejects.toThrow(/OR|boolean|owner/i)
+  const validTail = `SELECT entity_id, payload_json FROM records
+    WHERE owner_id = ? AND entity = ? AND deleted = 0
+    ORDER BY updated_at DESC, entity_id ASC`
+  await expect(
+    database.getAllAsync(
+      `/* records:list */ SELECT entity_id, payload_json FROM records
+       UNION ${validTail}`,
+      ['owner-a', 'client'],
+    ),
+  ).rejects.toThrow(/SQL|statement|UNION/i)
+  await expect(
+    database.getAllAsync(`SELECT 1; /* records:list */ ${validTail}`, ['owner-a', 'client']),
+  ).rejects.toThrow(/SQL|statement|prefix/i)
+  await expect(
+    database.getAllAsync(
+      `/* records:list */ SELECT entity_id, payload_json FROM records
+       WHERE owner_id = ? AND (entity = ? AND deleted = 0)
+       ORDER BY updated_at DESC, entity_id ASC`,
+      ['owner-a', 'client'],
+    ),
+  ).rejects.toThrow(/SQL|WHERE|group/i)
 })

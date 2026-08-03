@@ -217,6 +217,7 @@ type RepositoryControlPlane = {
   clearingOwners: Set<string>
   failedClearOwners: Set<string>
   writeTail: Promise<void>
+  attachments: Set<symbol>
 }
 
 const databaseControlPlanes = new Map<string, RepositoryControlPlane>()
@@ -231,6 +232,7 @@ const getDatabaseControlPlane = (databaseName: string): RepositoryControlPlane =
     clearingOwners: new Set(),
     failedClearOwners: new Set(),
     writeTail: Promise.resolve(),
+    attachments: new Set(),
   }
   databaseControlPlanes.set(databaseName, controlPlane)
   return controlPlane
@@ -242,12 +244,16 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
 
   private readonly databaseName: string
   private readonly control: RepositoryControlPlane
+  private readonly attachmentToken = Symbol('fieldcraft-repository-attachment')
+  private attached = false
   private database: SQLiteDatabase | null = null
   private openPromise: Promise<SQLiteDatabase> | null = null
   private closePromise: Promise<void> | null = null
   private closing = false
   private activeOperations = 0
   private drainWaiters: (() => void)[] = []
+  private pendingWrites = 0
+  private pendingWriteWaiters: (() => void)[] = []
 
   constructor(options: SQLiteFieldCraftRepositoryOptions = {}) {
     this.databaseName = options.databaseName ?? 'fieldcraft.db'
@@ -264,12 +270,18 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
   async initialize(ownerId: string): Promise<void> {
     if (!ownerId) throw new Error('An owner ID is required to initialize the repository')
     if (this.closing) throw new Error('The repository is closing or closed')
-    const activeOwner = this.ownerBoundary.getSnapshot().ownerId
-    if (activeOwner !== null && activeOwner !== ownerId) this.ownerBoundary.switchOwner(null)
-    const generation = ++this.control.ownerRequestGeneration
-    await this.ensureDatabase()
-    if (this.closing) throw new Error('The repository is closing or closed')
-    if (generation === this.control.ownerRequestGeneration) this.ownerBoundary.switchOwner(ownerId)
+    const attachedNow = this.attach()
+    try {
+      const activeOwner = this.ownerBoundary.getSnapshot().ownerId
+      if (activeOwner !== null && activeOwner !== ownerId) this.ownerBoundary.switchOwner(null)
+      const generation = ++this.control.ownerRequestGeneration
+      await this.ensureDatabase()
+      if (this.closing) throw new Error('The repository is closing or closed')
+      if (generation === this.control.ownerRequestGeneration) this.ownerBoundary.switchOwner(ownerId)
+    } catch (error) {
+      if (attachedNow) this.detach()
+      throw error
+    }
   }
 
   deactivateOwner(): void {
@@ -324,7 +336,7 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
     let didWrite = false
 
     await this.serializeWrite(async () => {
-      this.assertOwnerAvailable(mutation.ownerId)
+      this.assertSharedOwnerAvailable(mutation.ownerId)
       if (!this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
         throw new Error('Owner changed while waiting to commit a local mutation')
       }
@@ -449,7 +461,7 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
     })
 
     await this.serializeWrite(async () => {
-      this.assertOwnerAvailable(snapshot.ownerId)
+      this.assertSharedOwnerAvailable(snapshot.ownerId)
       await this.accessDatabase(async (database) => {
         await database.withExclusiveTransactionAsync(async (transaction) => {
         for (const { row, payloadJson } of prepared) {
@@ -499,7 +511,7 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
     const cloudPayloadJson = canonicalStringify(cloudPayload)
 
     await this.serializeWrite(async () => {
-      this.assertOwnerAvailable(snapshot.ownerId)
+      this.assertSharedOwnerAvailable(snapshot.ownerId)
       await this.accessDatabase(async (database) => {
         await database.withExclusiveTransactionAsync(async (transaction) => {
         await transaction.runAsync(
@@ -566,7 +578,7 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise
     this.closing = true
-    this.deactivateOwner()
+    const lastAttachment = this.detach()
     this.closePromise = (async () => {
       if (this.openPromise) {
         try {
@@ -575,10 +587,13 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
           // Opening already reports its own failure to the initiating caller.
         }
       }
-      await this.control.writeTail
+      if (this.pendingWrites > 0) {
+        await new Promise<void>((resolve) => this.pendingWriteWaiters.push(resolve))
+      }
       if (this.activeOperations > 0) {
         await new Promise<void>((resolve) => this.drainWaiters.push(resolve))
       }
+      if (lastAttachment && this.control.attachments.size === 0) this.deactivateOwner()
       const database = this.database
       this.database = null
       if (database) await database.closeAsync()
@@ -594,6 +609,11 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
   }
 
   private assertOwnerAvailable = (ownerId: string): void => {
+    if (this.closing) throw new Error('The repository is closing or closed')
+    this.assertSharedOwnerAvailable(ownerId)
+  }
+
+  private assertSharedOwnerAvailable = (ownerId: string): void => {
     if (this.control.clearingOwners.has(ownerId)) {
       throw new Error(`Owner ${ownerId} data clear is in progress`)
     }
@@ -603,12 +623,34 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
   }
 
   private serializeWrite = <T>(work: () => Promise<T>): Promise<T> => {
+    this.pendingWrites += 1
     const run = this.control.writeTail.then(work, work)
     this.control.writeTail = run.then(
       () => undefined,
       () => undefined,
     )
-    return run
+    return run.finally(() => {
+      this.pendingWrites -= 1
+      if (this.pendingWrites === 0) {
+        const waiters = this.pendingWriteWaiters
+        this.pendingWriteWaiters = []
+        for (const waiter of waiters) waiter()
+      }
+    })
+  }
+
+  private attach(): boolean {
+    if (this.attached) return false
+    this.attached = true
+    this.control.attachments.add(this.attachmentToken)
+    return true
+  }
+
+  private detach(): boolean {
+    if (!this.attached) return false
+    this.attached = false
+    this.control.attachments.delete(this.attachmentToken)
+    return this.control.attachments.size === 0
   }
 
   private parsePersistedPayload<T>(
