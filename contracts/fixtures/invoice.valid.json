@@ -1,0 +1,24 @@
+{
+  "clientName": "Jordan Lee",
+  "jobTitle": "Replace valve",
+  "jobAddress": "10 Main Street",
+  "jobDescription": "Replace the leaking shutoff valve.",
+  "tradeType": "Plumbing",
+  "taxBasisPoints": 825,
+  "paymentTerms": "Due on receipt",
+  "lineItems": [
+    {
+      "description": "Labor",
+      "type": "labor",
+      "quantity": 1500,
+      "unitPriceCents": 10000
+    },
+    {
+      "description": "Valve",
+      "type": "material",
+      "quantity": 1000,
+      "unitPriceCents": 2599
+    }
+  ],
+  "notes": "Thank you."
+}

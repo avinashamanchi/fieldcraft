@@ -1,0 +1,53 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://fieldcraft.app/contracts/fieldcraft.v1.schema.json",
+  "title": "FieldCraft Invoice Draft v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "clientName",
+    "jobTitle",
+    "tradeType",
+    "taxBasisPoints",
+    "paymentTerms",
+    "lineItems"
+  ],
+  "properties": {
+    "clientName": { "type": "string", "minLength": 1 },
+    "jobTitle": { "type": "string", "minLength": 1 },
+    "jobAddress": { "type": "string" },
+    "jobDescription": { "type": "string" },
+    "tradeType": {
+      "enum": [
+        "Plumbing",
+        "Electrical",
+        "HVAC",
+        "Carpentry",
+        "General",
+        "Roofing",
+        "Flooring",
+        "Painting"
+      ]
+    },
+    "taxBasisPoints": { "type": "integer", "minimum": 0, "maximum": 10000 },
+    "paymentTerms": { "enum": ["Due on receipt", "Net 14", "Net 30"] },
+    "lineItems": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 100,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["description", "type", "quantity", "unitPriceCents"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "description": { "type": "string", "minLength": 1, "maxLength": 500 },
+          "type": { "enum": ["labor", "material"] },
+          "quantity": { "type": "integer", "minimum": 0, "maximum": 10000 },
+          "unitPriceCents": { "type": "integer", "minimum": 0, "maximum": 100000000 }
+        }
+      }
+    },
+    "notes": { "type": "string" }
+  }
+}
