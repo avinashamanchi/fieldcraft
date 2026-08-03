@@ -190,3 +190,44 @@ it('clears only the requested owner partition across owner-scoped tables', async
   expect(raw.syncCursors).toEqual([{ owner_id: 'owner-b' }])
   expect(raw.metadata).toEqual([{ owner_id: 'owner-b' }])
 })
+
+it('shares pending clear gates across repositories using the same database', async () => {
+  const first = new SQLiteFieldCraftRepository({ databaseName: 'shared-pending-clear.db' })
+  const second = new SQLiteFieldCraftRepository({ databaseName: 'shared-pending-clear.db' })
+  await Promise.all([first.initialize('owner-a'), second.initialize('owner-a')])
+  await first.transactLocalMutation(mutationFor('owner-a', 'client-a'))
+  const paused = __pauseNextOwnerClear('shared-pending-clear.db')
+
+  const clear = first.clearOwner('owner-a')
+  await paused.started
+
+  await expect(second.list('client')).rejects.toThrow(/clear/i)
+  await expect(
+    second.transactLocalMutation({
+      ...mutationFor('owner-a', 'client-b'),
+      id: '00000000-0000-4000-8000-000000000013',
+    }),
+  ).rejects.toThrow(/clear/i)
+  paused.release()
+  await clear
+})
+
+it('shares failed-clear denial and successful retry across repository instances', async () => {
+  const first = new SQLiteFieldCraftRepository({ databaseName: 'shared-failed-clear.db' })
+  const second = new SQLiteFieldCraftRepository({ databaseName: 'shared-failed-clear.db' })
+  await Promise.all([first.initialize('owner-a'), second.initialize('owner-a')])
+  await first.transactLocalMutation(mutationFor('owner-a', 'client-a'))
+  __failNextOwnerClear('shared-failed-clear.db')
+
+  await expect(first.clearOwner('owner-a')).rejects.toThrow(/clear/i)
+  await expect(second.get('client', 'client-a')).rejects.toThrow(/clear failed/i)
+  await expect(second.clearOwner('owner-a')).resolves.toBeUndefined()
+  await expect(first.get('client', 'client-a')).resolves.toBeNull()
+
+  await expect(
+    second.transactLocalMutation({
+      ...mutationFor('owner-a', 'client-new'),
+      id: '00000000-0000-4000-8000-000000000014',
+    }),
+  ).resolves.toBeUndefined()
+})

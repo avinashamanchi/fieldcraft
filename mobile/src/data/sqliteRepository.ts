@@ -210,25 +210,49 @@ export type SQLiteFieldCraftRepositoryOptions = {
   databaseName?: string
 }
 
+type RepositoryControlPlane = {
+  ownerBoundary: OwnerBoundary
+  ownerRequestGeneration: number
+  clearPromises: Map<string, Promise<void>>
+  clearingOwners: Set<string>
+  failedClearOwners: Set<string>
+  writeTail: Promise<void>
+}
+
+const databaseControlPlanes = new Map<string, RepositoryControlPlane>()
+
+const getDatabaseControlPlane = (databaseName: string): RepositoryControlPlane => {
+  const existing = databaseControlPlanes.get(databaseName)
+  if (existing) return existing
+  const controlPlane: RepositoryControlPlane = {
+    ownerBoundary: new OwnerBoundary(),
+    ownerRequestGeneration: 0,
+    clearPromises: new Map(),
+    clearingOwners: new Set(),
+    failedClearOwners: new Set(),
+    writeTail: Promise.resolve(),
+  }
+  databaseControlPlanes.set(databaseName, controlPlane)
+  return controlPlane
+}
+
 export class SQLiteFieldCraftRepository implements FieldCraftRepository {
-  readonly ownerBoundary = new OwnerBoundary()
+  readonly ownerBoundary: OwnerBoundary
   readonly outbox: MutationOutbox
 
   private readonly databaseName: string
+  private readonly control: RepositoryControlPlane
   private database: SQLiteDatabase | null = null
   private openPromise: Promise<SQLiteDatabase> | null = null
   private closePromise: Promise<void> | null = null
   private closing = false
   private activeOperations = 0
   private drainWaiters: (() => void)[] = []
-  private ownerRequestGeneration = 0
-  private readonly clearPromises = new Map<string, Promise<void>>()
-  private readonly clearingOwners = new Set<string>()
-  private readonly failedClearOwners = new Set<string>()
-  private writeTail: Promise<void> = Promise.resolve()
 
   constructor(options: SQLiteFieldCraftRepositoryOptions = {}) {
     this.databaseName = options.databaseName ?? 'fieldcraft.db'
+    this.control = getDatabaseControlPlane(this.databaseName)
+    this.ownerBoundary = this.control.ownerBoundary
     this.outbox = new SQLiteMutationOutbox(
       this.accessDatabase,
       validateMutationEnvelope,
@@ -242,14 +266,14 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
     if (this.closing) throw new Error('The repository is closing or closed')
     const activeOwner = this.ownerBoundary.getSnapshot().ownerId
     if (activeOwner !== null && activeOwner !== ownerId) this.ownerBoundary.switchOwner(null)
-    const generation = ++this.ownerRequestGeneration
+    const generation = ++this.control.ownerRequestGeneration
     await this.ensureDatabase()
     if (this.closing) throw new Error('The repository is closing or closed')
-    if (generation === this.ownerRequestGeneration) this.ownerBoundary.switchOwner(ownerId)
+    if (generation === this.control.ownerRequestGeneration) this.ownerBoundary.switchOwner(ownerId)
   }
 
   deactivateOwner(): void {
-    this.ownerRequestGeneration += 1
+    this.control.ownerRequestGeneration += 1
     this.ownerBoundary.switchOwner(null)
   }
 
@@ -512,10 +536,10 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
   clearOwner(ownerId: string): Promise<void> {
     if (!ownerId) return Promise.reject(new Error('An owner ID is required to clear data'))
     if (this.closing) return Promise.reject(new Error('The repository is closing or closed'))
-    const existing = this.clearPromises.get(ownerId)
+    const existing = this.control.clearPromises.get(ownerId)
     if (existing) return existing
 
-    this.clearingOwners.add(ownerId)
+    this.control.clearingOwners.add(ownerId)
     this.ownerBoundary.beginDelete(ownerId)
     const clear = this.serializeWrite(async () => {
       await this.accessDatabase(async (database) => {
@@ -527,15 +551,15 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
           await transaction.runAsync('/* owner:clear:metadata */ DELETE FROM metadata WHERE owner_id = ?', [ownerId])
         })
       }, true)
-      this.failedClearOwners.delete(ownerId)
+      this.control.failedClearOwners.delete(ownerId)
     }).catch((error) => {
-      this.failedClearOwners.add(ownerId)
+      this.control.failedClearOwners.add(ownerId)
       throw error
     }).finally(() => {
-      this.clearingOwners.delete(ownerId)
-      this.clearPromises.delete(ownerId)
+      this.control.clearingOwners.delete(ownerId)
+      this.control.clearPromises.delete(ownerId)
     })
-    this.clearPromises.set(ownerId, clear)
+    this.control.clearPromises.set(ownerId, clear)
     return clear
   }
 
@@ -551,7 +575,7 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
           // Opening already reports its own failure to the initiating caller.
         }
       }
-      await this.writeTail
+      await this.control.writeTail
       if (this.activeOperations > 0) {
         await new Promise<void>((resolve) => this.drainWaiters.push(resolve))
       }
@@ -570,17 +594,17 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
   }
 
   private assertOwnerAvailable = (ownerId: string): void => {
-    if (this.clearingOwners.has(ownerId)) {
+    if (this.control.clearingOwners.has(ownerId)) {
       throw new Error(`Owner ${ownerId} data clear is in progress`)
     }
-    if (this.failedClearOwners.has(ownerId)) {
+    if (this.control.failedClearOwners.has(ownerId)) {
       throw new Error(`Owner ${ownerId} data clear failed; retry clearOwner before access`)
     }
   }
 
   private serializeWrite = <T>(work: () => Promise<T>): Promise<T> => {
-    const run = this.writeTail.then(work, work)
-    this.writeTail = run.then(
+    const run = this.control.writeTail.then(work, work)
+    this.control.writeTail = run.then(
       () => undefined,
       () => undefined,
     )
@@ -603,10 +627,12 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
     }
 
     try {
-      const parsed = entityPayloadSchemas[entity].parse(payload) as Record<string, unknown>
-      if (parsed.ownerId !== ownerId || (entityId !== undefined && parsed.id !== entityId)) {
-        throw new Error('Persisted entity identity does not match its owner-scoped cache key')
-      }
+      const parsed = validateEntityPayload(
+        entity,
+        payload,
+        ownerId,
+        entityId ?? String((payload as Record<string, unknown> | null)?.id ?? ''),
+      )
       return parsed as T
     } catch (cause) {
       throw new DataCorruptionError(

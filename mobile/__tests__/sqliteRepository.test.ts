@@ -8,6 +8,7 @@ import {
   __failNextOutboxInsert,
   __failNextMigration,
   __getRawDatabase,
+  __pauseNextOutboxInsert,
   __resetSQLiteMock,
 } from 'expo-sqlite'
 
@@ -297,4 +298,35 @@ it('rejects a list row whose SQLite key disagrees with its validated payload ID'
   __getRawDatabase('key-mismatch.db').records[0].entity_id = 'different-client'
 
   await expect(repository.list('client')).rejects.toThrow(/corrupt/i)
+})
+
+it('does not expose transaction-local cache rows before a later outbox failure rolls back', async () => {
+  const writer = new SQLiteFieldCraftRepository({ databaseName: 'transaction-isolation.db' })
+  const reader = new SQLiteFieldCraftRepository({ databaseName: 'transaction-isolation.db' })
+  await Promise.all([writer.initialize(OWNER), reader.initialize(OWNER)])
+  const paused = __pauseNextOutboxInsert('transaction-isolation.db')
+  __failNextOutboxInsert('transaction-isolation.db')
+
+  const write = writer.transactLocalMutation(mutation())
+  await paused.started
+
+  await expect(reader.list('client')).resolves.toEqual([])
+  paused.release()
+  await expect(write).rejects.toThrow(/outbox/i)
+  await expect(reader.list('client')).resolves.toEqual([])
+})
+
+it('rejects schema-valid persisted invoice total corruption from both list and get', async () => {
+  const repository = new SQLiteFieldCraftRepository({ databaseName: 'persisted-invoice-math.db' })
+  await repository.initialize(OWNER)
+  await repository.transactLocalMutation(bundleMutation())
+  const invoiceRow = __getRawDatabase('persisted-invoice-math.db').records.find(
+    (row) => row.entity === 'invoice',
+  )
+  if (!invoiceRow) throw new Error('invoice test fixture was not persisted')
+  const persisted = JSON.parse(invoiceRow.payload_json) as Record<string, unknown>
+  invoiceRow.payload_json = JSON.stringify({ ...persisted, totalCents: 16239 })
+
+  await expect(repository.list('invoice')).rejects.toThrow(/corrupt/i)
+  await expect(repository.get('invoice', 'invoice-1')).rejects.toThrow(/corrupt/i)
 })

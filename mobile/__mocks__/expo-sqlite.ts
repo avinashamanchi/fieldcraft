@@ -90,7 +90,7 @@ const copyState = (state: MockDatabaseState): MockDatabaseState => ({
   transactionTail: state.transactionTail,
 })
 
-const restoreState = (target: MockDatabaseState, source: MockDatabaseState): void => {
+const commitState = (target: MockDatabaseState, source: MockDatabaseState): void => {
   target.userVersion = source.userVersion
   target.tables = source.tables
   target.records = source.records
@@ -98,7 +98,6 @@ const restoreState = (target: MockDatabaseState, source: MockDatabaseState): voi
   target.conflicts = source.conflicts
   target.syncCursors = source.syncCursors
   target.metadata = source.metadata
-  target.closeCount = source.closeCount
 }
 
 const asParams = (params: unknown[]): BindValue[] => {
@@ -115,14 +114,18 @@ const assertSql = (condition: boolean, message: string): void => {
 }
 
 const requireOwnerPredicate = (sql: string): void => {
+  assertSql(!/\bor\b/.test(sql), 'owner predicate boolean OR is not supported')
   assertSql(/\bowner_id\s*=\s*\?/.test(sql), 'query must include owner_id = ?')
 }
 
 class MockSQLiteDatabase {
-  constructor(private readonly state: MockDatabaseState) {}
+  constructor(
+    private readonly state: MockDatabaseState,
+    private readonly control: MockDatabaseState = state,
+  ) {}
 
   async closeAsync(): Promise<void> {
-    this.state.closeCount += 1
+    this.control.closeCount += 1
   }
 
   async execAsync(source: string): Promise<void> {
@@ -138,8 +141,8 @@ class MockSQLiteDatabase {
         assertSql(sql.includes(constraint), `schema constraint must be owner-scoped: ${constraint}`)
       }
     }
-    if (this.state.failNextMigration && source.includes('CREATE TABLE IF NOT EXISTS records')) {
-      this.state.failNextMigration = false
+    if (this.control.failNextMigration && source.includes('CREATE TABLE IF NOT EXISTS records')) {
+      this.control.failNextMigration = false
       this.state.tables.add('records')
       throw new Error('simulated migration failure')
     }
@@ -160,17 +163,15 @@ class MockSQLiteDatabase {
     task: (transaction: MockSQLiteDatabase) => Promise<void>,
   ): Promise<void> {
     let release = () => {}
-    const previous = this.state.transactionTail
-    this.state.transactionTail = new Promise<void>((resolve) => {
+    const previous = this.control.transactionTail
+    this.control.transactionTail = new Promise<void>((resolve) => {
       release = resolve
     })
     await previous
-    const before = copyState(this.state)
+    const transactionState = copyState(this.control)
     try {
-      await task(this)
-    } catch (error) {
-      restoreState(this.state, before)
-      throw error
+      await task(new MockSQLiteDatabase(transactionState, this.control))
+      commitState(this.control, transactionState)
     } finally {
       release()
     }
@@ -212,14 +213,14 @@ class MockSQLiteDatabase {
         'outbox insert must include owner-scoped key columns',
       )
       assertSql(params.length === 11 && String(params[0]).length > 0, 'outbox insert parameters')
-      const pause = this.state.nextOutboxInsertPause
+      const pause = this.control.nextOutboxInsertPause
       if (pause) {
-        this.state.nextOutboxInsertPause = null
+        this.control.nextOutboxInsertPause = null
         pause.markStarted()
         await pause.wait
       }
-      if (this.state.failNextOutboxInsert) {
-        this.state.failNextOutboxInsert = false
+      if (this.control.failNextOutboxInsert) {
+        this.control.failNextOutboxInsert = false
         throw new Error('simulated outbox insertion failure')
       }
       const row: OutboxRow = {
@@ -266,9 +267,9 @@ class MockSQLiteDatabase {
     }
     if (source.includes('owner:clear:records')) {
       assertSql(/^\/\* owner:clear:records \*\/ delete from records where owner_id = \?$/.test(sql), 'records clear SQL')
-      const pause = this.state.nextOwnerClearPause
+      const pause = this.control.nextOwnerClearPause
       if (pause) {
-        this.state.nextOwnerClearPause = null
+        this.control.nextOwnerClearPause = null
         pause.markStarted()
         await pause.wait
       }
@@ -278,8 +279,8 @@ class MockSQLiteDatabase {
     }
     if (source.includes('owner:clear:outbox')) {
       assertSql(/^\/\* owner:clear:outbox \*\/ delete from outbox where owner_id = \?$/.test(sql), 'outbox clear SQL')
-      if (this.state.failNextOwnerClear) {
-        this.state.failNextOwnerClear = false
+      if (this.control.failNextOwnerClear) {
+        this.control.failNextOwnerClear = false
         throw new Error('simulated owner clear failure')
       }
       const before = this.state.outbox.length
@@ -315,6 +316,10 @@ class MockSQLiteDatabase {
     }
     if (source.includes('records:get')) {
       requireOwnerPredicate(sql)
+      assertSql(
+        /where owner_id = \? and entity = \? and entity_id = \? and deleted = 0$/.test(sql),
+        'records get WHERE clause and parameter order',
+      )
       assertSql(sql.includes('from records'), 'records get must query records')
       assertSql(sql.includes('entity = ?'), 'records get must include entity = ?')
       assertSql(sql.includes('deleted = 0'), 'records get must exclude tombstones')
@@ -331,6 +336,10 @@ class MockSQLiteDatabase {
     }
     if (source.includes('outbox:duplicate')) {
       requireOwnerPredicate(sql)
+      assertSql(
+        /from outbox where owner_id = \? and mutation_id = \?$/.test(sql),
+        'duplicate query WHERE clause and parameter order',
+      )
       assertSql(sql.includes('select payload_hash from outbox'), 'duplicate query must read outbox hash')
       assertSql(sql.includes('mutation_id = ?'), 'duplicate query mutation ID')
       const row = this.state.outbox.find(
@@ -340,6 +349,10 @@ class MockSQLiteDatabase {
     }
     if (source.includes('outbox:next-sequence')) {
       requireOwnerPredicate(sql)
+      assertSql(
+        /from outbox where owner_id = \?$/.test(sql),
+        'sequence query WHERE clause and parameter order',
+      )
       assertSql(sql.includes('max(sequence)'), 'sequence query must allocate from durable maximum')
       assertSql(sql.includes('from outbox'), 'sequence query must read outbox')
       const sequence = this.state.outbox
@@ -355,6 +368,10 @@ class MockSQLiteDatabase {
     const sql = normalizeSql(source)
     if (source.includes('records:list')) {
       requireOwnerPredicate(sql)
+      assertSql(
+        /where owner_id = \? and entity = \? and deleted = 0 order by updated_at desc, entity_id asc$/.test(sql),
+        'records list WHERE clause and parameter order',
+      )
       assertSql(sql.includes('from records'), 'records list must query records')
       assertSql(sql.includes('entity = ?'), 'records list must include entity = ?')
       assertSql(sql.includes('deleted = 0'), 'records list must exclude tombstones')
@@ -364,9 +381,9 @@ class MockSQLiteDatabase {
           (row) => row.owner_id === params[0] && row.entity === params[1] && row.deleted === 0,
         )
         .map((row) => ({ ...row }))
-      const pause = this.state.nextReadPause
+      const pause = this.control.nextReadPause
       if (pause) {
-        this.state.nextReadPause = null
+        this.control.nextReadPause = null
         pause.markStarted()
         await pause.wait
       }
@@ -374,6 +391,10 @@ class MockSQLiteDatabase {
     }
     if (source.includes('outbox:list')) {
       requireOwnerPredicate(sql)
+      assertSql(
+        /where owner_id = \? and state in \('pending', 'failed'\) order by sequence asc$/.test(sql),
+        'outbox list WHERE clause and parameter order',
+      )
       assertSql(sql.includes('from outbox'), 'outbox list must query outbox')
       assertSql(sql.includes("state in ('pending', 'failed')"), 'outbox list must filter sendable states')
       assertSql(sql.includes('payload_hash'), 'outbox list must select payload hash')
@@ -382,9 +403,9 @@ class MockSQLiteDatabase {
         .filter((row) => row.owner_id === params[0])
         .sort((left, right) => left.sequence - right.sequence)
         .map((row) => ({ ...row }))
-      const pause = this.state.nextOutboxReadPause
+      const pause = this.control.nextOutboxReadPause
       if (pause) {
-        this.state.nextOutboxReadPause = null
+        this.control.nextOutboxReadPause = null
         pause.markStarted()
         await pause.wait
       }

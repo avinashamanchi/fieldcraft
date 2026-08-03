@@ -189,4 +189,11 @@ it('rejects comment-routed malformed SQL and ownerless queries in the SQLite ada
   await expect(
     database.execAsync('CREATE TABLE IF NOT EXISTS records (id TEXT PRIMARY KEY)'),
   ).rejects.toThrow(/owner.scoped|owner_id/i)
+  await expect(
+    database.getAllAsync(
+      `/* records:list */ SELECT entity_id, payload_json FROM records
+       WHERE owner_id = ? OR entity = ? AND deleted = 0`,
+      ['owner-a', 'client'],
+    ),
+  ).rejects.toThrow(/OR|boolean|owner/i)
 })
