@@ -10,6 +10,12 @@ describe('FieldCraft web baseline', () => {
     expect(readFileSync('.node-version', 'utf8').trim()).toBe('22')
   })
 
+  it('requires the Node patch level required by React Router', () => {
+    const packageJson = JSON.parse(readFileSync('package.json', 'utf8'))
+
+    expect(packageJson.engines.node).toBe('>=22.22.0 <23')
+  })
+
   it('uses the patched React Router package directly', () => {
     const packageJson = JSON.parse(readFileSync('package.json', 'utf8'))
 
