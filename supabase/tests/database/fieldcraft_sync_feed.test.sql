@@ -2,7 +2,7 @@ begin;
 
 create extension if not exists pgtap with schema extensions;
 
-select plan(54);
+select plan(60);
 
 insert into auth.users (id, email)
 values
@@ -99,6 +99,16 @@ select
 from public.clients as client
 where client.id = '74000000-0000-0000-0000-000000000007';
 
+insert into public.mutation_receipts (
+  user_id, mutation_id, response, created_at, updated_at
+) values (
+  '70000000-0000-0000-0000-000000000007',
+  '73500000-0000-0000-0000-000000000017',
+  '{"status":"applied","entity":"client","kind":"delete","entity_id":"74000000-0000-0000-0000-000000000017","deleted_version":4}',
+  '2026-08-03T10:00:01.000Z',
+  '2026-08-03T10:00:09.000Z'
+);
+
 insert into public.mutation_receipts (user_id, mutation_id, response)
 select
   '70000000-0000-0000-0000-000000000007',
@@ -155,6 +165,65 @@ from public.clients as client
 join public.jobs as job on job.user_id = client.user_id and job.client_id = client.id
 where client.id = '74000000-0000-0000-0000-000000000007'
   and job.id = '75000000-0000-0000-0000-000000000007';
+
+insert into public.mutation_receipts (user_id, mutation_id, response)
+select
+  '70000000-0000-0000-0000-000000000007',
+  '73700000-0000-0000-0000-000000000007',
+  jsonb_build_object(
+    'status', 'applied',
+    'entity', 'invoice',
+    'kind', 'update',
+    'entity_id', invoice.id,
+    'cloud', to_jsonb(invoice) || jsonb_build_object(
+      'clients', jsonb_build_object('name', client.name),
+      'jobs', jsonb_build_object(
+        'title', job.title,
+        'address', job.address,
+        'description', job.description,
+        'trade_type', job.trade_type
+      )
+    )
+  )
+from public.clients as client
+join public.jobs as job on job.user_id = client.user_id and job.client_id = client.id
+join public.invoices as invoice
+  on invoice.user_id = job.user_id and invoice.client_id = job.client_id and invoice.job_id = job.id
+where client.id = '74000000-0000-0000-0000-000000000007'
+  and job.id = '75000000-0000-0000-0000-000000000007'
+  and invoice.id = '76000000-0000-0000-0000-000000000007';
+
+insert into public.mutation_receipts (user_id, mutation_id, response)
+select
+  '70000000-0000-0000-0000-000000000007',
+  '73800000-0000-0000-0000-000000000007',
+  jsonb_build_object(
+    'status', 'applied',
+    'entity', 'invoice',
+    'kind', 'update',
+    'entity_id', invoice.id,
+    'cloud', to_jsonb(invoice)
+  )
+from public.invoices as invoice
+where invoice.id = '76000000-0000-0000-0000-000000000007';
+
+insert into public.mutation_receipts (user_id, mutation_id, response)
+select
+  '70000000-0000-0000-0000-000000000007',
+  '73900000-0000-0000-0000-000000000007',
+  jsonb_build_object(
+    'status', 'applied',
+    'client', to_jsonb(client),
+    'job', to_jsonb(job),
+    'invoice', to_jsonb(invoice)
+  )
+from public.clients as client
+join public.jobs as job on job.user_id = client.user_id and job.client_id = client.id
+join public.invoices as invoice
+  on invoice.user_id = job.user_id and invoice.client_id = job.client_id and invoice.job_id = job.id
+where client.id = '74000000-0000-0000-0000-000000000007'
+  and job.id = '75000000-0000-0000-0000-000000000007'
+  and invoice.id = '76000000-0000-0000-0000-000000000007';
 
 set local role authenticated;
 create temporary table legacy_generic_applied (response jsonb not null) on commit drop;
@@ -230,6 +299,18 @@ select throws_ok(
   '22023',
   null,
   'a legacy generic receipt without a status is rejected'
+);
+select is(
+  (public.apply_entity_mutation(
+    '73500000-0000-0000-0000-000000000017',
+    'client',
+    'delete',
+    '74000000-0000-0000-0000-000000000017',
+    4,
+    '{}'
+  ) ->> 'deleted_at')::timestamptz,
+  '2026-08-03T10:00:01.000Z'::timestamptz,
+  'a legacy delete binds its immutable receipt creation time instead of replay update time'
 );
 
 create temporary table legacy_bundle_applied (response jsonb not null) on commit drop;
@@ -572,6 +653,60 @@ select is((select response -> 'cloud_payload' -> 'invoice' from missing_job_bund
 
 reset role;
 delete from public.clients where id = '74000000-0000-0000-0000-000000000007';
+set local role authenticated;
+select is(
+  (
+    select change #>> '{payload,clients,name}'
+    from jsonb_array_elements(public.pull_sync_changes(null, null, 500) -> 'changes') as entry(change)
+    where change ->> 'entity' = 'invoice'
+      and change ->> 'entity_id' = '76000000-0000-0000-0000-000000000007'
+      and (change ->> 'deleted')::boolean = false
+    order by (change ->> 'change_id')::bigint
+    limit 1
+  ),
+  'Bundle client',
+  'historical invoice feed events retain durable relationship snapshots after current rows are deleted'
+);
+select is(
+  public.apply_entity_mutation(
+    '73700000-0000-0000-0000-000000000007',
+    'invoice',
+    'update',
+    '76000000-0000-0000-0000-000000000007',
+    1,
+    '{"number":"Ignored replay body"}'
+  ) #>> '{cloud,clients,name}',
+  'Bundle client',
+  'a durable legacy invoice receipt binds after its current relationships are deleted'
+);
+select throws_ok(
+  $$ select public.apply_entity_mutation(
+    '73800000-0000-0000-0000-000000000007',
+    'invoice',
+    'update',
+    '76000000-0000-0000-0000-000000000007',
+    1,
+    '{"number":"Insufficient replay"}'
+  ) $$,
+  '22023',
+  null,
+  'an insufficient legacy invoice receipt fails closed after relationships are deleted'
+);
+select is(
+  public.save_invoice_bundle(
+    '73900000-0000-0000-0000-000000000007',
+    '{"client":{"id":"74000000-0000-0000-0000-000000000007"},"job":{"id":"75000000-0000-0000-0000-000000000007","clientId":"74000000-0000-0000-0000-000000000007"},"invoice":{"id":"76000000-0000-0000-0000-000000000007","clientId":"74000000-0000-0000-0000-000000000007","jobId":"75000000-0000-0000-0000-000000000007"}}'
+  ) ->> 'mutation_id',
+  '73900000-0000-0000-0000-000000000007',
+  'a durable legacy bundle receipt binds after every current member is deleted'
+);
+reset role;
+select ok(
+  not (select response ? 'mutation_id' from public.mutation_receipts
+       where user_id = '70000000-0000-0000-0000-000000000007'
+         and mutation_id = '73800000-0000-0000-0000-000000000007'),
+  'a failed legacy replay leaves its durable receipt unchanged'
+);
 set local role authenticated;
 create temporary table missing_all_bundle (response jsonb not null) on commit drop;
 insert into missing_all_bundle (response)

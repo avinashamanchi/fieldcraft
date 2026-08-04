@@ -181,6 +181,7 @@ type PreparedCloudRow = {
 }
 
 const FEED_RECONCILIATION_KEY = 'sync-feed-v2-reconciliation-required'
+const FEED_RECONCILIATION_TERMINAL_KEY = 'sync-feed-v2-terminal-reconciliation-pending'
 const recordKey = (entity: EntityName, entityId: string): string => `${entity}:${entityId}`
 
 const validateEntityPayload = (
@@ -366,7 +367,7 @@ const protectedReconciliationKeys = async (
 const finalizeBootstrapReconciliation = async (
   database: SQLiteDatabase,
   ownerId: string,
-): Promise<void> => {
+): Promise<boolean> => {
   const stagedRows = await database.getAllAsync<ReconciliationRecordRow>(
     `/* bootstrap:records:list */
      SELECT entity, entity_id, payload_json, version, deleted, updated_at
@@ -413,14 +414,120 @@ const finalizeBootstrapReconciliation = async (
       [ownerId, row.entity, row.entity_id],
     )
   }
+  if (protectedKeys.size > 0) {
+    await database.runAsync(
+      `/* metadata:reconciliation-terminal:upsert */
+       INSERT INTO metadata (owner_id, key, value)
+       VALUES (?, ?, ?)
+       ON CONFLICT(owner_id, key) DO UPDATE SET value = excluded.value`,
+      [ownerId, FEED_RECONCILIATION_TERMINAL_KEY, 'true'],
+    )
+    return false
+  }
   await database.runAsync(
     `/* bootstrap:stage:clear */ DELETE FROM sync_bootstrap_records WHERE owner_id = ?`,
     [ownerId],
   )
   await database.runAsync(
+    `/* metadata:reconciliation-terminal:delete */ DELETE FROM metadata WHERE owner_id = ? AND key = ?`,
+    [ownerId, FEED_RECONCILIATION_TERMINAL_KEY],
+  )
+  await database.runAsync(
     `/* metadata:reconciliation:delete */ DELETE FROM metadata WHERE owner_id = ? AND key = ?`,
     [ownerId, FEED_RECONCILIATION_KEY],
   )
+  return true
+}
+
+const stagedRowIsAtLeastAsNew = (
+  staged: ReconciliationRecordRow,
+  receipt: PreparedCloudRow,
+): boolean => {
+  const timestampOrder = staged.updated_at.localeCompare(receipt.row.updatedAt)
+  if (timestampOrder !== 0) return timestampOrder > 0
+  if (staged.deleted !== (receipt.row.deleted ? 1 : 0)) return staged.deleted === 1
+  return staged.version >= receipt.row.version
+}
+
+const repairAcknowledgedBootstrapRows = async (
+  database: SQLiteDatabase,
+  ownerId: string,
+  receiptRows: PreparedCloudRow[],
+): Promise<boolean> => {
+  const terminal = await database.getFirstAsync<MetadataRow>(
+    `/* metadata:reconciliation-terminal:get */
+     SELECT value FROM metadata WHERE owner_id = ? AND key = ?`,
+    [ownerId, FEED_RECONCILIATION_TERMINAL_KEY],
+  )
+  if (terminal?.value !== 'true') return false
+
+  const stagedRows = await database.getAllAsync<ReconciliationRecordRow>(
+    `/* bootstrap:records:list */
+     SELECT entity, entity_id, payload_json, version, deleted, updated_at
+     FROM sync_bootstrap_records
+     WHERE owner_id = ?`,
+    [ownerId],
+  )
+  const receiptByKey = new Map(
+    receiptRows.map((row) => [recordKey(row.row.entity, row.row.entityId), row]),
+  )
+  const repairs = stagedRows.filter((row) => {
+    const receipt = receiptByKey.get(recordKey(row.entity, row.entity_id))
+    return receipt !== undefined && stagedRowIsAtLeastAsNew(row, receipt)
+  })
+  if (repairs.length > 0) {
+    await writeCloudRows(database, prepareCloudRows(repairs.map((row) => {
+      let payload: unknown
+      try {
+        payload = JSON.parse(row.payload_json)
+      } catch (cause) {
+        throw new DataCorruptionError('Corrupt staged cloud row during acknowledgement repair', { cause })
+      }
+      return {
+        ownerId,
+        entity: row.entity,
+        entityId: row.entity_id,
+        payload,
+        version: row.version,
+        updatedAt: row.updated_at,
+        ...(row.deleted === 1 ? { deleted: true } : {}),
+      }
+    }), ownerId))
+  }
+
+  const remainingProtected = await protectedReconciliationKeys(database, ownerId)
+  for (const receipt of receiptRows) {
+    const key = recordKey(receipt.row.entity, receipt.row.entityId)
+    if (remainingProtected.has(key)) continue
+    await database.runAsync(
+      `/* bootstrap:stage:delete-key */
+       DELETE FROM sync_bootstrap_records
+       WHERE owner_id = ? AND entity = ? AND entity_id = ?`,
+      [ownerId, receipt.row.entity, receipt.row.entityId],
+    )
+  }
+  if (remainingProtected.size > 0) return false
+
+  await database.runAsync(
+    `/* bootstrap:stage:clear */ DELETE FROM sync_bootstrap_records WHERE owner_id = ?`,
+    [ownerId],
+  )
+  await database.runAsync(
+    `/* metadata:reconciliation-terminal:delete */ DELETE FROM metadata WHERE owner_id = ? AND key = ?`,
+    [ownerId, FEED_RECONCILIATION_TERMINAL_KEY],
+  )
+  await database.runAsync(
+    `/* metadata:reconciliation:delete */ DELETE FROM metadata WHERE owner_id = ? AND key = ?`,
+    [ownerId, FEED_RECONCILIATION_KEY],
+  )
+  await database.runAsync(
+    `/* metadata:initial-pull:upsert */
+     INSERT INTO metadata (owner_id, key, value)
+     VALUES (?, ?, ?)
+     ON CONFLICT(owner_id, key) DO UPDATE SET value = excluded.value`,
+    [ownerId, 'initial-cloud-pull-complete', 'true'],
+  )
+  return true
 }
 
 const prepareConflict = (
@@ -838,6 +945,7 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
     if (ownerId !== snapshot.ownerId) throw new Error('Pull owner must match the active owner')
     const prepared = prepareCloudRows(inputRows, ownerId)
     let reconciledBootstrap = false
+    let completedInitialHydration = false
 
     await this.serializeWrite(async () => {
       this.assertSharedOwnerAvailable(ownerId)
@@ -859,16 +967,18 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
           )
           if (markInitialHydration) {
             if (reconciliation?.value === 'true') {
-              await finalizeBootstrapReconciliation(transaction, ownerId)
+              completedInitialHydration = await finalizeBootstrapReconciliation(transaction, ownerId)
               reconciledBootstrap = true
+            } else completedInitialHydration = true
+            if (completedInitialHydration) {
+              await transaction.runAsync(
+                `/* metadata:initial-pull:upsert */
+                 INSERT INTO metadata (owner_id, key, value)
+                 VALUES (?, ?, ?)
+                 ON CONFLICT(owner_id, key) DO UPDATE SET value = excluded.value`,
+                [ownerId, 'initial-cloud-pull-complete', 'true'],
+              )
             }
-            await transaction.runAsync(
-              `/* metadata:initial-pull:upsert */
-               INSERT INTO metadata (owner_id, key, value)
-               VALUES (?, ?, ?)
-               ON CONFLICT(owner_id, key) DO UPDATE SET value = excluded.value`,
-              [ownerId, 'initial-cloud-pull-complete', 'true'],
-            )
           }
           if (!isCurrent() || !this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
             throw new Error('Owner changed while committing a pull')
@@ -879,7 +989,7 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
     if ((prepared.length > 0 || reconciledBootstrap) && this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
       this.ownerBoundary.markDataChanged()
     }
-    if (markInitialHydration && this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
+    if (completedInitialHydration && this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
       const listeners = this.control.initialPullListeners.get(ownerId)
       this.control.initialPullListeners.delete(ownerId)
       for (const listener of listeners ?? []) listener()
@@ -926,6 +1036,7 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
     const snapshot = this.requireOwnerSnapshot()
     if (ownerId !== snapshot.ownerId) throw new Error('Acknowledgement owner must match the active owner')
     const prepared = prepareCloudRows(inputRows, ownerId)
+    let completedInitialHydration = false
 
     await this.serializeWrite(async () => {
       this.assertSharedOwnerAvailable(ownerId)
@@ -942,13 +1053,25 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
           if (result.changes !== 1) {
             throw new Error('Mutation acknowledgement did not match one sendable outbox record')
           }
+          completedInitialHydration = await repairAcknowledgedBootstrapRows(
+            transaction,
+            ownerId,
+            prepared,
+          )
           if (!isCurrent() || !this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
             throw new Error('Owner changed while acknowledging a mutation')
           }
         })
       }, true)
     })
-    if (this.ownerBoundary.isOwnerEpochCurrent(snapshot)) this.ownerBoundary.markDataChanged()
+    if (this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
+      this.ownerBoundary.markDataChanged()
+      if (completedInitialHydration) {
+        const listeners = this.control.initialPullListeners.get(ownerId)
+        this.control.initialPullListeners.delete(ownerId)
+        for (const listener of listeners ?? []) listener()
+      }
+    }
   }
 
   async recordMutationFailure(
@@ -1043,6 +1166,7 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
 
   async resolveConflictKeepCloud(mutationId: string): Promise<void> {
     const snapshot = this.requireOwnerSnapshot()
+    let completedInitialHydration = false
     await this.serializeWrite(async () => {
       this.assertSharedOwnerAvailable(snapshot.ownerId)
       await this.accessDatabase(async (database) => {
@@ -1093,7 +1217,8 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
                 version: conflict.cloudVersion,
                 updatedAt: String((conflict.cloudPayload as Record<string, unknown>).updatedAt),
               }]
-          await writeCloudRows(transaction, prepareCloudRows(cloudRows, snapshot.ownerId))
+          const preparedCloudRows = prepareCloudRows(cloudRows, snapshot.ownerId)
+          await writeCloudRows(transaction, preparedCloudRows)
           const completed = await transaction.runAsync(
             `/* outbox:resolve */
              UPDATE outbox SET state = 'complete', last_error = NULL
@@ -1101,6 +1226,11 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
             [snapshot.ownerId, mutationId],
           )
           if (completed.changes !== 1) throw new Error('Conflict resolution did not match its outbox record')
+          completedInitialHydration = await repairAcknowledgedBootstrapRows(
+            transaction,
+            snapshot.ownerId,
+            preparedCloudRows,
+          )
           await transaction.runAsync(
             `/* conflicts:delete */ DELETE FROM conflicts WHERE owner_id = ? AND mutation_id = ?`,
             [snapshot.ownerId, mutationId],
@@ -1111,7 +1241,14 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
         })
       }, true)
     })
-    if (this.ownerBoundary.isOwnerEpochCurrent(snapshot)) this.ownerBoundary.markDataChanged()
+    if (this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
+      this.ownerBoundary.markDataChanged()
+      if (completedInitialHydration) {
+        const listeners = this.control.initialPullListeners.get(snapshot.ownerId)
+        this.control.initialPullListeners.delete(snapshot.ownerId)
+        for (const listener of listeners ?? []) listener()
+      }
+    }
   }
 
   async resolveConflictWithMutation(

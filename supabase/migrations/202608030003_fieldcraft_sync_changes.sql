@@ -173,21 +173,33 @@ begin
         when page.entity = 'invoice' then
           page.payload || jsonb_build_object(
             'clients', (
-              select jsonb_build_object('name', client.name)
-              from public.clients as client
-              where client.user_id = page.user_id
-                and client.id = (page.payload ->> 'client_id')::uuid
+              select jsonb_build_object('name', client_change.payload ->> 'name')
+              from public.sync_changes as client_change
+              where client_change.user_id = page.user_id
+                and client_change.entity = 'client'
+                and client_change.entity_id = (page.payload ->> 'client_id')::uuid
+                and not client_change.deleted
+                and (client_change.updated_at, client_change.change_id)
+                    <= (page.updated_at, page.change_id)
+              order by client_change.updated_at desc, client_change.change_id desc
+              limit 1
             ),
             'jobs', (
               select jsonb_build_object(
-                'title', job.title,
-                'address', job.address,
-                'description', job.description,
-                'trade_type', job.trade_type
+                'title', job_change.payload ->> 'title',
+                'address', job_change.payload ->> 'address',
+                'description', job_change.payload ->> 'description',
+                'trade_type', job_change.payload ->> 'trade_type'
               )
-              from public.jobs as job
-              where job.user_id = page.user_id
-                and job.id = nullif(page.payload ->> 'job_id', '')::uuid
+              from public.sync_changes as job_change
+              where job_change.user_id = page.user_id
+                and job_change.entity = 'job'
+                and job_change.entity_id = nullif(page.payload ->> 'job_id', '')::uuid
+                and not job_change.deleted
+                and (job_change.updated_at, job_change.change_id)
+                    <= (page.updated_at, page.change_id)
+              order by job_change.updated_at desc, job_change.change_id desc
+              limit 1
             )
           )
         else page.payload
@@ -315,9 +327,6 @@ language plpgsql
 security definer
 set search_path = pg_catalog, public
 as $$
-declare
-  v_client jsonb;
-  v_job jsonb;
 begin
   if p_payload is null then return null; end if;
   if jsonb_typeof(p_payload) <> 'object' then
@@ -325,28 +334,22 @@ begin
   end if;
   if p_entity <> 'invoice' then return p_payload; end if;
 
-  select jsonb_build_object('name', client.name) into v_client
-  from public.clients as client
-  where client.user_id = p_user_id
-    and client.id = (p_payload ->> 'client_id')::uuid;
-  if v_client is null then
-    raise exception 'receipt invoice client relationship is unavailable' using errcode = '22023';
+  perform public.require_jsonb_uuid(to_jsonb(p_payload ->> 'client_id'), 'receipt invoice client_id');
+  if jsonb_typeof(p_payload -> 'clients') <> 'object'
+    or nullif(btrim(p_payload #>> '{clients,name}'), '') is null
+  then
+    raise exception 'receipt invoice client snapshot is unavailable' using errcode = '22023';
   end if;
   if nullif(p_payload ->> 'job_id', '') is not null then
-    select jsonb_build_object(
-      'title', job.title,
-      'address', job.address,
-      'description', job.description,
-      'trade_type', job.trade_type
-    ) into v_job
-    from public.jobs as job
-    where job.user_id = p_user_id
-      and job.id = (p_payload ->> 'job_id')::uuid;
-    if v_job is null then
-      raise exception 'receipt invoice job relationship is unavailable' using errcode = '22023';
+    perform public.require_jsonb_uuid(to_jsonb(p_payload ->> 'job_id'), 'receipt invoice job_id');
+    if jsonb_typeof(p_payload -> 'jobs') <> 'object'
+      or nullif(btrim(p_payload #>> '{jobs,title}'), '') is null
+      or nullif(btrim(p_payload #>> '{jobs,trade_type}'), '') is null
+    then
+      raise exception 'receipt invoice job snapshot is unavailable' using errcode = '22023';
     end if;
   end if;
-  return p_payload || jsonb_build_object('clients', v_client, 'jobs', v_job);
+  return p_payload;
 end;
 $$;
 
@@ -356,7 +359,7 @@ revoke execute on function public.fieldcraft_enrich_receipt_entity(uuid, text, j
 create or replace function public.fieldcraft_bind_generic_receipt(
   p_user_id uuid,
   p_response jsonb,
-  p_receipt_updated_at timestamptz,
+  p_receipt_created_at timestamptz,
   p_mutation_id uuid,
   p_entity text,
   p_kind text,
@@ -416,7 +419,7 @@ begin
     p_response := p_response || jsonb_build_object(
       'deleted_at', coalesce(
         nullif(p_response ->> 'deleted_at', '')::timestamptz,
-        p_receipt_updated_at
+        p_receipt_created_at
       )
     );
   else
@@ -597,7 +600,7 @@ declare
   v_user_id uuid := auth.uid();
   v_response jsonb;
   v_cloud jsonb;
-  v_receipt_updated_at timestamptz;
+  v_receipt_created_at timestamptz;
 begin
   if v_user_id is null then
     raise exception 'authentication required' using errcode = '42501';
@@ -616,14 +619,14 @@ begin
   end if;
 
   perform pg_advisory_xact_lock(hashtextextended(v_user_id::text || ':' || p_mutation_id::text, 0));
-  select receipt.response, receipt.updated_at into v_response, v_receipt_updated_at
+  select receipt.response, receipt.created_at into v_response, v_receipt_created_at
   from public.mutation_receipts as receipt
   where receipt.user_id = v_user_id and receipt.mutation_id = p_mutation_id;
   if found then
     v_response := public.fieldcraft_bind_generic_receipt(
       v_user_id,
       v_response,
-      v_receipt_updated_at,
+      v_receipt_created_at,
       p_mutation_id,
       p_entity,
       p_kind,

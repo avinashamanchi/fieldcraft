@@ -202,6 +202,14 @@ const expectedSql = {
   bootstrapRecordDelete: normalizeSql(`/* bootstrap:records:delete */
     DELETE FROM records WHERE owner_id = ? AND entity = ? AND entity_id = ?`),
   bootstrapStageClear: '/* bootstrap:stage:clear */ delete from sync_bootstrap_records where owner_id = ?',
+  bootstrapStageDeleteKey: normalizeSql(`/* bootstrap:stage:delete-key */
+    DELETE FROM sync_bootstrap_records
+    WHERE owner_id = ? AND entity = ? AND entity_id = ?`),
+  reconciliationTerminalUpsert: normalizeSql(`/* metadata:reconciliation-terminal:upsert */
+    INSERT INTO metadata (owner_id, key, value)
+    VALUES (?, ?, ?)
+    ON CONFLICT(owner_id, key) DO UPDATE SET value = excluded.value`),
+  reconciliationTerminalDelete: '/* metadata:reconciliation-terminal:delete */ delete from metadata where owner_id = ? and key = ?',
   reconciliationDelete: '/* metadata:reconciliation:delete */ delete from metadata where owner_id = ? and key = ?',
   recordsGet: normalizeSql(`/* records:get */
     SELECT entity_id, payload_json FROM records
@@ -241,6 +249,8 @@ const expectedSql = {
   initialPullGet: normalizeSql(`/* metadata:initial-pull:get */
     SELECT value FROM metadata WHERE owner_id = ? AND key = ?`),
   reconciliationGet: normalizeSql(`/* metadata:reconciliation:get */
+    SELECT value FROM metadata WHERE owner_id = ? AND key = ?`),
+  reconciliationTerminalGet: normalizeSql(`/* metadata:reconciliation-terminal:get */
     SELECT value FROM metadata WHERE owner_id = ? AND key = ?`),
   bootstrapOutboxList: normalizeSql(`/* bootstrap:outbox:list */
     SELECT entity, entity_id, kind, payload_json
@@ -511,6 +521,16 @@ class MockSQLiteDatabase {
       else this.state.metadata[index] = row
       return { changes: 1, lastInsertRowId: 0 }
     }
+    if (source.includes('metadata:reconciliation-terminal:upsert')) {
+      requireExactSql(sql, expectedSql.reconciliationTerminalUpsert, 'terminal reconciliation metadata upsert')
+      const row = { owner_id: params[0], key: params[1], value: params[2] }
+      const index = this.state.metadata.findIndex(
+        (item) => item.owner_id === params[0] && item.key === params[1],
+      )
+      if (index === -1) this.state.metadata.push(row)
+      else this.state.metadata[index] = row
+      return { changes: 1, lastInsertRowId: 0 }
+    }
     if (source.includes('outbox:acknowledge')) {
       requireExactSql(sql, expectedSql.outboxAcknowledge, 'outbox acknowledgement')
       requireOwnerPredicate(sql)
@@ -649,6 +669,24 @@ class MockSQLiteDatabase {
       this.state.bootstrapRecords = this.state.bootstrapRecords.filter((row) => row.owner_id !== params[0])
       return { changes: before - this.state.bootstrapRecords.length, lastInsertRowId: 0 }
     }
+    if (source.includes('bootstrap:stage:delete-key')) {
+      requireExactSql(sql, expectedSql.bootstrapStageDeleteKey, 'bootstrap stage key delete')
+      requireOwnerPredicate(sql)
+      const before = this.state.bootstrapRecords.length
+      this.state.bootstrapRecords = this.state.bootstrapRecords.filter((row) => !(
+        row.owner_id === params[0] && row.entity === params[1] && row.entity_id === params[2]
+      ))
+      return { changes: before - this.state.bootstrapRecords.length, lastInsertRowId: 0 }
+    }
+    if (source.includes('metadata:reconciliation-terminal:delete')) {
+      requireExactSql(sql, expectedSql.reconciliationTerminalDelete, 'terminal reconciliation metadata delete')
+      requireOwnerPredicate(sql)
+      const before = this.state.metadata.length
+      this.state.metadata = this.state.metadata.filter(
+        (row) => !(row.owner_id === params[0] && row.key === params[1]),
+      )
+      return { changes: before - this.state.metadata.length, lastInsertRowId: 0 }
+    }
     if (source.includes('metadata:reconciliation:delete')) {
       requireExactSql(sql, expectedSql.reconciliationDelete, 'reconciliation metadata delete')
       requireOwnerPredicate(sql)
@@ -739,6 +777,12 @@ class MockSQLiteDatabase {
     }
     if (source.includes('metadata:reconciliation:get')) {
       requireExactSql(sql, expectedSql.reconciliationGet, 'reconciliation metadata get')
+      return this.state.metadata.find(
+        (row) => row.owner_id === params[0] && row.key === params[1],
+      ) as T | undefined ?? null
+    }
+    if (source.includes('metadata:reconciliation-terminal:get')) {
+      requireExactSql(sql, expectedSql.reconciliationTerminalGet, 'terminal reconciliation metadata get')
       return this.state.metadata.find(
         (row) => row.owner_id === params[0] && row.key === params[1],
       ) as T | undefined ?? null
