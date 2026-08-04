@@ -240,6 +240,21 @@ it('durably stops FIFO when an explicit recreation meets a concurrent cloud recr
         syncState: 'current',
       },
       cloudVersion: 1,
+      cloudRows: [{
+        ownerId: OWNER_A,
+        entity: 'client',
+        entityId: recreate.entityId,
+        payload: {
+          ...recreate.payload as Record<string, unknown>,
+          version: 1,
+          syncState: 'current',
+        },
+        version: 1,
+        updatedAt: '2026-08-03T10:00:00.000Z',
+        changeSource: 'sync_changes',
+        changeSeq: 1,
+        changeId: 1,
+      }],
     },
   }]
 

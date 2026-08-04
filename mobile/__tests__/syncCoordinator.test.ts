@@ -12,7 +12,11 @@ import {
   type SyncClock,
   type SyncRepository,
 } from '../src/data/syncCoordinator'
-import type { CloudRowEnvelope } from '../src/data/repository'
+import {
+  DataCorruptionError,
+  OutboxCorruptionError,
+  type CloudRowEnvelope,
+} from '../src/data/repository'
 import { createSupabaseGateway } from '../src/data/supabaseGateway'
 
 const OWNER_A = 'owner-a'
@@ -97,7 +101,10 @@ class FakeRepository implements SyncRepository {
   readonly cursors = new Map<string, string | null>()
   conflicts = 0
   failNextAcknowledgement = false
+  acknowledgementError: unknown = null
+  conflictError: unknown = null
   failFailureRecording = false
+  commitPullError: unknown = null
   acknowledgementGate: Promise<void> | null = null
   acknowledgementStarted: (() => void) | null = null
   readonly acknowledgementRepairFlags: boolean[] = []
@@ -117,6 +124,7 @@ class FakeRepository implements SyncRepository {
   }
 
   async commitPull(ownerId: string, rows: CloudRowEnvelope[], cursor: string): Promise<void> {
+    if (this.commitPullError) throw this.commitPullError
     this.events.push(`pull:${ownerId}:${rows.map((row) => row.entityId).join(',')}`)
     this.cursors.set(ownerId, cursor)
   }
@@ -133,6 +141,7 @@ class FakeRepository implements SyncRepository {
     this.acknowledgementStarted?.()
     await (this.acknowledgementGate ?? Promise.resolve())
     if (!isCurrent()) return
+    if (this.acknowledgementError) throw this.acknowledgementError
     if (this.failNextAcknowledgement) {
       this.failNextAcknowledgement = false
       throw new Error('simulated local transaction failure')
@@ -151,12 +160,20 @@ class FakeRepository implements SyncRepository {
   ): Promise<void> {
     if (this.failFailureRecording) throw new Error('simulated durable transition failure')
     this.events.push(`failure:${mutationId}:${reason}`)
+    if (reason === 'validation' || reason === 'invalid-response') {
+      for (const [ownerId, items] of this.pending) {
+        this.pending.set(ownerId, items.map((item) => item.id === mutationId
+          ? { ...item, failureReason: reason }
+          : item))
+      }
+    }
   }
 
   async recordMutationConflict(
     _ownerId: string,
     conflict: Parameters<SyncRepository['recordMutationConflict']>[1],
   ): Promise<void> {
+    if (this.conflictError) throw this.conflictError
     this.events.push(`conflict:${conflict.mutationId}`)
     this.conflicts += 1
     this.pending.set(
@@ -460,6 +477,10 @@ it('preserves both versions and stops FIFO processing on a version conflict', as
       localPayload: conflicted.payload,
       cloudPayload: clientPayload(OWNER_A, 'client-conflict', 'Cloud name', 3, 'current'),
       cloudVersion: 3,
+      cloudRows: [{
+        ...canonicalRow(OWNER_A, 'client-conflict', 3),
+        changeSource: 'sync_changes', changeSeq: 3, changeId: 3,
+      }],
     },
   }
 
@@ -483,7 +504,134 @@ it.each([
 
   expect(repository.events).toContain(`failure:${item.id}:${durableReason}`)
   expect(clock.timers.size).toBe(0)
-  expect(repository.pending.get(OWNER_A)).toEqual([item])
+  expect(repository.pending.get(OWNER_A)).toEqual([
+    expect.objectContaining({ id: item.id, failureReason: durableReason }),
+  ])
+})
+
+it('continues pulling cloud changes while a permanent local FIFO head remains stopped', async () => {
+  const { coordinator, repository, gateway, clock } = makeCoordinator()
+  const item = mutation('00000000-0000-4000-8000-000000000063', 'client-validation-head')
+  repository.pending.set(OWNER_A, [item])
+  gateway.pushError = new RemoteGatewayError('validation')
+
+  await coordinator.setLifecycle({
+    ownerId: OWNER_A,
+    authenticated: true,
+    foreground: true,
+    online: true,
+  })
+  expect(gateway.pulls).toBe(1)
+  expect(gateway.pushed).toEqual([item.id])
+
+  gateway.pushError = null
+  gateway.pullResult = {
+    rows: [canonicalRow(OWNER_A, 'unrelated-cloud-change', 3)],
+    cursor: 'cursor-after-permanent-head',
+    hasMore: false,
+  }
+  await coordinator.trigger()
+
+  expect(gateway.pulls).toBe(2)
+  expect(gateway.pushed).toEqual([item.id])
+  expect(repository.events).toContain('pull:owner-a:unrelated-cloud-change')
+  expect(coordinator.getStatus()).toMatchObject({ state: 'failed', pending: 1 })
+  expect(clock.timers.size).toBe(0)
+})
+
+it('marks the exact corrupted intent discovered during pull and schedules no retry', async () => {
+  const { coordinator, repository, gateway, clock } = makeCoordinator()
+  const earlier = mutation('00000000-0000-4000-8000-000000000061', 'client-earlier')
+  const corrupted = mutation('00000000-0000-4000-8000-000000000062', 'client-corrupted')
+  repository.pending.set(OWNER_A, [earlier, corrupted])
+  repository.commitPullError = new OutboxCorruptionError(corrupted.id)
+
+  await coordinator.setLifecycle({
+    ownerId: OWNER_A,
+    authenticated: true,
+    foreground: true,
+    online: true,
+  })
+
+  expect(repository.events).toContain(`failure:${corrupted.id}:invalid-response`)
+  expect(gateway.pushed).toEqual([])
+  expect(coordinator.getStatus()).toMatchObject({ state: 'failed', pending: 2 })
+  expect(clock.timers.size).toBe(0)
+})
+
+it('treats deterministic pulled-authority corruption as terminal and schedules no retry', async () => {
+  const { coordinator, repository, gateway, clock } = makeCoordinator()
+  const item = mutation('00000000-0000-4000-8000-000000000064', 'client-pull-corruption')
+  repository.pending.set(OWNER_A, [item])
+  repository.commitPullError = new DataCorruptionError('equivocating cloud authority')
+
+  await coordinator.setLifecycle({
+    ownerId: OWNER_A,
+    authenticated: true,
+    foreground: true,
+    online: true,
+  })
+
+  expect(gateway.pushed).toEqual([])
+  expect(coordinator.getStatus()).toMatchObject({ state: 'failed', pending: 1 })
+  expect(clock.timers.size).toBe(0)
+})
+
+it('marks the current mutation invalid when deterministic acknowledgement authority is corrupt', async () => {
+  const { coordinator, repository, gateway, clock } = makeCoordinator()
+  const item = mutation('00000000-0000-4000-8000-000000000065', 'client-ack-corruption')
+  repository.pending.set(OWNER_A, [item])
+  repository.acknowledgementError = new DataCorruptionError('malformed acknowledgement authority')
+  gateway.pushResult = { type: 'applied', rows: [canonicalRow(OWNER_A, item.entityId)] }
+
+  await coordinator.setLifecycle({
+    ownerId: OWNER_A,
+    authenticated: true,
+    foreground: true,
+    online: true,
+  })
+
+  expect(repository.events).toContain(`failure:${item.id}:invalid-response`)
+  expect(repository.pending.get(OWNER_A)).toEqual([
+    expect.objectContaining({ id: item.id, failureReason: 'invalid-response' }),
+  ])
+  expect(clock.timers.size).toBe(0)
+})
+
+it('marks the current mutation invalid when deterministic conflict authority is corrupt', async () => {
+  const { coordinator, repository, gateway, clock } = makeCoordinator()
+  const item = mutation('00000000-0000-4000-8000-000000000066', 'client-conflict-corruption')
+  repository.pending.set(OWNER_A, [item])
+  repository.conflictError = new DataCorruptionError('malformed conflict authority')
+  gateway.pushResult = {
+    type: 'conflict',
+    conflict: {
+      mutationId: item.id,
+      mutationKind: item.kind,
+      entity: item.entity,
+      entityId: item.entityId,
+      localPayload: item.payload,
+      cloudPayload: clientPayload(OWNER_A, item.entityId, 'Cloud', 2, 'current'),
+      cloudVersion: 2,
+      cloudRows: [{
+        ...canonicalRow(OWNER_A, item.entityId),
+        changeSource: 'sync_changes',
+        changeSeq: 2,
+        changeId: 2,
+      }],
+    },
+  }
+
+  await coordinator.setLifecycle({
+    ownerId: OWNER_A,
+    authenticated: true,
+    foreground: true,
+    online: true,
+  })
+
+  expect(repository.events).toContain(`failure:${item.id}:invalid-response`)
+  expect(repository.events).not.toContain(`conflict:${item.id}`)
+  expect(clock.timers.size).toBe(0)
 })
 
 type ProviderReply = { data: unknown; error: unknown | null; status: number }
@@ -545,7 +693,7 @@ it('calls the reviewed RPC boundary with the stable mutation UUID', async () => 
       entity_id: 'client-rpc',
       cloud: rawClient('client-rpc'),
       sync_position: {
-        updated_at: '2026-08-03T10:00:02.000Z', change_id: 80, source: 'sync_changes',
+        updated_at: '2026-08-03T10:00:02.000Z', change_seq: 80, change_id: 80, source: 'sync_changes',
       },
     },
   }
@@ -555,7 +703,7 @@ it('calls the reviewed RPC boundary with the stable mutation UUID', async () => 
   await expect(gateway.pushMutation(OWNER_A, item, new AbortController().signal)).resolves.toEqual({
     type: 'applied',
     rows: [{
-      ...canonicalRow(OWNER_A, 'client-rpc'), changeId: 80, changeSource: 'sync_changes',
+      ...canonicalRow(OWNER_A, 'client-rpc'), changeSeq: 80, changeId: 80, changeSource: 'sync_changes',
     }],
   })
   expect(client.rpcCalls).toEqual([
@@ -587,7 +735,7 @@ it('sends the reviewed object payload for deletes and returns a canonical tombst
       deleted_version: 4,
       deleted_at: '2026-08-03T10:00:00.000Z',
       sync_position: {
-        updated_at: '2026-08-03T10:00:00.000Z', change_id: 84, source: 'sync_changes',
+        updated_at: '2026-08-03T10:00:00.000Z', change_seq: 84, change_id: 84, source: 'sync_changes',
       },
     },
   }
@@ -608,6 +756,7 @@ it('sends the reviewed object payload for deletes and returns a canonical tombst
       payload: null,
       version: 4,
       updatedAt: item.createdAt,
+      changeSeq: 84,
       changeId: 84,
       changeSource: 'sync_changes',
       deleted: true,
@@ -703,6 +852,9 @@ it('normalizes the reviewed version-conflict response and rejects unknown shapes
       entity_id: item.entityId,
       cloud_version: 2,
       cloud_payload: rawClient(item.entityId),
+      sync_position: {
+        updated_at: '2026-08-03T10:00:02.000Z', change_seq: 83, change_id: 83, source: 'sync_changes',
+      },
     },
   }
   const gateway = createSupabaseGateway(client)
@@ -718,6 +870,10 @@ it('normalizes the reviewed version-conflict response and rejects unknown shapes
       localPayload: item.payload,
       cloudPayload: canonicalRow(OWNER_A, item.entityId).payload,
       cloudVersion: 2,
+      cloudRows: [{
+        ...canonicalRow(OWNER_A, item.entityId),
+        changeSeq: 83, changeId: 83, changeSource: 'sync_changes',
+      }],
     },
   })
 
@@ -744,11 +900,11 @@ it('pulls owner-readable rows from the globally ordered change feed', async () =
     data: {
       status: 'ok',
       changes: [
-        { change_id: 1, owner_id: OWNER_A, entity: 'client', entity_id: 'client-a', version: 2, updated_at: '2026-08-03T10:00:02.000Z', deleted: false, payload: rawClient('client-a', '2026-08-03T10:00:02.000Z') },
-        { change_id: 2, owner_id: OWNER_A, entity: 'client', entity_id: 'client-b', version: 2, updated_at: '2026-08-03T10:00:02.000Z', deleted: false, payload: rawClient('client-b', '2026-08-03T10:00:02.000Z') },
-        { change_id: 3, owner_id: OWNER_A, entity: 'client', entity_id: 'client-z', version: 2, updated_at: '2026-08-03T10:00:03.000Z', deleted: false, payload: rawClient('client-z', '2026-08-03T10:00:03.000Z') },
+        { change_seq: 1, change_id: 1, owner_id: OWNER_A, entity: 'client', entity_id: 'client-a', version: 2, updated_at: '2026-08-03T10:00:02.000Z', deleted: false, payload: rawClient('client-a', '2026-08-03T10:00:02.000Z') },
+        { change_seq: 2, change_id: 2, owner_id: OWNER_A, entity: 'client', entity_id: 'client-b', version: 2, updated_at: '2026-08-03T10:00:02.000Z', deleted: false, payload: rawClient('client-b', '2026-08-03T10:00:02.000Z') },
+        { change_seq: 3, change_id: 3, owner_id: OWNER_A, entity: 'client', entity_id: 'client-z', version: 2, updated_at: '2026-08-03T10:00:03.000Z', deleted: false, payload: rawClient('client-z', '2026-08-03T10:00:03.000Z') },
       ],
-      cursor: { updated_at: '2026-08-03T10:00:03.000Z', change_id: 3 },
+      cursor: { updated_at: '2026-08-03T10:00:03.000Z', change_seq: 3, change_id: 3 },
       has_more: false,
     },
   }
@@ -759,6 +915,7 @@ it('pulls owner-readable rows from the globally ordered change feed', async () =
   expect(result.rows.map((row) => row.entityId)).toEqual(['client-a', 'client-b', 'client-z'])
   expect(JSON.parse(result.cursor)).toEqual({
     updatedAt: '2026-08-03T10:00:03.000Z',
+    changeSeq: 3,
     changeId: 3,
   })
   expect(result.hasMore).toBe(false)
@@ -790,6 +947,7 @@ it('normalizes a changed invoice from its bounded owner-readable relation projec
     data: {
       status: 'ok',
       changes: [{
+        change_seq: 4,
         change_id: 4,
         owner_id: OWNER_A,
         entity: 'invoice',
@@ -799,13 +957,19 @@ it('normalizes a changed invoice from its bounded owner-readable relation projec
         deleted: false,
         payload: invoice,
       }],
-      cursor: { updated_at: '2026-08-03T10:00:04.000Z', change_id: 4 },
+      cursor: { updated_at: '2026-08-03T10:00:04.000Z', change_seq: 4, change_id: 4 },
       has_more: false,
     },
   }
   const gateway = createSupabaseGateway(client)
 
-  const result = await gateway.pullSince(OWNER_A, null, new AbortController().signal)
+  const result = await gateway.pullSince(
+    OWNER_A,
+    JSON.stringify({
+      updatedAt: '2026-08-03T10:00:03.000Z', changeSeq: 3, changeId: 3,
+    }),
+    new AbortController().signal,
+  )
 
   expect(result.rows).toEqual([
     expect.objectContaining({

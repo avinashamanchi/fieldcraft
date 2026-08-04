@@ -3,7 +3,7 @@ import type { SQLiteDatabase } from 'expo-sqlite'
 
 import type { MutationEnvelope } from '../domain/sync'
 import type { OwnerBoundary } from './ownerBoundary'
-import { DataCorruptionError } from './repository'
+import { OutboxCorruptionError } from './repository'
 
 export interface MutationOutbox {
   list(ownerId: string): Promise<MutationEnvelope[]>
@@ -110,17 +110,8 @@ export class SQLiteMutationOutbox implements MutationOutbox {
       )
 
       return Promise.all(rows.map(async (row) => {
-        let payload: unknown
         try {
-          payload = JSON.parse(row.payload_json)
-        } catch (cause) {
-          throw new DataCorruptionError(
-            `Corrupt outbox JSON for owner ${ownerId} mutation ${row.mutation_id}`,
-            { cause },
-          )
-        }
-
-        try {
+          const payload: unknown = JSON.parse(row.payload_json)
           const mutation = this.validateMutation({
             id: row.mutation_id,
             ownerId: row.owner_id,
@@ -134,16 +125,26 @@ export class SQLiteMutationOutbox implements MutationOutbox {
           })
           const expectedHash = await hashMutationEnvelope(mutation)
           if (expectedHash !== row.payload_hash) {
-            throw new DataCorruptionError(
-              `Corrupt outbox hash for owner ${ownerId} mutation ${row.mutation_id}`,
-            )
+            throw new OutboxCorruptionError(row.mutation_id)
           }
           return row.last_error ? { ...mutation, failureReason: row.last_error } : mutation
         } catch (cause) {
-          throw new DataCorruptionError(
-            `Corrupt outbox envelope for owner ${ownerId} mutation ${row.mutation_id}`,
-            { cause },
-          )
+          if (row.last_error === 'invalid-response') {
+            return {
+              id: row.mutation_id,
+              ownerId: row.owner_id,
+              entity: row.entity,
+              entityId: row.entity_id,
+              kind: row.kind,
+              baseVersion: row.base_version,
+              payload: null,
+              createdAt: row.created_at,
+              attempts: row.attempts,
+              failureReason: 'invalid-response' as const,
+            }
+          }
+          if (cause instanceof OutboxCorruptionError) throw cause
+          throw new OutboxCorruptionError(row.mutation_id, undefined, { cause })
         }
       }))
     })

@@ -13,13 +13,13 @@ import type { CloudRowEnvelope, InvoiceBundlePayload } from '../src/data/reposit
 import { RemoteGatewayError, type PullResult, type PushResult, type RemoteGateway } from '../src/data/remoteGateway'
 import { SQLiteFieldCraftRepository } from '../src/data/sqliteRepository'
 import { createSupabaseGateway, type SupabaseGatewayClient } from '../src/data/supabaseGateway'
-import { SyncCoordinator } from '../src/data/syncCoordinator'
+import { SyncCoordinator, type SyncClock } from '../src/data/syncCoordinator'
 
 const OWNER = 'owner-a'
 const DATABASE = 'legacy-feed-upgrade.db'
 const SHARED_TIME = '2026-08-03T10:00:10.000Z'
 
-type PositionedCloudRow = CloudRowEnvelope & { changeId: number }
+type PositionedCloudRow = CloudRowEnvelope & { changeSeq: number; changeId: number }
 
 const localClient = (overrides: Record<string, unknown> = {}) => ({
   id: 'client-local',
@@ -52,6 +52,7 @@ const feedReply = (
   data: {
     status: 'ok',
     changes: [{
+      change_seq: changeId,
       change_id: changeId,
       owner_id: OWNER,
       entity: 'client',
@@ -61,7 +62,7 @@ const feedReply = (
       deleted: false,
       updated_at: SHARED_TIME,
     }],
-    cursor: { updated_at: SHARED_TIME, change_id: changeId },
+    cursor: { updated_at: SHARED_TIME, change_seq: changeId, change_id: changeId },
     has_more: hasMore,
   },
 })
@@ -154,6 +155,8 @@ const clientEnvelope = (
   },
   version,
   updatedAt,
+  changeSource: 'sync_changes',
+  changeSeq: changeId,
   changeId,
 })
 
@@ -170,6 +173,8 @@ const tombstone = (
   payload: null,
   version,
   updatedAt,
+  changeSource: 'sync_changes',
+  changeSeq: changeId,
   changeId,
   deleted: true,
 })
@@ -251,6 +256,8 @@ const bundleRows = (
     payload: bundle[entity],
     version: bundle[entity].version,
     updatedAt: bundle[entity].updatedAt,
+    changeSource: 'sync_changes',
+    changeSeq: changeIds[index],
     changeId: changeIds[index],
   }))
 )
@@ -267,6 +274,222 @@ const runCoordinator = async (repository: SQLiteFieldCraftRepository, gateway: R
 }
 
 beforeEach(() => __resetSQLiteMock())
+
+it('forces a hydrated v3 owner through fresh authority reconciliation before accepting an old receipt', async () => {
+  const databaseName = 'v3-authority-upgrade.db'
+  await openDatabaseAsync(databaseName)
+  const raw = __getRawDatabase(databaseName)
+  raw.userVersion = 3
+  raw.tables = new Set([
+    'records', 'outbox', 'conflicts', 'sync_cursors', 'metadata', 'sync_bootstrap_records',
+  ])
+  const mutation = pendingClientMutation(
+    '00000000-0000-4000-8000-000000000080',
+    'v3-client',
+    'Old local edit',
+    2,
+  )
+  raw.records.push({
+    owner_id: OWNER,
+    entity: 'client',
+    entity_id: mutation.entityId,
+    payload_json: canonicalStringify(clientEnvelope(
+      mutation.entityId,
+      'Newer cloud state',
+      5,
+      '2026-08-03T10:00:05.000Z',
+      100,
+    ).payload),
+    version: 5,
+    deleted: 0,
+    updated_at: '2026-08-03T10:00:05.000Z',
+  })
+  raw.outbox.push({
+    owner_id: OWNER,
+    mutation_id: mutation.id,
+    sequence: 1,
+    entity: mutation.entity,
+    entity_id: mutation.entityId,
+    kind: mutation.kind,
+    base_version: mutation.baseVersion,
+    payload_json: canonicalStringify(mutation.payload),
+    payload_hash: await hashMutationEnvelope(mutation),
+    created_at: mutation.createdAt,
+    attempts: 0,
+    state: 'pending',
+    last_error: null,
+  })
+  const retainedCursor = JSON.stringify({
+    updatedAt: '2026-08-03T10:00:05.000Z', changeSeq: 100, changeId: 100,
+  })
+  raw.syncCursors.push({ owner_id: OWNER, entity: '__all__', cursor: retainedCursor })
+  raw.metadata.push({ owner_id: OWNER, key: 'initial-cloud-pull-complete', value: 'true' })
+
+  const repository = new SQLiteFieldCraftRepository({ databaseName })
+  await repository.initialize(OWNER)
+
+  await expect(repository.getSyncCursor(OWNER)).resolves.toBeNull()
+  await expect(repository.hasCompletedInitialPull(OWNER)).resolves.toBe(false)
+  expect(raw.metadata).toContainEqual({
+    owner_id: OWNER, key: 'sync-feed-v2-reconciliation-required', value: 'true',
+  })
+
+  const newer = clientEnvelope(
+    mutation.entityId,
+    'Newer cloud state',
+    5,
+    '2026-08-03T10:00:05.000Z',
+    100,
+  )
+  const oldReceipt = clientEnvelope(
+    mutation.entityId,
+    'Old applied receipt',
+    3,
+    '2026-08-03T10:00:03.000Z',
+    90,
+  )
+  const seenCursors: Array<string | null> = []
+  const gateway: RemoteGateway = {
+    async pullSince(_ownerId, cursor) {
+      seenCursors.push(cursor)
+      return cursor === null
+        ? { rows: [newer], cursor: retainedCursor, hasMore: false }
+        : { rows: [], cursor: retainedCursor, hasMore: false }
+    },
+    async pushMutation() {
+      return { type: 'applied', rows: [oldReceipt] }
+    },
+    subscribeToOwner() { return { unsubscribe() {} } },
+  }
+
+  await runCoordinator(repository, gateway)
+
+  expect(seenCursors).toEqual([null])
+  await expect(repository.get('client', mutation.entityId)).resolves.toMatchObject({
+    name: 'Newer cloud state', version: 5, syncState: 'current',
+  })
+  await expect(repository.outbox.list(OWNER)).resolves.toEqual([])
+})
+
+it('requeues immutable v3 conflict intents whose authority rows cannot be reconstructed', async () => {
+  const databaseName = 'v3-conflict-upgrade.db'
+  await openDatabaseAsync(databaseName)
+  const raw = __getRawDatabase(databaseName)
+  raw.userVersion = 3
+  raw.tables = new Set([
+    'records', 'outbox', 'conflicts', 'sync_cursors', 'metadata', 'sync_bootstrap_records',
+  ])
+  const mutation = pendingClientMutation(
+    '00000000-0000-4000-8000-000000000079',
+    'legacy-conflict-client',
+    'Preserved local conflict',
+    2,
+  )
+  const payloadJson = canonicalStringify(mutation.payload)
+  const payloadHash = await hashMutationEnvelope(mutation)
+  raw.outbox.push({
+    owner_id: OWNER,
+    mutation_id: mutation.id,
+    sequence: 7,
+    entity: mutation.entity,
+    entity_id: mutation.entityId,
+    kind: mutation.kind,
+    base_version: mutation.baseVersion,
+    payload_json: payloadJson,
+    payload_hash: payloadHash,
+    created_at: mutation.createdAt,
+    attempts: 2,
+    state: 'conflict',
+    last_error: null,
+  })
+  raw.conflicts.push({
+    owner_id: OWNER,
+    mutation_id: mutation.id,
+    entity: mutation.entity,
+    entity_id: mutation.entityId,
+    local_payload_json: payloadJson,
+    cloud_payload_json: canonicalStringify(clientEnvelope(
+      mutation.entityId, 'Legacy cloud conflict', 3, SHARED_TIME,
+    ).payload),
+    cloud_version: 3,
+  })
+  raw.metadata.push({ owner_id: OWNER, key: 'initial-cloud-pull-complete', value: 'true' })
+
+  const repository = new SQLiteFieldCraftRepository({ databaseName })
+  await repository.initialize(OWNER)
+
+  await expect(repository.countConflicts(OWNER)).resolves.toBe(0)
+  await expect(repository.outbox.list(OWNER)).resolves.toEqual([
+    expect.objectContaining({
+      id: mutation.id,
+      payload: mutation.payload,
+      attempts: 2,
+    }),
+  ])
+  expect(raw.outbox[0]).toMatchObject({
+    mutation_id: mutation.id,
+    payload_json: payloadJson,
+    payload_hash: payloadHash,
+    state: 'pending',
+    last_error: null,
+  })
+  expect(raw.conflicts).toEqual([])
+  expect(raw.metadata).toContainEqual({
+    owner_id: OWNER, key: 'sync-feed-v2-reconciliation-required', value: 'true',
+  })
+})
+
+it('attributes terminal-bootstrap bundle corruption to the exact intent and schedules no retry', async () => {
+  const { raw, repository } = await initializeLegacyRepository('bootstrap-exact-corruption.db')
+  const pending = pendingBundleMutation('00000000-0000-4000-8000-000000000078')
+  await repository.transactLocalMutation(pending)
+  const delays: number[] = []
+  const clock: SyncClock = {
+    now: () => Date.parse('2026-08-03T12:00:00.000Z'),
+    setTimeout: (_callback, delayMs) => {
+      delays.push(delayMs)
+      return delays.length
+    },
+    clearTimeout: () => {},
+  }
+  let pushed = false
+  const gateway: RemoteGateway = {
+    async pullSince() {
+      const stored = raw.outbox.find((row) => row.mutation_id === pending.id)!
+      stored.payload_json = '{}'
+      return {
+        rows: [],
+        cursor: JSON.stringify({
+          updatedAt: '1970-01-01T00:00:00.000Z', changeSeq: 0, changeId: 0,
+        }),
+        hasMore: false,
+      }
+    },
+    async pushMutation() {
+      pushed = true
+      throw new Error('push must not start after terminal bootstrap corruption')
+    },
+    subscribeToOwner() { return { unsubscribe() {} } },
+  }
+  const coordinator = new SyncCoordinator({
+    repository,
+    gateway,
+    clock,
+    refreshAuthentication: async () => {},
+  })
+
+  await coordinator.setLifecycle(active)
+  await coordinator.whenIdle()
+
+  expect(pushed).toBe(false)
+  expect(delays).toEqual([])
+  expect(coordinator.getStatus()).toMatchObject({ state: 'failed', pending: 1 })
+  expect(raw.outbox.find((row) => row.mutation_id === pending.id)).toMatchObject({
+    state: 'failed',
+    last_error: 'invalid-response',
+  })
+  await expect(repository.getSyncCursor(OWNER)).resolves.toBeNull()
+})
 
 it('upgrades a packaged legacy cursor through crash-resumable staged reconciliation without losing local work', async () => {
   await openDatabaseAsync(DATABASE)
@@ -330,12 +553,12 @@ it('upgrades a packaged legacy cursor through crash-resumable staged reconciliat
 
   const repository = new SQLiteFieldCraftRepository({ databaseName: DATABASE })
   await repository.initialize(OWNER)
-  expect(raw.userVersion).toBe(3)
+  expect(raw.userVersion).toBe(4)
   await expect(repository.getSyncCursor(OWNER)).resolves.toBeNull()
   await expect(repository.hasCompletedInitialPull(OWNER)).resolves.toBe(false)
 
   const client = new Client()
-  client.replies = [feedReply(101, 'client-server-a', 'Server A', true)]
+  client.replies = [feedReply(1, 'client-server-a', 'Server A', true)]
   const gateway = createSupabaseGateway(client)
   const pageOne = await gateway.pullSince(OWNER, null, new AbortController().signal)
   await repository.commitPull(OWNER, pageOne.rows, pageOne.cursor, false)
@@ -347,7 +570,7 @@ it('upgrades a packaged legacy cursor through crash-resumable staged reconciliat
   })
   await expect(repository.getSyncCursor(OWNER)).resolves.toBe(pageOne.cursor)
 
-  client.replies = [feedReply(102, 'client-server-b', 'Server B', false)]
+  client.replies = [feedReply(2, 'client-server-b', 'Server B', false)]
   const terminal = await gateway.pullSince(OWNER, pageOne.cursor, new AbortController().signal)
   await expect(repository.commitPull(
     OWNER,
@@ -363,7 +586,7 @@ it('upgrades a packaged legacy cursor through crash-resumable staged reconciliat
   await expect(repository.get('client', 'client-server-b')).resolves.toBeNull()
 
   client.replies = [
-    feedReply(102, 'client-server-b', 'Server B', false),
+    feedReply(2, 'client-server-b', 'Server B', false),
     {
       status: 200,
       error: null,
@@ -375,7 +598,7 @@ it('upgrades a packaged legacy cursor through crash-resumable staged reconciliat
         kind: 'update',
         cloud: rawClient('client-local', 'Unsynced local edit', 8, '2026-08-03T10:00:11.000Z'),
         sync_position: {
-          updated_at: '2026-08-03T10:00:11.000Z', change_id: 103, source: 'sync_changes',
+          updated_at: '2026-08-03T10:00:11.000Z', change_seq: 3, change_id: 3, source: 'sync_changes',
         },
       },
     },
@@ -404,9 +627,9 @@ it('upgrades a packaged legacy cursor through crash-resumable staged reconciliat
   await expect(repository.outbox.list(OWNER)).resolves.toEqual([])
   expect((raw as unknown as { bootstrapRecords: unknown[] }).bootstrapRecords).toEqual([])
   expect(client.calls.filter((call) => call.name === 'pull_sync_changes')).toEqual([
-    expect.objectContaining({ parameters: { p_cursor_updated_at: null, p_cursor_change_id: null, p_limit: 500 } }),
-    expect.objectContaining({ parameters: { p_cursor_updated_at: SHARED_TIME, p_cursor_change_id: 101, p_limit: 500 } }),
-    expect.objectContaining({ parameters: { p_cursor_updated_at: SHARED_TIME, p_cursor_change_id: 101, p_limit: 500 } }),
+    expect.objectContaining({ parameters: { p_cursor_change_seq: null, p_limit: 500 } }),
+    expect.objectContaining({ parameters: { p_cursor_change_seq: 1, p_limit: 500 } }),
+    expect.objectContaining({ parameters: { p_cursor_change_seq: 1, p_limit: 500 } }),
   ])
 })
 
@@ -419,12 +642,12 @@ it('keeps a newer multipage bootstrap update authoritative after replaying an ol
   )
   await repository.transactLocalMutation(mutation)
 
-  const applied = clientEnvelope('receipt-client', 'Applied before crash', 2, '2026-08-03T10:00:01.000Z')
-  const newer = clientEnvelope('receipt-client', 'Newer remote edit', 3, '2026-08-03T10:00:02.000Z')
+  const applied = clientEnvelope('receipt-client', 'Applied before crash', 2, '2026-08-03T10:00:01.000Z', 100)
+  const newer = clientEnvelope('receipt-client', 'Newer remote edit', 3, '2026-08-03T10:00:02.000Z', 101)
   const gateway = new ScriptedGateway()
   gateway.pulls = [
-    { rows: [applied], cursor: '{"updatedAt":"2026-08-03T10:00:01.000Z","changeId":100}', hasMore: true },
-    { rows: [newer], cursor: '{"updatedAt":"2026-08-03T10:00:02.000Z","changeId":101}', hasMore: false },
+    { rows: [applied], cursor: '{"updatedAt":"2026-08-03T10:00:01.000Z","changeSeq":100,"changeId":100}', hasMore: true },
+    { rows: [newer], cursor: '{"updatedAt":"2026-08-03T10:00:02.000Z","changeSeq":101,"changeId":101}', hasMore: false },
   ]
   gateway.pushes = [{ type: 'applied', rows: [applied] }]
 
@@ -436,7 +659,7 @@ it('keeps a newer multipage bootstrap update authoritative after replaying an ol
   await expect(repository.outbox.list(OWNER)).resolves.toEqual([])
   await expect(repository.hasCompletedInitialPull(OWNER)).resolves.toBe(true)
   await expect(repository.getSyncCursor(OWNER)).resolves.toBe(
-    '{"updatedAt":"2026-08-03T10:00:02.000Z","changeId":101}',
+    '{"updatedAt":"2026-08-03T10:00:02.000Z","changeSeq":101,"changeId":101}',
   )
   expect(coordinator.getStatus().state).toBe('current')
   expect(gateway.pushed).toEqual([mutation.id])
@@ -451,12 +674,12 @@ it('keeps a later bootstrap tombstone authoritative instead of resurrecting an o
   )
   await repository.transactLocalMutation(mutation)
 
-  const applied = clientEnvelope('deleted-receipt-client', 'Applied before crash', 2, '2026-08-03T10:00:01.000Z')
-  const deleted = tombstone('client', 'deleted-receipt-client', 2, '2026-08-03T10:00:03.000Z')
+  const applied = clientEnvelope('deleted-receipt-client', 'Applied before crash', 2, '2026-08-03T10:00:01.000Z', 200)
+  const deleted = tombstone('client', 'deleted-receipt-client', 2, '2026-08-03T10:00:03.000Z', 201)
   const gateway = new ScriptedGateway()
   gateway.pulls = [
-    { rows: [applied], cursor: '{"updatedAt":"2026-08-03T10:00:01.000Z","changeId":200}', hasMore: true },
-    { rows: [deleted], cursor: '{"updatedAt":"2026-08-03T10:00:03.000Z","changeId":201}', hasMore: false },
+    { rows: [applied], cursor: '{"updatedAt":"2026-08-03T10:00:01.000Z","changeSeq":200,"changeId":200}', hasMore: true },
+    { rows: [deleted], cursor: '{"updatedAt":"2026-08-03T10:00:03.000Z","changeSeq":201,"changeId":201}', hasMore: false },
   ]
   gateway.pushes = [{ type: 'applied', rows: [applied] }]
 
@@ -474,23 +697,23 @@ it('reapplies later authoritative bundle member edits and tombstones after an ol
   await repository.transactLocalMutation(mutation)
 
   const appliedBundle = bundlePayload(2, '2026-08-03T10:00:01.000Z', 'current', 'Applied')
-  const newerClient = clientEnvelope('bundle-client', 'Newer remote client', 3, '2026-08-03T10:00:04.000Z')
-  const deletedJob = tombstone('job', 'bundle-job', 2, '2026-08-03T10:00:05.000Z')
-  const deletedInvoice = tombstone('invoice', 'bundle-invoice', 2, '2026-08-03T10:00:06.000Z')
+  const newerClient = clientEnvelope('bundle-client', 'Newer remote client', 3, '2026-08-03T10:00:04.000Z', 301)
+  const deletedJob = tombstone('job', 'bundle-job', 2, '2026-08-03T10:00:05.000Z', 302)
+  const deletedInvoice = tombstone('invoice', 'bundle-invoice', 2, '2026-08-03T10:00:06.000Z', 303)
   const gateway = new ScriptedGateway()
   gateway.pulls = [
     {
-      rows: bundleRows(appliedBundle),
-      cursor: '{"updatedAt":"2026-08-03T10:00:01.000Z","changeId":300}',
+      rows: bundleRows(appliedBundle, [298, 299, 300]),
+      cursor: '{"updatedAt":"2026-08-03T10:00:01.000Z","changeSeq":300,"changeId":300}',
       hasMore: true,
     },
     {
       rows: [newerClient, deletedJob, deletedInvoice],
-      cursor: '{"updatedAt":"2026-08-03T10:00:06.000Z","changeId":303}',
+      cursor: '{"updatedAt":"2026-08-03T10:00:06.000Z","changeSeq":303,"changeId":303}',
       hasMore: false,
     },
   ]
-  gateway.pushes = [{ type: 'applied', rows: bundleRows(appliedBundle) }]
+  gateway.pushes = [{ type: 'applied', rows: bundleRows(appliedBundle, [298, 299, 300]) }]
 
   const coordinator = await runCoordinator(repository, gateway)
 
@@ -515,19 +738,31 @@ it('preserves and sends genuinely unsent generic and bundle work exactly once af
   await repository.transactLocalMutation(generic)
   await repository.transactLocalMutation(bundle)
 
-  const serverGeneric = clientEnvelope('unsent-client', 'Preexisting server client', 1, '2026-08-03T10:00:01.000Z')
+  const serverGeneric = clientEnvelope(
+    'unsent-client',
+    'Preexisting server client',
+    1,
+    '2026-08-03T10:00:01.000Z',
+    400,
+  )
   const serverBundle = bundlePayload(1, '2026-08-03T10:00:02.000Z', 'current', 'Preexisting server')
-  const genericApplied = clientEnvelope('unsent-client', 'Unsent client', 2, '2026-08-03T10:00:10.000Z')
+  const genericApplied = clientEnvelope(
+    'unsent-client',
+    'Unsent client',
+    2,
+    '2026-08-03T10:00:10.000Z',
+    404,
+  )
   const bundleApplied = bundlePayload(2, '2026-08-03T10:00:11.000Z', 'current', 'Local')
   const gateway = new ScriptedGateway()
   gateway.pulls = [{
-    rows: [serverGeneric, ...bundleRows(serverBundle)],
-    cursor: '{"updatedAt":"2026-08-03T10:00:02.000Z","changeId":403}',
+    rows: [serverGeneric, ...bundleRows(serverBundle, [401, 402, 403])],
+    cursor: '{"updatedAt":"2026-08-03T10:00:02.000Z","changeSeq":403,"changeId":403}',
     hasMore: false,
   }]
   gateway.pushes = [
     { type: 'applied', rows: [genericApplied] },
-    { type: 'applied', rows: bundleRows(bundleApplied) },
+    { type: 'applied', rows: bundleRows(bundleApplied, [405, 406, 407]) },
   ]
 
   const coordinator = await runCoordinator(repository, gateway)
@@ -549,13 +784,13 @@ it('keeps terminal repair state durable across a crash before receipt replay and
     'Local edit before crash',
   )
   await repository.transactLocalMutation(mutation)
-  const applied = clientEnvelope('crash-client', 'Applied before crash', 2, '2026-08-03T10:00:01.000Z')
-  const newer = clientEnvelope('crash-client', 'Newer after receipt', 3, '2026-08-03T10:00:02.000Z')
+  const applied = clientEnvelope('crash-client', 'Applied before crash', 2, '2026-08-03T10:00:01.000Z', 500)
+  const newer = clientEnvelope('crash-client', 'Newer after receipt', 3, '2026-08-03T10:00:02.000Z', 501)
 
   await repository.commitPull(
     OWNER,
     [applied, newer],
-    '{"updatedAt":"2026-08-03T10:00:02.000Z","changeId":501}',
+    '{"updatedAt":"2026-08-03T10:00:02.000Z","changeSeq":501,"changeId":501}',
     true,
   )
 
@@ -570,7 +805,7 @@ it('keeps terminal repair state durable across a crash before receipt replay and
   const gateway = new ScriptedGateway()
   gateway.pulls = [{
     rows: [],
-    cursor: '{"updatedAt":"2026-08-03T10:00:02.000Z","changeId":501}',
+    cursor: '{"updatedAt":"2026-08-03T10:00:02.000Z","changeSeq":501,"changeId":501}',
     hasMore: false,
   }]
   gateway.pushes = [{ type: 'applied', rows: [applied] }]
@@ -592,12 +827,12 @@ it('rolls back receipt repair when the generation changes and never cross-applie
     'Local edit before switch',
   )
   await repository.transactLocalMutation(mutation)
-  const applied = clientEnvelope('generation-client', 'Old receipt', 2, '2026-08-03T10:00:01.000Z')
-  const newer = clientEnvelope('generation-client', 'Newer staged row', 3, '2026-08-03T10:00:02.000Z')
+  const applied = clientEnvelope('generation-client', 'Old receipt', 2, '2026-08-03T10:00:01.000Z', 600)
+  const newer = clientEnvelope('generation-client', 'Newer staged row', 3, '2026-08-03T10:00:02.000Z', 601)
   await repository.commitPull(
     OWNER,
     [newer],
-    '{"updatedAt":"2026-08-03T10:00:02.000Z","changeId":601}',
+    '{"updatedAt":"2026-08-03T10:00:02.000Z","changeSeq":601,"changeId":601}',
     true,
   )
 
@@ -627,17 +862,19 @@ it('preserves a conflict through bootstrap and applies staged authority when kee
     'Conflict response row',
     5,
     '2026-08-03T10:00:00.000100Z',
+    700,
   )
   const newer = clientEnvelope(
     'conflict-client',
     'Later staged recreation',
     1,
     '2026-08-03T10:00:00.000900Z',
+    701,
   )
   await repository.commitPull(
     OWNER,
     [newer],
-    '{"updatedAt":"2026-08-03T10:00:00.000900Z","changeId":701}',
+    '{"updatedAt":"2026-08-03T10:00:00.000900Z","changeSeq":701,"changeId":701}',
     true,
   )
   await repository.recordMutationConflict(OWNER, {
@@ -649,6 +886,7 @@ it('preserves a conflict through bootstrap and applies staged authority when kee
     localPayload: mutation.payload,
     cloudPayload: conflictCloud.payload,
     cloudVersion: 5,
+    cloudRows: [conflictCloud],
   })
 
   await repository.resolveConflictKeepCloud(mutation.id)
@@ -678,7 +916,7 @@ it('fails a malformed legacy replay closed while keeping its staged repair durab
   const gateway = new ScriptedGateway()
   gateway.pulls = [{
     rows: [newer],
-    cursor: '{"updatedAt":"2026-08-03T10:00:02.000Z","changeId":801}',
+    cursor: '{"updatedAt":"2026-08-03T10:00:02.000Z","changeSeq":801,"changeId":801}',
     hasMore: false,
   }]
   gateway.pushErrors = [new RemoteGatewayError('validation')]
@@ -721,13 +959,13 @@ it('uses change_id to keep a same-time recreation newer than an older delete rec
   await repository.commitPull(
     OWNER,
     [receiptDelete],
-    JSON.stringify({ updatedAt: SHARED_TIME, changeId: 900 }),
+    JSON.stringify({ updatedAt: SHARED_TIME, changeSeq: 900, changeId: 900 }),
     false,
   )
   await repository.commitPull(
     OWNER,
     [stagedRecreation],
-    JSON.stringify({ updatedAt: SHARED_TIME, changeId: 901 }),
+    JSON.stringify({ updatedAt: SHARED_TIME, changeSeq: 901, changeId: 901 }),
     true,
   )
   await repository.acknowledgeMutation(OWNER, mutation.id, [receiptDelete])
@@ -739,7 +977,7 @@ it('uses change_id to keep a same-time recreation newer than an older delete rec
   await expect(repository.hasCompletedInitialPull(OWNER)).resolves.toBe(true)
 })
 
-it('preserves PostgreSQL microseconds when staged authority has the later timestamp but smaller change_id', async () => {
+it('uses committed sequence instead of PostgreSQL microseconds when authority positions disagree', async () => {
   const { repository } = await initializeLegacyRepository('bootstrap-microsecond-stage-order.db')
   const mutation = pendingClientMutation(
     '00000000-0000-4000-8000-000000000120',
@@ -764,15 +1002,15 @@ it('preserves PostgreSQL microseconds when staged authority has the later timest
   await repository.commitPull(
     OWNER,
     [staged],
-    JSON.stringify({ updatedAt: staged.updatedAt, changeId: staged.changeId }),
+    JSON.stringify({ updatedAt: staged.updatedAt, changeSeq: staged.changeSeq, changeId: staged.changeId }),
     true,
   )
 
   await repository.acknowledgeMutation(OWNER, mutation.id, [receipt])
 
   await expect(repository.get('client', mutation.entityId)).resolves.toMatchObject({
-    name: 'Later staged authority',
-    version: 3,
+    name: 'Earlier receipt',
+    version: 2,
   })
 })
 
@@ -787,7 +1025,7 @@ it('keeps authoritative bootstrap absence over a pre-feed generic receipt', asyn
   await repository.commitPull(
     OWNER,
     [],
-    JSON.stringify({ updatedAt: SHARED_TIME, changeId: 1000 }),
+    JSON.stringify({ updatedAt: SHARED_TIME, changeSeq: 1000, changeId: 1000 }),
     true,
   )
   const legacyReceipt: CloudRowEnvelope = {
@@ -814,7 +1052,7 @@ it('keeps authoritative bootstrap absence over every pre-feed bundle receipt mem
   await repository.commitPull(
     OWNER,
     [],
-    JSON.stringify({ updatedAt: SHARED_TIME, changeId: 1010 }),
+    JSON.stringify({ updatedAt: SHARED_TIME, changeSeq: 1010, changeId: 1010 }),
     true,
   )
   const legacyRows = bundleRows(
@@ -842,7 +1080,7 @@ it('keeps a new post-bootstrap receipt whose feed position is beyond the termina
   await repository.commitPull(
     OWNER,
     [],
-    JSON.stringify({ updatedAt: SHARED_TIME, changeId: 1020 }),
+    JSON.stringify({ updatedAt: SHARED_TIME, changeSeq: 1020, changeId: 1020 }),
     true,
   )
   const newReceipt: CloudRowEnvelope = {
@@ -865,7 +1103,7 @@ it('keeps a new post-bootstrap receipt whose feed position is beyond the termina
   await expect(repository.hasCompletedInitialPull(OWNER)).resolves.toBe(true)
 })
 
-it('preserves PostgreSQL microseconds when a post-terminal absent receipt has the later timestamp', async () => {
+it('keeps a higher terminal sequence authoritative over a later-timestamp receipt', async () => {
   const { repository } = await initializeLegacyRepository('bootstrap-microsecond-post-terminal.db')
   const mutation = pendingClientMutation(
     '00000000-0000-4000-8000-000000000121',
@@ -876,6 +1114,7 @@ it('preserves PostgreSQL microseconds when a post-terminal absent receipt has th
   await repository.transactLocalMutation(mutation)
   const terminalCursor = {
     updatedAt: '2026-08-03T10:00:00.000100Z',
+    changeSeq: 2000,
     changeId: 2000,
   }
   await repository.commitPull(OWNER, [], JSON.stringify(terminalCursor), true)
@@ -892,10 +1131,7 @@ it('preserves PostgreSQL microseconds when a post-terminal absent receipt has th
 
   await repository.acknowledgeMutation(OWNER, mutation.id, [receipt])
 
-  await expect(repository.get('client', mutation.entityId)).resolves.toMatchObject({
-    name: 'Later microsecond receipt',
-    version: 1,
-  })
+  await expect(repository.get('client', mutation.entityId)).resolves.toBeNull()
   await expect(repository.hasCompletedInitialPull(OWNER)).resolves.toBe(true)
 })
 
@@ -956,7 +1192,7 @@ it('uses change_id to keep a receipt recreation newer than a same-time staged de
   await repository.commitPull(
     OWNER,
     [stagedDelete],
-    JSON.stringify({ updatedAt: SHARED_TIME, changeId: 910 }),
+    JSON.stringify({ updatedAt: SHARED_TIME, changeSeq: 910, changeId: 910 }),
     true,
   )
   await repository.acknowledgeMutation(OWNER, mutation.id, [receiptRecreation])
@@ -979,13 +1215,13 @@ it('orders every same-time bundle member by its own change_id after a crash rest
   await repository.commitPull(
     OWNER,
     bundleRows(oldReceipt, [920, 922, 924]),
-    JSON.stringify({ updatedAt: SHARED_TIME, changeId: 924 }),
+    JSON.stringify({ updatedAt: SHARED_TIME, changeSeq: 924, changeId: 924 }),
     false,
   )
   await repository.commitPull(
     OWNER,
     bundleRows(laterRecreation, [921, 923, 925]),
-    JSON.stringify({ updatedAt: SHARED_TIME, changeId: 925 }),
+    JSON.stringify({ updatedAt: SHARED_TIME, changeSeq: 925, changeId: 925 }),
     true,
   )
   await repository.close()
@@ -1063,6 +1299,7 @@ it.each([
       localPayload: second.payload,
       cloudPayload: cloud.payload,
       cloudVersion: cloud.version,
+      cloudRows: [cloud],
     })
   }
 
@@ -1167,7 +1404,7 @@ it('rolls back receipt, staging repair, and later-intent reapply when the genera
   await repository.commitPull(
     OWNER,
     [staged],
-    JSON.stringify({ updatedAt: staged.updatedAt, changeId: staged.changeId }),
+    JSON.stringify({ updatedAt: staged.updatedAt, changeSeq: staged.changeSeq, changeId: staged.changeId }),
     true,
   )
 
@@ -1205,7 +1442,7 @@ it('uses a completed staged bootstrap to repair an unreconstructable legacy invo
   await repository.commitPull(
     OWNER,
     bundleRows(staged, [980, 981, 982]),
-    JSON.stringify({ updatedAt: SHARED_TIME, changeId: 982 }),
+    JSON.stringify({ updatedAt: SHARED_TIME, changeSeq: 982, changeId: 982 }),
     true,
   )
 
@@ -1221,7 +1458,7 @@ it('schedules and completes a fresh bootstrap for a hydrated owner needing legac
   const databaseName = 'legacy-invoice-repair-no-stage.db'
   const repository = new SQLiteFieldCraftRepository({ databaseName })
   await repository.initialize(OWNER)
-  const hydratedCursor = JSON.stringify({ updatedAt: SHARED_TIME, changeId: 970 })
+  const hydratedCursor = JSON.stringify({ updatedAt: SHARED_TIME, changeSeq: 970, changeId: 970 })
   await repository.commitPull(OWNER, [], hydratedCursor, true)
   const raw = __getRawDatabase(databaseName)
   const local = bundlePayload(1, '2026-08-03T09:01:00.000Z', 'pending', 'Legacy local')
@@ -1262,7 +1499,7 @@ it('schedules and completes a fresh bootstrap for a hydrated owner needing legac
   await repository.commitPull(
     OWNER,
     bundleRows(staged, [983, 984, 985]),
-    JSON.stringify({ updatedAt: SHARED_TIME, changeId: 985 }),
+    JSON.stringify({ updatedAt: SHARED_TIME, changeSeq: 985, changeId: 985 }),
     true,
   )
   await repository.acknowledgeMutation(OWNER, mutation.id, [], () => true, true)
@@ -1299,7 +1536,7 @@ it('preserves a later invoice intent during legacy feed repair and lets its rece
   await repository.commitPull(
     OWNER,
     bundleRows(staged, [990, 991, 992]),
-    JSON.stringify({ updatedAt: SHARED_TIME, changeId: 992 }),
+    JSON.stringify({ updatedAt: SHARED_TIME, changeSeq: 992, changeId: 992 }),
     true,
   )
 
@@ -1336,7 +1573,7 @@ it('rolls back a legacy feed repair when the owner generation changes', async ()
   await repository.commitPull(
     OWNER,
     bundleRows(staged, [996, 997, 998]),
-    JSON.stringify({ updatedAt: SHARED_TIME, changeId: 998 }),
+    JSON.stringify({ updatedAt: SHARED_TIME, changeSeq: 998, changeId: 998 }),
     true,
   )
 

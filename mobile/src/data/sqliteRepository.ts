@@ -15,6 +15,7 @@ import {
 import { OwnerBoundary } from './ownerBoundary'
 import {
   DataCorruptionError,
+  OutboxCorruptionError,
   type CloudRowEnvelope,
   type FieldCraftRepository,
   type InvoiceBundleCloudPayload,
@@ -100,8 +101,9 @@ const CloudRowEnvelopeSchema = z
     payload: z.unknown(),
     version: z.number().finite().int().min(0),
     updatedAt: z.string().min(1),
+    changeSeq: z.number().finite().int().min(0).optional(),
     changeId: z.number().finite().int().min(0).optional(),
-    changeSource: z.enum(['sync_changes', 'legacy_receipt']).optional(),
+    changeSource: z.enum(['sync_changes', 'sync_snapshot', 'legacy_receipt']).optional(),
     deleted: z.boolean().optional(),
   })
   .strict()
@@ -116,6 +118,7 @@ const ConflictRecordSchema = z
     localPayload: z.unknown(),
     cloudPayload: z.unknown(),
     cloudVersion: z.number().finite().int().min(0),
+    cloudRows: z.array(CloudRowEnvelopeSchema).min(1),
   })
   .strict()
 
@@ -138,6 +141,7 @@ type ReconciliationRecordRow = {
   version: number
   deleted: number
   updated_at: string
+  change_seq: number
   change_id: number
 }
 
@@ -146,10 +150,6 @@ type ReconciliationOutboxRow = {
   entity_id: string
   kind: MutationEnvelope['kind']
   payload_json: string
-}
-
-type MutationSequenceRow = {
-  sequence: number
 }
 
 type LaterOutboxRow = ReconciliationOutboxRow & {
@@ -185,6 +185,20 @@ type ConflictRow = {
   local_payload_json: string
   cloud_payload_json: string
   cloud_version: number
+  cloud_rows_json: string | null
+}
+
+type ServerAuthorityRow = {
+  owner_id: string
+  entity: EntityName
+  entity_id: string
+  payload_json: string
+  version: number
+  deleted: number
+  updated_at: string
+  change_source: NonNullable<CloudRowEnvelope['changeSource']>
+  change_seq: number
+  change_id: number
 }
 
 type CountRow = {
@@ -200,7 +214,12 @@ const FEED_RECONCILIATION_KEY = 'sync-feed-v2-reconciliation-required'
 const FEED_RECONCILIATION_TERMINAL_KEY = 'sync-feed-v2-terminal-reconciliation-pending'
 const recordKey = (entity: EntityName, entityId: string): string => `${entity}:${entityId}`
 
-type ImmutablePosition = { updatedAt: string; changeId: number }
+type ImmutablePosition = {
+  updatedAt: string
+  changeSeq: number
+  changeId: number
+  changeSource: NonNullable<CloudRowEnvelope['changeSource']>
+}
 
 type PreciseTimestamp = {
   wholeSecondMilliseconds: number
@@ -229,6 +248,16 @@ const compareImmutablePositions = (
   left: ImmutablePosition,
   right: ImmutablePosition,
 ): number => {
+  const leftIsSync = left.changeSource !== 'legacy_receipt'
+  const rightIsSync = right.changeSource !== 'legacy_receipt'
+  if (leftIsSync !== rightIsSync) return leftIsSync ? 1 : -1
+  if (leftIsSync) {
+    return left.changeSeq - right.changeSeq ||
+      left.changeId - right.changeId ||
+      (left.changeSource === right.changeSource
+        ? 0
+        : left.changeSource === 'sync_snapshot' ? 1 : -1)
+  }
   const leftTime = parsePreciseTimestamp(left.updatedAt)
   const rightTime = parsePreciseTimestamp(right.updatedAt)
   return leftTime.wholeSecondMilliseconds - rightTime.wholeSecondMilliseconds ||
@@ -237,18 +266,19 @@ const compareImmutablePositions = (
 }
 
 const parseSyncCursorTuple = (cursor: string): ImmutablePosition => {
-  let value: unknown
   try {
-    value = JSON.parse(cursor)
+    const value: unknown = JSON.parse(cursor)
+    const parsed = z.object({
+      updatedAt: z.string().min(1),
+      changeSeq: z.number().finite().int().min(0),
+      changeId: z.number().finite().int().min(0),
+    }).strict().parse(value)
+    parsePreciseTimestamp(parsed.updatedAt)
+    return { ...parsed, changeSource: 'sync_changes' }
   } catch (cause) {
-    throw new DataCorruptionError('Terminal bootstrap cursor is not valid JSON', { cause })
+    if (cause instanceof DataCorruptionError) throw cause
+    throw new DataCorruptionError('Terminal bootstrap cursor is invalid', { cause })
   }
-  const parsed = z.object({
-    updatedAt: z.string().min(1),
-    changeId: z.number().finite().int().min(0),
-  }).strict().parse(value)
-  parsePreciseTimestamp(parsed.updatedAt)
-  return parsed
 }
 
 const validateEntityPayload = (
@@ -336,33 +366,86 @@ const validateCloudBundlePayload = (
 const prepareCloudRows = (
   inputRows: CloudRowEnvelope[],
   ownerId: string,
-): PreparedCloudRow[] => inputRows.map((input) => {
-  const row = CloudRowEnvelopeSchema.parse(input) as CloudRowEnvelope
-  if (
-    (row.changeSource === 'legacy_receipt' && row.changeId !== 0) ||
-    (row.changeSource === 'sync_changes' && (row.changeId === undefined || row.changeId === 0))
-  ) {
-    throw new DataCorruptionError('Cloud row change source does not match its immutable change ID')
+): PreparedCloudRow[] => {
+  try {
+    return inputRows.map((input) => {
+      const row = CloudRowEnvelopeSchema.parse(input) as CloudRowEnvelope
+      const hasSource = row.changeSource !== undefined
+      const hasSequence = row.changeSeq !== undefined
+      const hasEventId = row.changeId !== undefined
+      if (hasSource || hasSequence || hasEventId) {
+        const valid = hasSource && hasSequence && hasEventId && (
+          (row.changeSource === 'sync_changes' && row.changeSeq! > 0 && row.changeId! > 0) ||
+          (row.changeSource === 'sync_snapshot' && row.changeSeq! >= 0 && row.changeId === 0) ||
+          (row.changeSource === 'legacy_receipt' && row.changeSeq === 0 && row.changeId === 0)
+        )
+        if (!valid) {
+          throw new DataCorruptionError(
+            'Cloud row source requires its complete matching immutable position',
+          )
+        }
+      }
+      if (row.ownerId !== ownerId) {
+        throw new Error('Cloud row owner does not match the active repository owner')
+      }
+      if (row.deleted && row.payload !== null) {
+        throw new Error('Deleted cloud rows require a null tombstone payload')
+      }
+      if (
+        row.changeSource === 'sync_snapshot' &&
+        (!row.deleted || row.payload !== null || row.version !== 0)
+      ) {
+        throw new DataCorruptionError(
+          'Snapshot authority is valid only for a version-zero absent tombstone',
+        )
+      }
+      const payload = row.deleted
+        ? null
+        : validateEntityPayload(row.entity, row.payload, row.ownerId, row.entityId)
+      if (payload) {
+        if (payload.version !== row.version) {
+          throw new Error('Cloud row payload version must match its envelope version')
+        }
+        if (payload.updatedAt !== row.updatedAt) {
+          throw new Error('Cloud row payload updatedAt must match its envelope updatedAt')
+        }
+      }
+      return { row, payloadJson: canonicalStringify(payload) }
+    })
+  } catch (cause) {
+    if (cause instanceof DataCorruptionError) throw cause
+    throw new DataCorruptionError('Cloud authority response is invalid', { cause })
   }
-  if (row.ownerId !== ownerId) {
-    throw new Error('Cloud row owner does not match the active repository owner')
-  }
-  if (row.deleted && row.payload !== null) {
-    throw new Error('Deleted cloud rows require a null tombstone payload')
-  }
-  const payload = row.deleted
-    ? null
-    : validateEntityPayload(row.entity, row.payload, row.ownerId, row.entityId)
-  if (payload) {
-    if (payload.version !== row.version) {
-      throw new Error('Cloud row payload version must match its envelope version')
+}
+
+const requirePositionedRows = (prepared: PreparedCloudRow[], operation: string): void => {
+  for (const { row } of prepared) {
+    if (
+      row.changeSource === undefined ||
+      row.changeSeq === undefined ||
+      row.changeId === undefined
+    ) {
+      throw new DataCorruptionError(`${operation} requires complete server authority`)
     }
-    if (payload.updatedAt !== row.updatedAt) {
-      throw new Error('Cloud row payload updatedAt must match its envelope updatedAt')
+  }
+}
+
+const requireAuthoritySources = (
+  prepared: PreparedCloudRow[],
+  allowed: readonly NonNullable<CloudRowEnvelope['changeSource']>[],
+  operation: string,
+): void => {
+  for (const { row } of prepared) {
+    if (
+      row.changeSource === undefined ||
+      !allowed.includes(row.changeSource)
+    ) {
+      throw new DataCorruptionError(
+        `${operation} requires authority from ${allowed.join(' or ')}`,
+      )
     }
   }
-  return { row, payloadJson: canonicalStringify(payload) }
-})
+}
 
 const writeCloudRows = async (
   database: SQLiteDatabase,
@@ -384,28 +467,107 @@ const writeCloudRows = async (
   }
 }
 
-const writeBootstrapRows = async (
+const authorityPosition = (row: CloudRowEnvelope): ImmutablePosition => {
+  if (
+    row.changeSource === undefined ||
+    row.changeSeq === undefined ||
+    row.changeId === undefined
+  ) {
+    throw new DataCorruptionError('Server authority is missing its complete position')
+  }
+  return {
+    updatedAt: row.updatedAt,
+    changeSource: row.changeSource,
+    changeSeq: row.changeSeq,
+    changeId: row.changeId,
+  }
+}
+
+const cloudRowFromAuthority = (row: ServerAuthorityRow): CloudRowEnvelope => {
+  let payload: unknown
+  try {
+    payload = JSON.parse(row.payload_json)
+  } catch (cause) {
+    throw new DataCorruptionError('Stored server authority contains corrupt JSON', { cause })
+  }
+  return {
+    ownerId: row.owner_id,
+    entity: row.entity,
+    entityId: row.entity_id,
+    payload,
+    version: row.version,
+    updatedAt: row.updated_at,
+    changeSource: row.change_source,
+    changeSeq: row.change_seq,
+    changeId: row.change_id,
+    ...(row.deleted === 1 ? { deleted: true } : {}),
+  }
+}
+
+const writeServerAuthorityRows = async (
   database: SQLiteDatabase,
   prepared: PreparedCloudRow[],
-): Promise<void> => {
-  for (const { row, payloadJson } of prepared) {
-    if (row.changeId === undefined) {
-      throw new DataCorruptionError('Bootstrap cloud rows require an immutable change ID')
+): Promise<Set<string>> => {
+  requirePositionedRows(prepared, 'Server authority write')
+  const affected = new Set<string>()
+  for (const candidate of prepared) {
+    const { row, payloadJson } = candidate
+    const key = recordKey(row.entity, row.entityId)
+    affected.add(key)
+    const existing = await database.getFirstAsync<ServerAuthorityRow>(
+      `/* server-authority:get */
+       SELECT owner_id, entity, entity_id, payload_json, version, deleted,
+              updated_at, change_source, change_seq, change_id
+       FROM sync_server_authority
+       WHERE owner_id = ? AND entity = ? AND entity_id = ?`,
+      [row.ownerId, row.entity, row.entityId],
+    )
+    if (existing) {
+      if (
+        row.changeSource === 'sync_changes' &&
+        existing.change_source === 'sync_changes' &&
+        row.changeSeq === existing.change_seq &&
+        row.changeId !== existing.change_id
+      ) {
+        throw new DataCorruptionError(
+          'One owner sequence cannot identify different sync-change events',
+        )
+      }
+      const comparison = compareImmutablePositions(
+        authorityPosition(row),
+        authorityPosition(cloudRowFromAuthority(existing)),
+      )
+      if (comparison < 0) continue
+      if (comparison === 0) {
+        const sameAuthority = existing.payload_json === payloadJson &&
+          existing.version === row.version &&
+          existing.deleted === (row.deleted ? 1 : 0) &&
+          (
+            row.changeSource === 'sync_snapshot' ||
+            existing.updated_at === row.updatedAt
+          )
+        if (!sameAuthority) {
+          throw new DataCorruptionError(
+            'One immutable server position cannot identify different authority',
+          )
+        }
+        continue
+      }
     }
     await database.runAsync(
-      `/* bootstrap:stage:upsert */
-       INSERT INTO sync_bootstrap_records
-         (owner_id, entity, entity_id, payload_json, version, deleted, updated_at, change_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `/* server-authority:upsert */
+       INSERT INTO sync_server_authority
+         (owner_id, entity, entity_id, payload_json, version, deleted, updated_at,
+          change_source, change_seq, change_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(owner_id, entity, entity_id) DO UPDATE SET
          payload_json = excluded.payload_json,
          version = excluded.version,
          deleted = excluded.deleted,
          updated_at = excluded.updated_at,
-         change_id = excluded.change_id
-       WHERE excluded.updated_at > sync_bootstrap_records.updated_at
-          OR (excluded.updated_at = sync_bootstrap_records.updated_at
-              AND excluded.change_id >= sync_bootstrap_records.change_id)`,
+         change_source = excluded.change_source,
+         change_seq = excluded.change_seq,
+         change_id = excluded.change_id`,
       [
         row.ownerId,
         row.entity,
@@ -414,92 +576,61 @@ const writeBootstrapRows = async (
         row.version,
         row.deleted ? 1 : 0,
         row.updatedAt,
-        row.changeId,
+        row.changeSource!,
+        row.changeSeq!,
+        row.changeId!,
       ],
     )
   }
+  return affected
 }
 
-const reconciliationKeysForRows = (
-  rows: ReconciliationOutboxRow[],
-  ownerId: string,
-): Set<string> => {
-  const protectedKeys = new Set<string>()
-  for (const row of rows) {
-    protectedKeys.add(recordKey(row.entity, row.entity_id))
-    if (row.kind !== 'save_invoice_bundle') continue
-    let payload: unknown
-    try {
-      payload = JSON.parse(row.payload_json)
-    } catch (cause) {
-      throw new DataCorruptionError('Corrupt invoice bundle while reconciling cloud state', { cause })
-    }
-    const invoiceId = (payload as { invoice?: { id?: unknown } })?.invoice?.id
-    if (typeof invoiceId !== 'string') {
-      throw new DataCorruptionError('Corrupt invoice bundle identity while reconciling cloud state')
-    }
-    const bundle = validateBundlePayload(payload, ownerId, invoiceId)
-    protectedKeys.add(recordKey('client', bundle.client.id))
-    protectedKeys.add(recordKey('job', bundle.job.id))
-    protectedKeys.add(recordKey('invoice', bundle.invoice.id))
-  }
-  return protectedKeys
-}
-
-const protectedReconciliationKeys = async (
+const materializeServerAuthority = async (
   database: SQLiteDatabase,
   ownerId: string,
-): Promise<Set<string>> => {
-  const rows = await database.getAllAsync<ReconciliationOutboxRow>(
-    `/* bootstrap:outbox:list */
-     SELECT entity, entity_id, kind, payload_json
-     FROM outbox
-     WHERE owner_id = ? AND state <> 'complete'`,
+  keys?: Set<string>,
+): Promise<void> => {
+  const rows = await database.getAllAsync<ServerAuthorityRow>(
+    `/* server-authority:list */
+     SELECT owner_id, entity, entity_id, payload_json, version, deleted,
+            updated_at, change_source, change_seq, change_id
+     FROM sync_server_authority
+     WHERE owner_id = ?`,
     [ownerId],
   )
-  return reconciliationKeysForRows(rows, ownerId)
+  const selected = keys
+    ? rows.filter((row) => keys.has(recordKey(row.entity, row.entity_id)))
+    : rows
+  await writeCloudRows(
+    database,
+    prepareCloudRows(selected.map(cloudRowFromAuthority), ownerId),
+  )
 }
 
-const snapshotLaterLocalIntentRows = async (
+const allOutboxIntentRows = async (
   database: SQLiteDatabase,
   ownerId: string,
-  mutationId: string,
-  overwrittenRows: PreparedCloudRow[],
+): Promise<LaterOutboxRow[]> => database.getAllAsync<LaterOutboxRow>(
+  `/* outbox:all-local-intents */
+   SELECT sequence, mutation_id, entity, entity_id, kind, base_version,
+          payload_json, created_at, attempts, payload_hash
+   FROM outbox
+   WHERE owner_id = ? AND state <> 'complete'
+   ORDER BY sequence ASC`,
+  [ownerId],
+)
+
+const preparedIntentRows = async (
+  rows: LaterOutboxRow[],
+  ownerId: string,
 ): Promise<PreparedCloudRow[]> => {
-  const acknowledged = await database.getFirstAsync<MutationSequenceRow>(
-    `/* outbox:acknowledgement-sequence */
-     SELECT sequence FROM outbox
-     WHERE owner_id = ? AND mutation_id = ? AND state <> 'complete'`,
-    [ownerId, mutationId],
-  )
-  if (!acknowledged) {
-    throw new Error('Mutation acknowledgement is missing its durable outbox sequence')
-  }
-  const later = await database.getAllAsync<LaterOutboxRow>(
-    `/* outbox:later-local-intents */
-     SELECT sequence, mutation_id, entity, entity_id, kind, base_version,
-            payload_json, created_at, attempts, payload_hash
-     FROM outbox
-     WHERE owner_id = ? AND sequence > ? AND state <> 'complete'
-     ORDER BY sequence ASC`,
-    [ownerId, acknowledged.sequence],
-  )
-  if (later.length === 0 || overwrittenRows.length === 0) return []
-  const laterKeys = reconciliationKeysForRows(later, ownerId)
-  const overwrittenKeys = new Set(
-    overwrittenRows.map(({ row }) => recordKey(row.entity, row.entityId)),
-  )
-  const protectedKeys = new Set(
-    [...laterKeys].filter((key) => overwrittenKeys.has(key)),
-  )
-  if (protectedKeys.size === 0) return []
   const latestByKey = new Map<string, CloudRowEnvelope>()
-  for (const row of later) {
+  for (const row of rows) {
     let payload: unknown
     try {
       payload = JSON.parse(row.payload_json)
     } catch (cause) {
-      throw new DataCorruptionError('Corrupt protected outbox JSON during acknowledgement', { cause })
+      throw new OutboxCorruptionError(row.mutation_id, undefined, { cause })
     }
     let mutation: MutationEnvelope
     try {
@@ -515,12 +646,12 @@ const snapshotLaterLocalIntentRows = async (
         attempts: row.attempts,
       })
       if (await hashMutationEnvelope(mutation) !== row.payload_hash) {
-        throw new Error('protected outbox hash does not match its immutable envelope')
+        throw new Error('immutable mutation hash mismatch')
       }
     } catch (cause) {
-      throw new DataCorruptionError('Corrupt protected outbox intent during acknowledgement', { cause })
+      throw new OutboxCorruptionError(row.mutation_id, undefined, { cause })
     }
-    const intentRows: CloudRowEnvelope[] = mutation.kind === 'save_invoice_bundle'
+    const intents: CloudRowEnvelope[] = mutation.kind === 'save_invoice_bundle'
       ? (['client', 'job', 'invoice'] as const).map((entity) => {
           const entityPayload = (mutation.payload as InvoiceBundlePayload)[entity]
           return {
@@ -550,17 +681,81 @@ const snapshotLaterLocalIntentRows = async (
             version: Number((mutation.payload as Record<string, unknown>).version),
             updatedAt: String((mutation.payload as Record<string, unknown>).updatedAt),
           }]
-    for (const intent of intentRows) {
-      latestByKey.set(recordKey(intent.entity, intent.entityId), intent)
-    }
+    for (const intent of intents) latestByKey.set(recordKey(intent.entity, intent.entityId), intent)
   }
-  return prepareCloudRows(
-    [...latestByKey.entries()]
-      .filter(([key]) => protectedKeys.has(key))
-      .map(([, row]) => row),
-    ownerId,
+  return prepareCloudRows([...latestByKey.values()], ownerId)
+}
+
+const overlayAllLocalIntents = async (
+  database: SQLiteDatabase,
+  ownerId: string,
+): Promise<void> => {
+  await writeCloudRows(
+    database,
+    await preparedIntentRows(await allOutboxIntentRows(database, ownerId), ownerId),
   )
 }
+
+const applyServerAuthorityAndOverlay = async (
+  database: SQLiteDatabase,
+  ownerId: string,
+  prepared: PreparedCloudRow[],
+): Promise<void> => {
+  const affected = await writeServerAuthorityRows(database, prepared)
+  await materializeServerAuthority(database, ownerId, affected)
+  await overlayAllLocalIntents(database, ownerId)
+}
+
+const writeBootstrapRows = async (
+  database: SQLiteDatabase,
+  prepared: PreparedCloudRow[],
+): Promise<void> => {
+  for (const { row, payloadJson } of prepared) {
+    if (
+      row.changeSource !== 'sync_changes' ||
+      row.changeSeq === undefined ||
+      row.changeId === undefined
+    ) {
+      throw new DataCorruptionError('Bootstrap cloud rows require a complete sync-change position')
+    }
+    await database.runAsync(
+      `/* bootstrap:stage:upsert */
+       INSERT INTO sync_bootstrap_records
+         (owner_id, entity, entity_id, payload_json, version, deleted, updated_at,
+          change_seq, change_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(owner_id, entity, entity_id) DO UPDATE SET
+         payload_json = excluded.payload_json,
+         version = excluded.version,
+         deleted = excluded.deleted,
+         updated_at = excluded.updated_at,
+         change_seq = excluded.change_seq,
+         change_id = excluded.change_id
+       WHERE excluded.change_seq >= sync_bootstrap_records.change_seq`,
+      [
+        row.ownerId,
+        row.entity,
+        row.entityId,
+        payloadJson,
+        row.version,
+        row.deleted ? 1 : 0,
+        row.updatedAt,
+        row.changeSeq,
+        row.changeId,
+      ],
+    )
+  }
+}
+
+const protectedReconciliationKeys = async (
+  database: SQLiteDatabase,
+  ownerId: string,
+): Promise<Set<string>> => new Set(
+  (await preparedIntentRows(
+    await allOutboxIntentRows(database, ownerId),
+    ownerId,
+  )).map(({ row }) => recordKey(row.entity, row.entityId)),
+  )
 
 const scheduleFreshBootstrapReconciliation = async (
   database: SQLiteDatabase,
@@ -600,7 +795,7 @@ const finalizeBootstrapReconciliation = async (
 ): Promise<boolean> => {
   const stagedRows = await database.getAllAsync<ReconciliationRecordRow>(
     `/* bootstrap:records:list */
-     SELECT entity, entity_id, payload_json, version, deleted, updated_at, change_id
+     SELECT entity, entity_id, payload_json, version, deleted, updated_at, change_seq, change_id
      FROM sync_bootstrap_records
      WHERE owner_id = ?`,
     [ownerId],
@@ -610,6 +805,13 @@ const finalizeBootstrapReconciliation = async (
      SELECT entity, entity_id FROM records WHERE owner_id = ?`,
     [ownerId],
   )
+  const cursorRow = await database.getFirstAsync<SyncCursorRow>(
+    `/* sync-cursors:get */
+     SELECT cursor FROM sync_cursors WHERE owner_id = ? AND entity = ?`,
+    [ownerId, '__all__'],
+  )
+  if (!cursorRow) throw new DataCorruptionError('Bootstrap terminal page is missing its cursor')
+  const terminal = parseSyncCursorTuple(cursorRow.cursor)
   const protectedKeys = await protectedReconciliationKeys(database, ownerId)
   const staged = prepareCloudRows(stagedRows.map((row) => {
     let payload: unknown
@@ -625,26 +827,32 @@ const finalizeBootstrapReconciliation = async (
       payload,
       version: row.version,
       updatedAt: row.updated_at,
+      changeSeq: row.change_seq,
       changeId: row.change_id,
+      changeSource: 'sync_changes',
       ...(row.deleted === 1 ? { deleted: true } : {}),
     }
   }), ownerId)
-  const extantKeys = new Set(
-    staged.filter(({ row }) => !row.deleted).map(({ row }) => recordKey(row.entity, row.entityId)),
+  const stagedKeys = new Set(
+    staged.map(({ row }) => recordKey(row.entity, row.entityId)),
   )
-  await writeCloudRows(
-    database,
-    staged.filter(({ row }) => !row.deleted && !protectedKeys.has(recordKey(row.entity, row.entityId))),
-  )
-  for (const row of currentRows) {
-    const key = recordKey(row.entity, row.entity_id)
-    if (extantKeys.has(key) || protectedKeys.has(key)) continue
-    await database.runAsync(
-      `/* bootstrap:records:delete */
-       DELETE FROM records WHERE owner_id = ? AND entity = ? AND entity_id = ?`,
-      [ownerId, row.entity, row.entity_id],
-    )
-  }
+  const absences = prepareCloudRows(currentRows
+    .filter((row) => !stagedKeys.has(recordKey(row.entity, row.entity_id)))
+    .map((row): CloudRowEnvelope => ({
+      ownerId,
+      entity: row.entity,
+      entityId: row.entity_id,
+      payload: null,
+      version: 0,
+      updatedAt: terminal.updatedAt,
+      changeSource: 'sync_snapshot',
+      changeSeq: terminal.changeSeq,
+      changeId: 0,
+      deleted: true,
+    })), ownerId)
+  await writeServerAuthorityRows(database, [...staged, ...absences])
+  await materializeServerAuthority(database, ownerId)
+  await overlayAllLocalIntents(database, ownerId)
   if (protectedKeys.size > 0) {
     await database.runAsync(
       `/* metadata:reconciliation-terminal:upsert */
@@ -674,16 +882,21 @@ const stagedRowIsAtLeastAsNew = (
   staged: ReconciliationRecordRow,
   receipt: PreparedCloudRow,
 ): boolean => {
-  if (receipt.row.changeId !== undefined) {
+  if (receipt.row.changeId !== undefined && receipt.row.changeSeq !== undefined && receipt.row.changeSource) {
     return compareImmutablePositions(
-      { updatedAt: staged.updated_at, changeId: staged.change_id },
-      { updatedAt: receipt.row.updatedAt, changeId: receipt.row.changeId },
+      {
+        updatedAt: staged.updated_at,
+        changeSeq: staged.change_seq,
+        changeId: staged.change_id,
+        changeSource: 'sync_changes',
+      },
+      authorityPosition(receipt.row),
     ) >= 0
   }
-  const timestampOrder = compareImmutablePositions(
-    { updatedAt: staged.updated_at, changeId: 0 },
-    { updatedAt: receipt.row.updatedAt, changeId: 0 },
-  )
+  const leftTime = parsePreciseTimestamp(staged.updated_at)
+  const rightTime = parsePreciseTimestamp(receipt.row.updatedAt)
+  const timestampOrder = leftTime.wholeSecondMilliseconds - rightTime.wholeSecondMilliseconds ||
+    leftTime.microseconds - rightTime.microseconds
   if (timestampOrder !== 0) return timestampOrder > 0
   if (staged.deleted !== (receipt.row.deleted ? 1 : 0)) return staged.deleted === 1
   return staged.version >= receipt.row.version
@@ -713,7 +926,7 @@ const repairAcknowledgedBootstrapRows = async (
 
   const stagedRows = await database.getAllAsync<ReconciliationRecordRow>(
     `/* bootstrap:records:list */
-     SELECT entity, entity_id, payload_json, version, deleted, updated_at, change_id
+     SELECT entity, entity_id, payload_json, version, deleted, updated_at, change_seq, change_id
      FROM sync_bootstrap_records
      WHERE owner_id = ?`,
     [ownerId],
@@ -743,7 +956,9 @@ const repairAcknowledgedBootstrapRows = async (
         payload,
         version: row.version,
         updatedAt: row.updated_at,
+        changeSeq: row.change_seq,
         changeId: row.change_id,
+        changeSource: 'sync_changes',
         ...(row.deleted === 1 ? { deleted: true } : {}),
       }
     }), ownerId))
@@ -758,7 +973,7 @@ const repairAcknowledgedBootstrapRows = async (
       (
         receipt.row.changeId !== undefined &&
         compareImmutablePositions(
-          { updatedAt: receipt.row.updatedAt, changeId: receipt.row.changeId },
+          authorityPosition(receipt.row),
           terminalCursor,
         ) <= 0
       )
@@ -801,13 +1016,30 @@ const repairAcknowledgedBootstrapRows = async (
   return true
 }
 
-const prepareConflict = (
+const prepareConflictUnchecked = (
   input: ConflictRecord,
   ownerId: string,
-): { conflict: ConflictRecord; localPayloadJson: string; cloudPayloadJson: string } => {
+): {
+  conflict: ConflictRecord
+  localPayloadJson: string
+  cloudPayloadJson: string
+  cloudRowsJson: string
+} => {
   const conflict = ConflictRecordSchema.parse(input) as ConflictRecord
   if (conflict.ownerId !== undefined && conflict.ownerId !== ownerId) {
     throw new Error('Conflict owner must match the active owner')
+  }
+  const cloudRows = prepareCloudRows(conflict.cloudRows, ownerId)
+  requirePositionedRows(cloudRows, 'Conflict authority')
+  for (const preparedRow of cloudRows) {
+    const isAbsent = preparedRow.row.deleted && preparedRow.row.payload === null
+    requireAuthoritySources(
+      [preparedRow],
+      isAbsent
+        ? ['sync_changes', 'sync_snapshot']
+        : ['sync_changes', 'legacy_receipt'],
+      'Conflict authority',
+    )
   }
   if (conflict.mutationKind === 'save_invoice_bundle') {
     if (conflict.entity !== 'invoice') {
@@ -818,10 +1050,42 @@ const prepareConflict = (
     if ((cloudBundle.invoice?.version ?? 0) !== conflict.cloudVersion) {
       throw new Error('Bundle conflict invoice version must match the conflict record')
     }
+    const expected = new Map((['client', 'job', 'invoice'] as const).map((entity) => {
+      const local = localBundle[entity]
+      const payload = cloudBundle[entity]
+      return [recordKey(entity, local.id), { entity, local, payload }]
+    }))
+    if (cloudRows.length !== expected.size) {
+      throw new Error('Bundle conflict requires one positioned authority row per member')
+    }
+    for (const preparedRow of cloudRows) {
+      const key = recordKey(preparedRow.row.entity, preparedRow.row.entityId)
+      const match = expected.get(key)
+      if (!match) {
+        throw new Error('Bundle conflict requires one positioned authority row per member')
+      }
+      if (
+        canonicalStringify(preparedRow.row.payload) !== canonicalStringify(match.payload) ||
+        (preparedRow.row.payload === null && preparedRow.row.version !== 0)
+      ) {
+        throw new Error('Bundle conflict authority does not match its cloud member')
+      }
+      expected.delete(key)
+    }
+    if (expected.size !== 0) {
+      throw new Error('Bundle conflict requires one positioned authority row per member')
+    }
     return {
-      conflict: { ...conflict, ownerId, localPayload: localBundle, cloudPayload: cloudBundle },
+      conflict: {
+        ...conflict,
+        ownerId,
+        localPayload: localBundle,
+        cloudPayload: cloudBundle,
+        cloudRows: cloudRows.map(({ row }) => row),
+      },
       localPayloadJson: canonicalStringify(localBundle),
       cloudPayloadJson: canonicalStringify(cloudBundle),
+      cloudRowsJson: canonicalStringify(cloudRows.map(({ row }) => row)),
     }
   }
   const localPayload = conflict.mutationKind === 'delete'
@@ -846,10 +1110,32 @@ const prepareConflict = (
   if (cloudPayload !== null && cloudPayload.version !== conflict.cloudVersion) {
     throw new Error('Conflict cloud payload version must match the conflict record')
   }
+  if (
+    cloudRows.length !== 1 ||
+    cloudRows[0].row.entity !== conflict.entity ||
+    cloudRows[0].row.entityId !== conflict.entityId ||
+    canonicalStringify(cloudRows[0].row.payload) !== canonicalStringify(cloudPayload) ||
+    cloudRows[0].row.version !== conflict.cloudVersion
+  ) {
+    throw new Error('Generic conflict authority does not match its cloud payload')
+  }
   return {
-    conflict: { ...conflict, ownerId },
+    conflict: { ...conflict, ownerId, cloudRows: cloudRows.map(({ row }) => row) },
     localPayloadJson: canonicalStringify(localPayload),
     cloudPayloadJson: canonicalStringify(cloudPayload),
+    cloudRowsJson: canonicalStringify(cloudRows.map(({ row }) => row)),
+  }
+}
+
+const prepareConflict = (
+  input: ConflictRecord,
+  ownerId: string,
+): ReturnType<typeof prepareConflictUnchecked> => {
+  try {
+    return prepareConflictUnchecked(input, ownerId)
+  } catch (cause) {
+    if (cause instanceof DataCorruptionError) throw cause
+    throw new DataCorruptionError('Conflict authority response is invalid', { cause })
   }
 }
 
@@ -858,19 +1144,20 @@ const writeConflict = async (
   ownerId: string,
   prepared: ReturnType<typeof prepareConflict>,
 ): Promise<void> => {
-  const { conflict, localPayloadJson, cloudPayloadJson } = prepared
+  const { conflict, localPayloadJson, cloudPayloadJson, cloudRowsJson } = prepared
   await database.runAsync(
     `/* conflicts:upsert */
      INSERT INTO conflicts
        (owner_id, mutation_id, entity, entity_id, local_payload_json,
-        cloud_payload_json, cloud_version)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
+        cloud_payload_json, cloud_version, cloud_rows_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(owner_id, mutation_id) DO UPDATE SET
        entity = excluded.entity,
        entity_id = excluded.entity_id,
        local_payload_json = excluded.local_payload_json,
        cloud_payload_json = excluded.cloud_payload_json,
-       cloud_version = excluded.cloud_version`,
+       cloud_version = excluded.cloud_version,
+       cloud_rows_json = excluded.cloud_rows_json`,
     [
       ownerId,
       conflict.mutationId,
@@ -879,6 +1166,7 @@ const writeConflict = async (
       localPayloadJson,
       cloudPayloadJson,
       conflict.cloudVersion,
+      cloudRowsJson,
     ],
   )
 }
@@ -1163,7 +1451,9 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
       this.assertSharedOwnerAvailable(snapshot.ownerId)
       await this.accessDatabase(async (database) => {
         await database.withExclusiveTransactionAsync(async (transaction) => {
-          await writeCloudRows(transaction, prepared)
+          const positioned = prepared.every(({ row }) => row.changeSource !== undefined)
+          if (positioned) await applyServerAuthorityAndOverlay(transaction, snapshot.ownerId, prepared)
+          else await writeCloudRows(transaction, prepared)
           if (!this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
             throw new Error('Owner changed while applying cloud rows')
           }
@@ -1215,6 +1505,9 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
     const snapshot = this.requireOwnerSnapshot()
     if (ownerId !== snapshot.ownerId) throw new Error('Pull owner must match the active owner')
     const prepared = prepareCloudRows(inputRows, ownerId)
+    requirePositionedRows(prepared, 'Pull commit')
+    requireAuthoritySources(prepared, ['sync_changes'], 'Pull commit')
+    parseSyncCursorTuple(cursor)
     let reconciledBootstrap = false
     let completedInitialHydration = false
 
@@ -1228,7 +1521,7 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
             [ownerId, FEED_RECONCILIATION_KEY],
           )
           if (reconciliation?.value === 'true') await writeBootstrapRows(transaction, prepared)
-          else await writeCloudRows(transaction, prepared)
+          else await applyServerAuthorityAndOverlay(transaction, ownerId, prepared)
           await transaction.runAsync(
             `/* sync-cursors:upsert */
              INSERT INTO sync_cursors (owner_id, entity, cursor)
@@ -1308,6 +1601,14 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
     const snapshot = this.requireOwnerSnapshot()
     if (ownerId !== snapshot.ownerId) throw new Error('Acknowledgement owner must match the active owner')
     const prepared = prepareCloudRows(inputRows, ownerId)
+    if (!requiresBootstrapRepair) {
+      requirePositionedRows(prepared, 'Mutation acknowledgement')
+      requireAuthoritySources(
+        prepared,
+        ['sync_changes', 'legacy_receipt'],
+        'Mutation acknowledgement',
+      )
+    }
     let completedInitialHydration = false
     let scheduledBootstrapRepair = false
 
@@ -1345,13 +1646,7 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
               return
             }
           }
-          const protectedLocalRows = await snapshotLaterLocalIntentRows(
-            transaction,
-            ownerId,
-            mutationId,
-            prepared,
-          )
-          if (!requiresBootstrapRepair) await writeCloudRows(transaction, prepared)
+          if (!requiresBootstrapRepair) await writeServerAuthorityRows(transaction, prepared)
           const result = await transaction.runAsync(
             `/* outbox:acknowledge */
              UPDATE outbox SET state = 'complete', last_error = NULL
@@ -1374,7 +1669,8 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
               [ownerId, 'initial-cloud-pull-complete', 'true'],
             )
           }
-          await writeCloudRows(transaction, protectedLocalRows)
+          await materializeServerAuthority(transaction, ownerId)
+          await overlayAllLocalIntents(transaction, ownerId)
           if (!isCurrent() || !this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
             throw new Error('Owner changed while acknowledging a mutation')
           }
@@ -1412,7 +1708,7 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
              UPDATE outbox
              SET state = 'failed', attempts = attempts + 1, last_error = ?
              WHERE owner_id = ? AND mutation_id = ?
-               AND state IN ('pending', 'failed', 'syncing')`,
+               AND state IN ('pending', 'failed', 'syncing', 'conflict')`,
             [reason, ownerId, mutationId],
           )
           if (result.changes !== 1) throw new Error('Mutation failure did not match one outbox record')
@@ -1472,7 +1768,7 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
       `/* conflicts:get */
        SELECT conflict.mutation_id, outbox.kind AS mutation_kind,
               conflict.entity, conflict.entity_id, conflict.local_payload_json,
-              conflict.cloud_payload_json, conflict.cloud_version
+              conflict.cloud_payload_json, conflict.cloud_version, conflict.cloud_rows_json
        FROM conflicts AS conflict
        INNER JOIN outbox AS outbox
          ON outbox.owner_id = conflict.owner_id
@@ -1495,7 +1791,7 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
             `/* conflicts:get */
              SELECT conflict.mutation_id, outbox.kind AS mutation_kind,
                     conflict.entity, conflict.entity_id, conflict.local_payload_json,
-                    conflict.cloud_payload_json, conflict.cloud_version
+                    conflict.cloud_payload_json, conflict.cloud_version, conflict.cloud_rows_json
              FROM conflicts AS conflict
              INNER JOIN outbox AS outbox
                ON outbox.owner_id = conflict.owner_id
@@ -1505,46 +1801,9 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
           )
           if (!row) throw new Error('The conflict is no longer available')
           const conflict = this.parseConflictRow(row, snapshot.ownerId)
-          const cloudRows = conflict.mutationKind === 'save_invoice_bundle'
-            ? (['client', 'job', 'invoice'] as const).map((entity) => {
-                const payload = (conflict.cloudPayload as InvoiceBundleCloudPayload)[entity]
-                const local = (conflict.localPayload as InvoiceBundlePayload)[entity]
-                return {
-                  ownerId: snapshot.ownerId,
-                  entity,
-                  entityId: payload?.id ?? local.id,
-                  payload,
-                  version: payload?.version ?? 0,
-                  updatedAt: payload?.updatedAt ?? new Date().toISOString(),
-                  ...(payload === null ? { deleted: true } : {}),
-                }
-              })
-            : conflict.cloudPayload === null
-              ? [{
-                  ownerId: snapshot.ownerId,
-                  entity: conflict.entity,
-                  entityId: conflict.entityId,
-                  payload: null,
-                  version: conflict.cloudVersion,
-                  updatedAt: new Date().toISOString(),
-                  deleted: true,
-                }]
-              : [{
-                ownerId: snapshot.ownerId,
-                entity: conflict.entity,
-                entityId: conflict.entityId,
-                payload: conflict.cloudPayload,
-                version: conflict.cloudVersion,
-                updatedAt: String((conflict.cloudPayload as Record<string, unknown>).updatedAt),
-              }]
-          const preparedCloudRows = prepareCloudRows(cloudRows, snapshot.ownerId)
-          const protectedLocalRows = await snapshotLaterLocalIntentRows(
-            transaction,
-            snapshot.ownerId,
-            mutationId,
-            preparedCloudRows,
-          )
-          await writeCloudRows(transaction, preparedCloudRows)
+          const preparedCloudRows = prepareCloudRows(conflict.cloudRows, snapshot.ownerId)
+          requirePositionedRows(preparedCloudRows, 'Keep-cloud conflict resolution')
+          await writeServerAuthorityRows(transaction, preparedCloudRows)
           const completed = await transaction.runAsync(
             `/* outbox:resolve */
              UPDATE outbox SET state = 'complete', last_error = NULL
@@ -1557,7 +1816,8 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
             snapshot.ownerId,
             preparedCloudRows,
           )
-          await writeCloudRows(transaction, protectedLocalRows)
+          await materializeServerAuthority(transaction, snapshot.ownerId)
+          await overlayAllLocalIntents(transaction, snapshot.ownerId)
           await transaction.runAsync(
             `/* conflicts:delete */ DELETE FROM conflicts WHERE owner_id = ? AND mutation_id = ?`,
             [snapshot.ownerId, mutationId],
@@ -1602,7 +1862,7 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
             `/* conflicts:get */
              SELECT conflict.mutation_id, outbox.kind AS mutation_kind,
                     conflict.entity, conflict.entity_id, conflict.local_payload_json,
-                    conflict.cloud_payload_json, conflict.cloud_version
+                    conflict.cloud_payload_json, conflict.cloud_version, conflict.cloud_rows_json
              FROM conflicts AS conflict
              INNER JOIN outbox AS outbox
                ON outbox.owner_id = conflict.owner_id
@@ -1728,6 +1988,7 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
           await transaction.runAsync('/* owner:clear:conflicts */ DELETE FROM conflicts WHERE owner_id = ?', [ownerId])
           await transaction.runAsync('/* owner:clear:sync_cursors */ DELETE FROM sync_cursors WHERE owner_id = ?', [ownerId])
           await transaction.runAsync('/* owner:clear:sync_bootstrap_records */ DELETE FROM sync_bootstrap_records WHERE owner_id = ?', [ownerId])
+          await transaction.runAsync('/* owner:clear:sync_server_authority */ DELETE FROM sync_server_authority WHERE owner_id = ?', [ownerId])
           await transaction.runAsync('/* owner:clear:metadata */ DELETE FROM metadata WHERE owner_id = ?', [ownerId])
         })
       }, true)
@@ -1842,6 +2103,9 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
         localPayload: JSON.parse(row.local_payload_json),
         cloudPayload: JSON.parse(row.cloud_payload_json),
         cloudVersion: row.cloud_version,
+        cloudRows: row.cloud_rows_json === null
+          ? []
+          : JSON.parse(row.cloud_rows_json),
       }, ownerId).conflict
     } catch (cause) {
       throw new DataCorruptionError(

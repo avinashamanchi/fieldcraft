@@ -30,4 +30,5 @@ export type ConflictRecord = {
   localPayload: unknown
   cloudPayload: unknown
   cloudVersion: number
+  cloudRows: import('../data/repository').CloudRowEnvelope[]
 }

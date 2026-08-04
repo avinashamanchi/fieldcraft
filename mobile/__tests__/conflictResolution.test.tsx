@@ -22,6 +22,28 @@ jest.mock('../src/data/SyncProvider', () => ({
   }),
 }))
 
+const cloudClient = {
+  id: 'client-1',
+  ownerId: 'owner-a',
+  version: 4,
+  createdAt: '2026-08-03T10:00:00.000Z',
+  updatedAt: '2026-08-03T10:00:04.000Z',
+  syncState: 'current',
+  name: 'Cloud name',
+  notes: 'private cloud note',
+}
+
+const positionedRow = (
+  entity: 'client' | 'job' | 'invoice',
+  entityId: string,
+  payload: Record<string, unknown>,
+  changeSeq: number,
+) => ({
+  ownerId: 'owner-a', entity, entityId, payload,
+  version: Number(payload.version), updatedAt: String(payload.updatedAt),
+  changeSource: 'sync_changes' as const, changeSeq, changeId: changeSeq,
+})
+
 const conflict: ConflictRecord = {
   mutationId: '00000000-0000-4000-8000-000000000071',
   entity: 'client',
@@ -36,17 +58,9 @@ const conflict: ConflictRecord = {
     name: 'My local name',
     notes: 'private local note',
   },
-  cloudPayload: {
-    id: 'client-1',
-    ownerId: 'owner-a',
-    version: 4,
-    createdAt: '2026-08-03T10:00:00.000Z',
-    updatedAt: '2026-08-03T10:00:04.000Z',
-    syncState: 'current',
-    name: 'Cloud name',
-    notes: 'private cloud note',
-  },
+  cloudPayload: cloudClient,
   cloudVersion: 4,
+  cloudRows: [positionedRow('client', 'client-1', cloudClient, 1)],
 }
 
 class FakeConflictRepository implements ConflictResolutionRepository {
@@ -206,6 +220,26 @@ it('recreates an edited row explicitly when the remote update target was deleted
   })
 })
 
+const bundleCloudPayload = {
+  client: { ...conflict.cloudPayload as object, id: 'client-1', name: 'Cloud client', version: 4 },
+  job: {
+    id: 'job-1', ownerId: 'owner-a', clientId: 'client-1', title: 'Cloud job', status: 'Invoiced',
+    version: 5, createdAt: '2026-08-03T10:00:00.000Z',
+    updatedAt: '2026-08-03T10:00:05.000Z', syncState: 'current',
+  },
+  invoice: {
+    id: 'invoice-1', ownerId: 'owner-a', clientId: 'client-1', jobId: 'job-1',
+    version: 6, createdAt: '2026-08-03T10:00:00.000Z',
+    updatedAt: '2026-08-03T10:00:06.000Z', syncState: 'current',
+    draft: {
+      clientName: 'Cloud client', jobTitle: 'Cloud job', tradeType: 'Plumbing',
+      taxBasisPoints: 0, paymentTerms: 'Net 30',
+      lineItems: [{ description: 'Cloud labor', type: 'labor', quantity: 1000, unitPriceCents: 200 }],
+    },
+    subtotalCents: 200, taxCents: 0, totalCents: 200,
+  },
+}
+
 const bundleConflict: ConflictRecord = {
   mutationId: '00000000-0000-4000-8000-000000000076',
   mutationKind: 'save_invoice_bundle',
@@ -231,25 +265,12 @@ const bundleConflict: ConflictRecord = {
       subtotalCents: 100, taxCents: 0, totalCents: 100,
     },
   },
-  cloudPayload: {
-    client: { ...conflict.cloudPayload as object, id: 'client-1', name: 'Cloud client', version: 4 },
-    job: {
-      id: 'job-1', ownerId: 'owner-a', clientId: 'client-1', title: 'Cloud job', status: 'Invoiced',
-      version: 5, createdAt: '2026-08-03T10:00:00.000Z',
-      updatedAt: '2026-08-03T10:00:05.000Z', syncState: 'current',
-    },
-    invoice: {
-      id: 'invoice-1', ownerId: 'owner-a', clientId: 'client-1', jobId: 'job-1',
-      version: 6, createdAt: '2026-08-03T10:00:00.000Z',
-      updatedAt: '2026-08-03T10:00:06.000Z', syncState: 'current',
-      draft: {
-        clientName: 'Cloud client', jobTitle: 'Cloud job', tradeType: 'Plumbing',
-        taxBasisPoints: 0, paymentTerms: 'Net 30',
-        lineItems: [{ description: 'Cloud labor', type: 'labor', quantity: 1000, unitPriceCents: 200 }],
-      },
-      subtotalCents: 200, taxCents: 0, totalCents: 200,
-    },
-  },
+  cloudPayload: bundleCloudPayload,
+  cloudRows: [
+    positionedRow('client', 'client-1', bundleCloudPayload.client, 2),
+    positionedRow('job', 'job-1', bundleCloudPayload.job, 3),
+    positionedRow('invoice', 'invoice-1', bundleCloudPayload.invoice, 4),
+  ],
 }
 
 it('replays a compound conflict with each entity rebased to its own cloud version', async () => {

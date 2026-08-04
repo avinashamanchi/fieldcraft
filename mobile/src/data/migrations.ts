@@ -1,6 +1,6 @@
 import type { SQLiteDatabase } from 'expo-sqlite'
 
-export const DATABASE_SCHEMA_VERSION = 3
+export const DATABASE_SCHEMA_VERSION = 4
 
 type UserVersionRow = { user_version: number }
 
@@ -126,6 +126,67 @@ const VERSION_THREE_SCHEMA = `
   PRAGMA user_version = 3;
 `
 
+const VERSION_FOUR_SCHEMA = `
+  ALTER TABLE sync_bootstrap_records ADD COLUMN change_seq INTEGER;
+  ALTER TABLE conflicts ADD COLUMN cloud_rows_json TEXT;
+
+  CREATE TABLE IF NOT EXISTS sync_server_authority (
+    owner_id TEXT NOT NULL,
+    entity TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    deleted INTEGER NOT NULL CHECK (deleted IN (0, 1)),
+    updated_at TEXT NOT NULL,
+    change_source TEXT NOT NULL
+      CHECK (change_source IN ('sync_changes', 'sync_snapshot', 'legacy_receipt')),
+    change_seq INTEGER NOT NULL CHECK (change_seq >= 0),
+    change_id INTEGER NOT NULL CHECK (change_id >= 0),
+    PRIMARY KEY (owner_id, entity, entity_id),
+    CHECK (
+      (change_source = 'sync_changes' AND change_seq > 0 AND change_id > 0)
+      OR (change_source = 'sync_snapshot' AND change_id = 0)
+      OR (change_source = 'legacy_receipt' AND change_seq = 0 AND change_id = 0)
+    )
+  );
+
+  INSERT INTO metadata (owner_id, key, value)
+  SELECT owners.owner_id, 'sync-feed-v2-reconciliation-required', 'true'
+  FROM (
+    SELECT owner_id FROM records
+    UNION SELECT owner_id FROM outbox
+    UNION SELECT owner_id FROM conflicts
+    UNION SELECT owner_id FROM sync_cursors
+    UNION SELECT owner_id FROM metadata
+    UNION SELECT owner_id FROM sync_bootstrap_records
+  ) AS owners
+  ON CONFLICT(owner_id, key) DO UPDATE SET value = excluded.value;
+
+  UPDATE outbox
+  SET state = 'pending', last_error = NULL
+  WHERE state = 'conflict';
+
+  DELETE FROM conflicts;
+
+  DELETE FROM metadata
+  WHERE key IN ('initial-cloud-pull-complete', 'sync-feed-v2-terminal-reconciliation-pending')
+    AND owner_id IN (
+      SELECT owner_id FROM metadata
+      WHERE key = 'sync-feed-v2-reconciliation-required'
+    );
+
+  DELETE FROM sync_cursors
+  WHERE entity = '__all__'
+    AND owner_id IN (
+      SELECT owner_id FROM metadata
+      WHERE key = 'sync-feed-v2-reconciliation-required'
+    );
+
+  DELETE FROM sync_bootstrap_records;
+
+  PRAGMA user_version = 4;
+`
+
 export const applyMigrations = async (database: SQLiteDatabase): Promise<void> => {
   await database.withExclusiveTransactionAsync(async (transaction) => {
     const row = await transaction.getFirstAsync<UserVersionRow>('PRAGMA user_version')
@@ -149,6 +210,11 @@ export const applyMigrations = async (database: SQLiteDatabase): Promise<void> =
 
     if (currentVersion === 2) {
       await transaction.execAsync(VERSION_THREE_SCHEMA)
+      currentVersion = 3
+    }
+
+    if (currentVersion === 3) {
+      await transaction.execAsync(VERSION_FOUR_SCHEMA)
     }
   })
 }

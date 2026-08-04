@@ -2,7 +2,13 @@ import * as Crypto from 'expo-crypto'
 
 import type { ConflictRecord, MutationEnvelope } from '../domain/sync'
 import type { MutationOutbox } from './outbox'
-import type { CloudRowEnvelope, InvoiceBundlePayload, MutationFailureReason } from './repository'
+import {
+  DataCorruptionError,
+  OutboxCorruptionError,
+  type CloudRowEnvelope,
+  type InvoiceBundlePayload,
+  type MutationFailureReason,
+} from './repository'
 import {
   RemoteGatewayError,
   type RemoteFailureReason,
@@ -113,7 +119,11 @@ const isEligible = (lifecycle: SyncLifecycle): lifecycle is SyncLifecycle & { ow
   lifecycle.online
 
 const classifyFailure = (error: unknown): RemoteFailureReason =>
-  error instanceof RemoteGatewayError ? error.reason : 'transient'
+  error instanceof RemoteGatewayError
+    ? error.reason
+    : error instanceof DataCorruptionError
+      ? 'invalid-response'
+      : 'transient'
 
 export class SyncCoordinator {
   private readonly repository: SyncRepository
@@ -194,13 +204,18 @@ export class SyncCoordinator {
     const ownerId = this.lifecycle.ownerId
     const controller = new AbortController()
     const promise = this.runGeneration(requestedGeneration, ownerId, controller.signal)
-      .catch(async () => {
+      .catch(async (error) => {
         if (!this.isRunCurrent(requestedGeneration, ownerId, controller.signal)) {
           return
         }
         const pending = await this.readPendingCount(ownerId, requestedGeneration)
         if (this.isRunCurrent(requestedGeneration, ownerId, controller.signal)) {
-          this.failStatus(pending, 'transient', requestedGeneration, 'pull')
+          this.failStatus(
+            pending,
+            classifyFailure(error),
+            requestedGeneration,
+            'pull',
+          )
         }
       })
       .finally(() => {
@@ -250,7 +265,22 @@ export class SyncCoordinator {
     ownerId: string,
     signal: AbortSignal,
   ): Promise<void> {
-    let pending = await this.repository.outbox.list(ownerId)
+    let pending: MutationEnvelope[]
+    try {
+      pending = await this.repository.outbox.list(ownerId)
+    } catch (error) {
+      if (!(error instanceof OutboxCorruptionError)) throw error
+      await this.repository.recordMutationFailure(
+        ownerId,
+        error.mutationId,
+        'invalid-response',
+        () => this.isRunCurrent(generation, ownerId, signal),
+      )
+      if (this.isRunCurrent(generation, ownerId, signal)) {
+        this.failStatus(1, 'invalid-response', generation, 'push')
+      }
+      return
+    }
     if (!this.isRunCurrent(generation, ownerId, signal)) return
     this.setStatus({ state: 'syncing', pending: pending.length })
 
@@ -259,6 +289,18 @@ export class SyncCoordinator {
       this.retryAttempts.authentication = 0
     } catch (error) {
       if (!this.isRunCurrent(generation, ownerId, signal)) return
+      if (error instanceof OutboxCorruptionError) {
+        await this.repository.recordMutationFailure(
+          ownerId,
+          error.mutationId,
+          'invalid-response',
+          () => this.isRunCurrent(generation, ownerId, signal),
+        )
+        if (this.isRunCurrent(generation, ownerId, signal)) {
+          this.failStatus(pending.length, 'invalid-response', generation, 'pull')
+        }
+        return
+      }
       const reason = classifyFailure(error)
       if (reason === 'reauthentication') this.onReauthenticationRequired(ownerId)
       this.failStatus(pending.length, reason, generation, 'authentication')
@@ -285,6 +327,22 @@ export class SyncCoordinator {
       }
     } catch (error) {
       if (!this.isRunCurrent(generation, ownerId, signal)) return
+      if (error instanceof OutboxCorruptionError) {
+        try {
+          await this.repository.recordMutationFailure(
+            ownerId,
+            error.mutationId,
+            'invalid-response',
+            () => this.isRunCurrent(generation, ownerId, signal),
+          )
+        } catch {
+          // The immutable row remains queued; surface the permanent stop either way.
+        }
+        if (this.isRunCurrent(generation, ownerId, signal)) {
+          this.failStatus(pending.length, 'invalid-response', generation, 'pull')
+        }
+        return
+      }
       const reason = classifyFailure(error)
       if (reason === 'reauthentication') this.onReauthenticationRequired(ownerId)
       this.failStatus(pending.length, reason, generation, 'pull')
@@ -292,7 +350,21 @@ export class SyncCoordinator {
     }
     if (!this.isRunCurrent(generation, ownerId, signal)) return
 
-    pending = await this.repository.outbox.list(ownerId)
+    try {
+      pending = await this.repository.outbox.list(ownerId)
+    } catch (error) {
+      if (!(error instanceof OutboxCorruptionError)) throw error
+      await this.repository.recordMutationFailure(
+        ownerId,
+        error.mutationId,
+        'invalid-response',
+        () => this.isRunCurrent(generation, ownerId, signal),
+      )
+      if (this.isRunCurrent(generation, ownerId, signal)) {
+        this.failStatus(1, 'invalid-response', generation, 'push')
+      }
+      return
+    }
     if (!this.isRunCurrent(generation, ownerId, signal)) return
     this.setStatus({ state: 'syncing', pending: pending.length })
 
@@ -322,11 +394,32 @@ export class SyncCoordinator {
       if (!this.isRunCurrent(generation, ownerId, signal)) return
 
       if (result.type === 'conflict') {
-        await this.repository.recordMutationConflict(
-          ownerId,
-          result.conflict,
-          () => this.isRunCurrent(generation, ownerId, signal),
-        )
+        try {
+          await this.repository.recordMutationConflict(
+            ownerId,
+            result.conflict,
+            () => this.isRunCurrent(generation, ownerId, signal),
+          )
+        } catch (error) {
+          if (!this.isRunCurrent(generation, ownerId, signal)) return
+          const corruptMutationId = error instanceof OutboxCorruptionError
+            ? error.mutationId
+            : item.id
+          const reason = classifyFailure(error)
+          try {
+            await this.repository.recordMutationFailure(
+              ownerId,
+              corruptMutationId,
+              reason,
+              () => this.isRunCurrent(generation, ownerId, signal),
+            )
+          } catch {
+            // The original outbox row remains sendable when local failure recording also fails.
+          }
+          if (!this.isRunCurrent(generation, ownerId, signal)) return
+          this.failStatus(pending.length, reason, generation, 'push')
+          return
+        }
         if (!this.isRunCurrent(generation, ownerId, signal)) return
         this.retryAttempts.push = 0
         this.setStatus({ state: 'conflict', count: await this.repository.countConflicts(ownerId) })
@@ -342,20 +435,24 @@ export class SyncCoordinator {
           result.requiresBootstrapRepair === true,
         )
         this.retryAttempts.push = 0
-      } catch {
+      } catch (error) {
         if (!this.isRunCurrent(generation, ownerId, signal)) return
+        const corruptMutationId = error instanceof OutboxCorruptionError
+          ? error.mutationId
+          : item.id
+        const reason = classifyFailure(error)
         try {
           await this.repository.recordMutationFailure(
             ownerId,
-            item.id,
-            'transient',
+            corruptMutationId,
+            reason,
             () => this.isRunCurrent(generation, ownerId, signal),
           )
         } catch {
           // The original outbox row remains sendable when local failure recording also fails.
         }
         if (!this.isRunCurrent(generation, ownerId, signal)) return
-        this.failStatus(pending.length, 'transient', generation, 'push')
+        this.failStatus(pending.length, reason, generation, 'push')
         return
       }
     }

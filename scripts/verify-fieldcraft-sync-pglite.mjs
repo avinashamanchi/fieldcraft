@@ -12,6 +12,9 @@ const clientId = '71000000-0000-0000-0000-000000000071'
 const jobId = '72000000-0000-0000-0000-000000000071'
 const invoiceId = '73000000-0000-0000-0000-000000000071'
 const legacyMutationId = '74000000-0000-0000-0000-000000000071'
+const legacyConflictMutationId = '74000000-0000-0000-0000-000000000072'
+const truncatedConflictMutationId = '74000000-0000-0000-0000-000000000077'
+const mismatchedConflictMutationId = '74000000-0000-0000-0000-000000000078'
 const nullNumberMutationId = '74000000-0000-0000-0000-000000000074'
 const nullPaymentTermsMutationId = '74000000-0000-0000-0000-000000000075'
 const missingStatusMutationId = '74000000-0000-0000-0000-000000000076'
@@ -21,12 +24,22 @@ const createMutationId = '75000000-0000-0000-0000-000000000071'
 const deleteMutationId = '75000000-0000-0000-0000-000000000072'
 const createdClientId = '76000000-0000-0000-0000-000000000071'
 const directClientId = '76000000-0000-0000-0000-000000000072'
+const rewrittenClientId = '76000000-0000-0000-0000-000000000073'
 const sentinelMutationId = '77000000-0000-0000-0000-000000000071'
+const conflictMutationId = '77000000-0000-0000-0000-000000000072'
+const absentConflictMutationId = '77000000-0000-0000-0000-000000000073'
+const bundleMutationId = '78000000-0000-0000-0000-000000000071'
+const bundleConflictMutationId = '78000000-0000-0000-0000-000000000072'
+const bundleClientId = '79000000-0000-0000-0000-000000000071'
+const bundleJobId = '79000000-0000-0000-0000-000000000072'
+const bundleInvoiceId = '79000000-0000-0000-0000-000000000073'
 
 const db = new PGlite()
 const failures = []
+let checks = 0
 
 const verify = async (label, operation) => {
+  checks += 1
   try {
     await operation()
     process.stdout.write(`PASS ${label}\n`)
@@ -128,6 +141,58 @@ try {
     where invoice.id = '${invoiceId}';
 
     insert into public.mutation_receipts (user_id, mutation_id, response)
+    values (
+      '${ownerId}',
+      '${truncatedConflictMutationId}',
+      jsonb_build_object(
+        'status', 'conflict',
+        'entity', 'invoice',
+        'kind', 'update',
+        'entity_id', '${invoiceId}',
+        'cloud', jsonb_build_object('id', '${invoiceId}', 'user_id', '${ownerId}'),
+        'cloud_version', 1
+      )
+    );
+
+    insert into public.mutation_receipts (user_id, mutation_id, response)
+    select
+      '${ownerId}',
+      '${mismatchedConflictMutationId}',
+      jsonb_build_object(
+        'status', 'conflict',
+        'entity', 'invoice',
+        'kind', 'update',
+        'entity_id', invoice.id,
+        'cloud', jsonb_set(to_jsonb(invoice), '{version}', '1'::jsonb),
+        'cloud_version', 999
+      )
+    from public.invoices as invoice
+    where invoice.id = '${invoiceId}';
+
+    insert into public.mutation_receipts (
+      user_id, mutation_id, response, created_at, updated_at
+    )
+    select
+      '${ownerId}',
+      '${legacyConflictMutationId}',
+      jsonb_build_object(
+        'status', 'conflict',
+        'entity', 'invoice',
+        'kind', 'update',
+        'entity_id', invoice.id,
+        'cloud', jsonb_set(
+          jsonb_set(to_jsonb(invoice), '{version}', '1'::jsonb),
+          '{updated_at}',
+          '"2026-08-03T09:59:00Z"'::jsonb
+        ),
+        'cloud_version', 1
+      ),
+      '2026-08-03T09:59:01Z',
+      '2026-08-03T09:59:01Z'
+    from public.invoices as invoice
+    where invoice.id = '${invoiceId}';
+
+    insert into public.mutation_receipts (user_id, mutation_id, response)
     select
       '${ownerId}',
       '${nullNumberMutationId}',
@@ -175,11 +240,42 @@ try {
     `select set_config('request.jwt.claim.sub', '${ownerId}', false)`,
   )
 
+  await verify('migration 003 installs an owner-committed synchronization sequence', async () => {
+    const result = await db.query(`
+      select counter.last_change_seq,
+             count(change.change_seq)::int as event_count,
+             count(distinct change.change_seq)::int as distinct_sequences
+      from public.sync_owner_counters as counter
+      left join public.sync_changes as change on change.user_id = counter.user_id
+      where counter.user_id = $1
+      group by counter.last_change_seq
+    `, [ownerId])
+    const row = result.rows[0]
+    if (
+      !row ||
+      Number(row.last_change_seq) !== row.event_count ||
+      row.event_count !== row.distinct_sequences
+    ) {
+      throw new Error(`owner sequence was ${JSON.stringify(row ?? null)}`)
+    }
+  })
+
+  await verify('pull pages are capped to the stable owner head read for that response', async () => {
+    const result = await db.query(`
+      select pg_get_functiondef(
+        'public.pull_sync_changes(bigint,integer)'::regprocedure
+      ) as definition
+    `)
+    if (!result.rows[0]?.definition.includes('change.change_seq <= v_head_change_seq')) {
+      throw new Error('pull page query is not capped to its captured owner head')
+    }
+  })
+
   await verify(
     'migration 003 emits a self-contained pre-003 invoice before later relationship rows',
     async () => {
       const result = await db.query(
-        'select public.pull_sync_changes(null, null, 500) as response',
+        'select public.pull_sync_changes(null, 500) as response',
       )
       const response = result.rows[0].response
       const invoice = response.changes.find(
@@ -269,18 +365,91 @@ try {
           throw new Error('new invoice position did not identify its mutation event')
         }
       } finally {
-        await db.exec(`delete from public.invoices where id = '${createdInvoiceId}'`)
+        await db.exec(`
+          begin;
+          select public.fieldcraft_lock_sync_owner('${ownerId}', null);
+          delete from public.invoices where id = '${createdInvoiceId}';
+          commit;
+        `)
       }
     },
   )
 
+  let legacyConflictResponse
+  await verify(
+    'a pre-003 invoice conflict rebinds to one complete current canonical snapshot',
+    async () => {
+      const result = await db.query(`
+        select public.apply_entity_mutation(
+          '${legacyConflictMutationId}',
+          'invoice',
+          'update',
+          '${invoiceId}',
+          1,
+          '{}'
+        ) as response
+      `)
+      const response = result.rows[0].response
+      legacyConflictResponse = response
+      if (
+        response.status !== 'conflict' ||
+        Number(response.cloud_version) !== 2 ||
+        response.cloud_payload?.clients?.name !== 'Current client snapshot' ||
+        response.cloud_payload?.jobs?.title !== 'Current job snapshot' ||
+        response.sync_position?.source !== 'sync_changes'
+      ) {
+        throw new Error(`legacy invoice conflict was ${JSON.stringify(response)}`)
+      }
+    },
+  )
+
+  for (const [label, mutationId] of [
+    ['a truncated legacy invoice conflict fails closed', truncatedConflictMutationId],
+    ['a legacy invoice conflict with a mismatched cloud version fails closed', mismatchedConflictMutationId],
+  ]) {
+    await verify(label, async () => {
+      await expectSqlState(
+        () => db.query(`
+          select public.apply_entity_mutation(
+            '${mutationId}',
+            'invoice',
+            'update',
+            '${invoiceId}',
+            1,
+            '{}'
+          )
+        `),
+        '22023',
+      )
+    })
+  }
+
   // Once the authoritative feed entities are gone, migration-002 receipts do
   // not contain enough relationship history to reconstruct an invoice safely.
   await db.exec(`
+    begin;
+    select public.fieldcraft_lock_sync_owner('${ownerId}', null);
     delete from public.invoices where id = '${invoiceId}';
     delete from public.jobs where id = '${jobId}';
     delete from public.clients where id = '${clientId}';
+    commit;
   `)
+
+  await verify('the rebound legacy invoice conflict is byte-stable after canonical deletion', async () => {
+    const result = await db.query(`
+      select public.apply_entity_mutation(
+        '${legacyConflictMutationId}',
+        'invoice',
+        'update',
+        '${invoiceId}',
+        99,
+        '{"number":"different replay body"}'
+      ) as response
+    `)
+    if (JSON.stringify(result.rows[0].response) !== JSON.stringify(legacyConflictResponse)) {
+      throw new Error('rebound legacy conflict changed after canonical deletion')
+    }
+  })
 
   for (const [label, mutationId] of [
     ['a raw invoice receipt with a JSON-null number fails closed', nullNumberMutationId],
@@ -454,26 +623,215 @@ try {
     },
   )
 
-  await verify('ordinary writes are not tagged with a stale mutation GUC', async () => {
+  await verify('unserialized canonical writes fail closed', async () => {
+    await expectSqlState(
+      () => db.exec(`
+        insert into public.clients (id, user_id, name)
+        values ('${directClientId}', '${ownerId}', 'Unserialized client')
+      `),
+      '55000',
+    )
+  })
+
+  await verify('an explicitly serialized maintenance write is untagged and contiguous', async () => {
+    const before = await db.query(
+      `select last_change_seq from public.sync_owner_counters where user_id = $1`,
+      [ownerId],
+    )
     await db.exec(`
-      select set_config('fieldcraft.mutation_id', '', false);
+      begin;
+      select public.fieldcraft_lock_sync_owner('${ownerId}', null);
       insert into public.clients (id, user_id, name)
-      values ('${directClientId}', '${ownerId}', 'Direct client');
+      values ('${directClientId}', '${ownerId}', 'Serialized client');
+      commit;
     `)
     const result = await db.query(
       `
-        select mutation_id
+        select mutation_id, change_seq
         from public.sync_changes
         where user_id = $1
           and entity = 'client'
           and entity_id = $2
-        order by change_id desc
+        order by change_seq desc
         limit 1
       `,
       [ownerId, directClientId],
     )
-    if (result.rows[0]?.mutation_id !== null) {
-      throw new Error(`direct write was tagged ${result.rows[0]?.mutation_id}`)
+    if (
+      result.rows[0]?.mutation_id !== null ||
+      Number(result.rows[0]?.change_seq) !== Number(before.rows[0].last_change_seq) + 1
+    ) {
+      throw new Error(`maintenance event was ${JSON.stringify(result.rows[0] ?? null)}`)
+    }
+  })
+
+  await verify('an unlocked canonical delete fails closed while its owner still exists', async () => {
+    await expectSqlState(
+      () => db.exec(`delete from public.clients where id = '${directClientId}'`),
+      '55000',
+    )
+    const result = await db.query(
+      'select count(*)::int as count from public.clients where id = $1',
+      [directClientId],
+    )
+    if (result.rows[0].count !== 1) throw new Error('unlocked delete changed canonical state')
+  })
+
+  await verify('a serialized entity identity rewrite is rejected atomically', async () => {
+    await db.exec(`begin; select public.fieldcraft_lock_sync_owner('${ownerId}', null)`)
+    try {
+      await expectSqlState(
+        () => db.exec(`
+          update public.clients
+          set id = '${rewrittenClientId}'
+          where user_id = '${ownerId}' and id = '${directClientId}'
+        `),
+        '22023',
+      )
+    } finally {
+      await db.exec('rollback')
+    }
+    const result = await db.query(
+      'select id from public.clients where user_id = $1 and id in ($2, $3)',
+      [ownerId, directClientId, rewrittenClientId],
+    )
+    if (result.rows.length !== 1 || result.rows[0].id !== directClientId) {
+      throw new Error(`identity rewrite state was ${JSON.stringify(result.rows)}`)
+    }
+  })
+
+  await verify('a rolled-back writer transaction consumes no owner sequence', async () => {
+    const before = await db.query(
+      `select last_change_seq from public.sync_owner_counters where user_id = $1`,
+      [ownerId],
+    )
+    await db.exec(`begin; select public.fieldcraft_lock_sync_owner('${ownerId}', null)`)
+    await db.exec(`
+      update public.clients set name = 'Rolled back client'
+      where user_id = '${ownerId}' and id = '${directClientId}'
+    `)
+    await db.exec('rollback')
+    const after = await db.query(`
+      select counter.last_change_seq,
+             client.name,
+             max(change.change_seq) as max_change_seq
+      from public.sync_owner_counters as counter
+      join public.clients as client on client.user_id = counter.user_id
+      left join public.sync_changes as change on change.user_id = counter.user_id
+      where counter.user_id = $1 and client.id = $2
+      group by counter.last_change_seq, client.name
+    `, [ownerId, directClientId])
+    if (
+      Number(after.rows[0].last_change_seq) !== Number(before.rows[0].last_change_seq) ||
+      Number(after.rows[0].max_change_seq) !== Number(before.rows[0].last_change_seq) ||
+      after.rows[0].name !== 'Serialized client'
+    ) {
+      throw new Error(`rollback state was ${JSON.stringify(after.rows[0] ?? null)}`)
+    }
+  })
+
+  await verify('generic conflicts carry exact immutable present and absence authority', async () => {
+    const present = await db.query(`
+      select public.apply_entity_mutation(
+        '${conflictMutationId}', 'client', 'create', '${directClientId}', null,
+        '{"name":"Conflicting local create"}'
+      ) as response
+    `)
+    const presentResponse = present.rows[0].response
+    if (
+      presentResponse.status !== 'conflict' ||
+      presentResponse.sync_position?.source !== 'sync_changes' ||
+      Number(presentResponse.sync_position?.change_seq) <= 0 ||
+      Number(presentResponse.sync_position?.change_id) <= 0
+    ) {
+      throw new Error(`present conflict was ${JSON.stringify(presentResponse)}`)
+    }
+
+    const missingId = '76000000-0000-0000-0000-000000000099'
+    const absent = await db.query(`
+      select public.apply_entity_mutation(
+        '${absentConflictMutationId}', 'client', 'update', '${missingId}', 1,
+        '{"name":"Missing cloud client"}'
+      ) as response
+    `)
+    const absentResponse = absent.rows[0].response
+    if (
+      absentResponse.status !== 'conflict' ||
+      absentResponse.cloud_payload !== null ||
+      absentResponse.sync_position?.source !== 'sync_snapshot' ||
+      Number(absentResponse.sync_position?.change_id) !== 0
+    ) {
+      throw new Error(`absence conflict was ${JSON.stringify(absentResponse)}`)
+    }
+
+    await db.exec(`
+      begin;
+      select public.fieldcraft_lock_sync_owner('${ownerId}', null);
+      update public.clients set name = 'Later serialized client'
+      where user_id = '${ownerId}' and id = '${directClientId}';
+      commit;
+    `)
+    const replay = await db.query(`
+      select public.apply_entity_mutation(
+        '${absentConflictMutationId}', 'client', 'update', '${missingId}', 99,
+        '{"name":"Different replay body"}'
+      ) as response
+    `)
+    if (JSON.stringify(replay.rows[0].response) !== JSON.stringify(absentResponse)) {
+      throw new Error('stored absence authority changed after the owner head advanced')
+    }
+  })
+
+  await verify('bundle receipts use consecutive sequences and conflicts position every member', async () => {
+    const payload = `{
+      "client":{"id":"${bundleClientId}","name":"Bundle client","baseVersion":0},
+      "job":{"id":"${bundleJobId}","clientId":"${bundleClientId}","title":"Bundle job","tradeType":"General","status":"Invoiced","baseVersion":0},
+      "invoice":{"id":"${bundleInvoiceId}","clientId":"${bundleClientId}","jobId":"${bundleJobId}","number":"SEQ-1","lineItems":[{"description":"Labor","type":"labor","quantity":1000,"unitPriceCents":100}],"subtotalCents":100,"taxBasisPoints":0,"taxCents":0,"totalCents":100,"paymentTerms":"Due on receipt","status":"Draft","baseVersion":0}
+    }`
+    const applied = await db.query(
+      `select public.save_invoice_bundle($1, $2::jsonb) as response`,
+      [bundleMutationId, payload],
+    )
+    const appliedResponse = applied.rows[0].response
+    const sequences = ['client', 'job', 'invoice'].map(
+      (entity) => Number(appliedResponse.sync_positions?.[entity]?.change_seq),
+    )
+    if (
+      appliedResponse.status !== 'applied' ||
+      sequences.some((value) => !Number.isSafeInteger(value)) ||
+      sequences[1] !== sequences[0] + 1 ||
+      sequences[2] !== sequences[1] + 1
+    ) {
+      throw new Error(`bundle positions were ${JSON.stringify(appliedResponse.sync_positions ?? null)}`)
+    }
+
+    const conflict = await db.query(
+      `select public.save_invoice_bundle($1, $2::jsonb) as response`,
+      [bundleConflictMutationId, payload],
+    )
+    const conflictResponse = conflict.rows[0].response
+    if (
+      conflictResponse.status !== 'conflict' ||
+      ['client', 'job', 'invoice'].some((entity) =>
+        conflictResponse.sync_positions?.[entity]?.source !== 'sync_changes'
+      )
+    ) {
+      throw new Error(`bundle conflict was ${JSON.stringify(conflictResponse)}`)
+    }
+  })
+
+  await verify('deleting the auth owner cascades canonical and synchronization state', async () => {
+    await db.exec(`delete from auth.users where id = '${ownerId}'`)
+    const result = await db.query(`
+      select
+        (select count(*) from auth.users where id = $1)::int as users,
+        (select count(*) from public.clients where user_id = $1)::int as clients,
+        (select count(*) from public.sync_owner_counters where user_id = $1)::int as counters,
+        (select count(*) from public.sync_changes where user_id = $1)::int as changes,
+        (select count(*) from public.mutation_receipts where user_id = $1)::int as receipts
+    `, [ownerId])
+    if (Object.values(result.rows[0]).some((count) => count !== 0)) {
+      throw new Error(`owner cascade left state ${JSON.stringify(result.rows[0])}`)
     }
   })
 } finally {
@@ -484,4 +842,4 @@ if (failures.length > 0) {
   throw new Error(`FieldCraft PGlite verification failed:\n${failures.join('\n')}`)
 }
 
-process.stdout.write(`FieldCraft PGlite verification passed (${11} checks).\n`)
+process.stdout.write(`FieldCraft PGlite verification passed (${checks} checks).\n`)

@@ -18,6 +18,11 @@ import { SQLiteFieldCraftRepository } from '../src/data/sqliteRepository'
 const OWNER = 'owner-a'
 const MUTATION_ONE = '00000000-0000-4000-8000-000000000001'
 const MUTATION_TWO = '00000000-0000-4000-8000-000000000002'
+const cursor = (changeSeq: number) => JSON.stringify({
+  updatedAt: `2026-08-03T10:00:${String(changeSeq).padStart(2, '0')}.000Z`,
+  changeSeq,
+  changeId: changeSeq,
+})
 
 const client = (overrides: Record<string, unknown> = {}) => ({
   id: 'client-1',
@@ -28,6 +33,22 @@ const client = (overrides: Record<string, unknown> = {}) => ({
   syncState: 'pending',
   name: 'Jordan Lee',
   ...overrides,
+})
+
+const conflictCloudRow = (
+  payload: Record<string, unknown> | null,
+  options: { entity?: 'client' | 'job' | 'invoice'; entityId?: string; changeSeq?: number; changeId?: number } = {},
+) => ({
+  ownerId: OWNER,
+  entity: options.entity ?? 'client',
+  entityId: options.entityId ?? String(payload?.id ?? 'client-1'),
+  payload,
+  version: Number(payload?.version ?? 0),
+  deleted: payload === null,
+  updatedAt: String(payload?.updatedAt ?? '2026-08-03T10:00:00.000Z'),
+  changeSource: payload === null ? 'sync_snapshot' as const : 'sync_changes' as const,
+  changeSeq: options.changeSeq ?? 1,
+  changeId: payload === null ? 0 : options.changeId ?? 1,
 })
 
 const mutation = (overrides: Record<string, unknown> = {}) => ({
@@ -103,13 +124,13 @@ beforeEach(() => {
   __resetSQLiteMock()
 })
 
-it('applies schema version 3 with every required table', async () => {
+it('applies schema version 4 with every required table', async () => {
   const repository = new SQLiteFieldCraftRepository({ databaseName: 'migration.db' })
 
   await repository.initialize(OWNER)
 
   const raw = __getRawDatabase('migration.db')
-  expect(raw.userVersion).toBe(3)
+  expect(raw.userVersion).toBe(4)
   expect([...raw.tables].sort()).toEqual([
     'conflicts',
     'metadata',
@@ -117,6 +138,7 @@ it('applies schema version 3 with every required table', async () => {
     'records',
     'sync_bootstrap_records',
     'sync_cursors',
+    'sync_server_authority',
   ])
 })
 
@@ -162,6 +184,9 @@ it('atomically applies canonical rows before completing an acknowledged mutation
     payload: client({ version: 2, updatedAt: '2026-08-03T10:00:02.000Z', syncState: 'current' }),
     version: 2,
     updatedAt: '2026-08-03T10:00:02.000Z',
+    changeSource: 'sync_changes',
+    changeSeq: 2,
+    changeId: 2,
   }])
 
   await expect(repository.get('client', 'client-1')).resolves.toMatchObject({
@@ -187,6 +212,9 @@ it('rolls back canonical rows when durable acknowledgement fails', async () => {
     payload: client({ version: 2, updatedAt: '2026-08-03T10:00:02.000Z', syncState: 'current' }),
     version: 2,
     updatedAt: '2026-08-03T10:00:02.000Z',
+    changeSource: 'sync_changes',
+    changeSeq: 2,
+    changeId: 2,
   }])).rejects.toThrow(/acknowledgement/i)
 
   await expect(repository.get('client', 'client-1')).resolves.toMatchObject({
@@ -207,9 +235,12 @@ it('commits pulled rows and the global cursor in one owner-scoped transaction', 
     payload: client({ version: 2, updatedAt: '2026-08-03T10:00:02.000Z', syncState: 'current' }),
     version: 2,
     updatedAt: '2026-08-03T10:00:02.000Z',
-  }], 'cursor-two')
+    changeSource: 'sync_changes',
+    changeSeq: 2,
+    changeId: 2,
+  }], cursor(2))
 
-  await expect(repository.getSyncCursor(OWNER)).resolves.toBe('cursor-two')
+  await expect(repository.getSyncCursor(OWNER)).resolves.toBe(cursor(2))
   await expect(repository.get('client', 'client-1')).resolves.toMatchObject({ version: 2 })
 })
 
@@ -264,11 +295,11 @@ it('durably marks initial cloud hydration only on a complete pull and clears it 
   await repository.initialize(OWNER)
 
   await expect(repository.hasCompletedInitialPull(OWNER)).resolves.toBe(false)
-  await repository.commitPull(OWNER, [], 'cursor-page-one', false)
+  await repository.commitPull(OWNER, [], cursor(1), false)
   await expect(repository.hasCompletedInitialPull(OWNER)).resolves.toBe(false)
 
   const completed = repository.waitForInitialPull(OWNER)
-  await repository.commitPull(OWNER, [], 'cursor-page-two', true)
+  await repository.commitPull(OWNER, [], cursor(2), true)
   await expect(completed).resolves.toBeUndefined()
   await expect(repository.hasCompletedInitialPull(OWNER)).resolves.toBe(true)
 
@@ -287,7 +318,7 @@ it('emits sync wakeups only for committed local mutations, not pulls or retry bo
   expect(listener).toHaveBeenCalledTimes(1)
   expect(listener).toHaveBeenLastCalledWith(OWNER)
 
-  await repository.commitPull(OWNER, [], 'cursor-current', true)
+  await repository.commitPull(OWNER, [], cursor(1), true)
   await repository.recordMutationFailure(OWNER, MUTATION_ONE, 'transient')
   expect(listener).toHaveBeenCalledTimes(1)
 
@@ -321,6 +352,12 @@ it('atomically records a conflict and removes it from the sendable FIFO', async 
       name: 'Cloud',
     }),
     cloudVersion: 3,
+    cloudRows: [conflictCloudRow(client({
+      version: 3,
+      updatedAt: '2026-08-03T10:00:03.000Z',
+      syncState: 'current',
+      name: 'Cloud',
+    }))],
   }
 
   await repository.recordMutationConflict(OWNER, record)
@@ -329,6 +366,42 @@ it('atomically records a conflict and removes it from the sendable FIFO', async 
   await expect(repository.countConflicts(OWNER)).resolves.toBe(1)
   await expect(repository.getConflict(MUTATION_ONE)).resolves.toEqual({ ...record, ownerId: OWNER })
   expect(__getRawDatabase('record-conflict.db').outbox[0]).toMatchObject({ state: 'conflict' })
+})
+
+it('rejects a bundle conflict whose positioned authority duplicates one member', async () => {
+  const repository = new SQLiteFieldCraftRepository({ databaseName: 'duplicate-bundle-authority.db' })
+  await repository.initialize(OWNER)
+  const local = invoiceBundle()
+  await repository.transactLocalMutation(bundleMutation({ payload: local }))
+  const cloud = {
+    client: { ...local.client, version: 4, syncState: 'current' as const },
+    job: { ...local.job, version: 5, syncState: 'current' as const },
+    invoice: { ...local.invoice, version: 6, syncState: 'current' as const },
+  }
+  const clientAuthority = conflictCloudRow(cloud.client, { changeSeq: 10, changeId: 10 })
+
+  await expect(repository.recordMutationConflict(OWNER, {
+    mutationId: bundleMutation().id,
+    mutationKind: 'save_invoice_bundle',
+    entity: 'invoice',
+    entityId: local.invoice.id,
+    localPayload: local,
+    cloudPayload: cloud,
+    cloudVersion: cloud.invoice.version,
+    cloudRows: [
+      clientAuthority,
+      { ...clientAuthority, changeSeq: 11, changeId: 11 },
+      { ...clientAuthority, changeSeq: 12, changeId: 12 },
+    ],
+  })).rejects.toMatchObject({
+    name: 'DataCorruptionError',
+    message: 'Conflict authority response is invalid',
+  })
+
+  await expect(repository.countConflicts(OWNER)).resolves.toBe(0)
+  await expect(repository.outbox.list(OWNER)).resolves.toEqual([
+    expect.objectContaining({ id: bundleMutation().id }),
+  ])
 })
 
 it('keeps cloud by applying the preserved canonical value before resolving the original', async () => {
@@ -348,6 +421,12 @@ it('keeps cloud by applying the preserved canonical value before resolving the o
       name: 'Cloud wins',
     }),
     cloudVersion: 3,
+    cloudRows: [conflictCloudRow(client({
+      version: 3,
+      updatedAt: '2026-08-03T10:00:03.000Z',
+      syncState: 'current',
+      name: 'Cloud wins',
+    }))],
   })
 
   await repository.resolveConflictKeepCloud(MUTATION_ONE)
@@ -376,6 +455,12 @@ it('preserves the original outbox record while atomically creating a new current
       name: 'Cloud',
     }),
     cloudVersion: 3,
+    cloudRows: [conflictCloudRow(client({
+      version: 3,
+      updatedAt: '2026-08-03T10:00:03.000Z',
+      syncState: 'current',
+      name: 'Cloud',
+    }))],
   })
   const replacement = mutation({
     id: MUTATION_TWO,
@@ -419,6 +504,12 @@ it('rebases a create collision as an update against the canonical SQLite cloud r
       name: 'Cloud row',
     }),
     cloudVersion: 4,
+    cloudRows: [conflictCloudRow(client({
+      version: 4,
+      updatedAt: '2026-08-03T10:00:04.000Z',
+      syncState: 'current',
+      name: 'Cloud row',
+    }))],
   })
 
   await repository.resolveConflictWithMutation(MUTATION_ONE, mutation({
@@ -459,6 +550,7 @@ it('atomically replaces an update-versus-deletion conflict with an explicit crea
     localPayload: client({ version: 1, syncState: 'conflict', name: 'My edit' }),
     cloudPayload: null,
     cloudVersion: 0,
+    cloudRows: [conflictCloudRow(null)],
   })
 
   await repository.resolveConflictWithMutation(MUTATION_ONE, mutation({
@@ -504,6 +596,11 @@ it('atomically rebases a compound edit with a remotely deleted invoice for expli
     localPayload: original,
     cloudPayload: { client: cloudClient, job: cloudJob, invoice: null },
     cloudVersion: 0,
+    cloudRows: [
+      conflictCloudRow(cloudClient, { changeSeq: 1, changeId: 1 }),
+      conflictCloudRow(cloudJob, { entity: 'job', entityId: 'job-1', changeSeq: 2, changeId: 2 }),
+      conflictCloudRow(null, { entity: 'invoice', entityId: 'invoice-1', changeSeq: 2 }),
+    ],
   })
   const replacement = invoiceBundle()
   replacement.client = { ...replacement.client, version: 4, syncState: 'pending' }
@@ -617,7 +714,10 @@ it('rejects cloud rows whose validated payload version disagrees with the envelo
         updatedAt: '2026-08-03T10:00:00.000Z',
       },
     ]),
-  ).rejects.toThrow(/version/i)
+  ).rejects.toMatchObject({
+    name: 'DataCorruptionError',
+    message: 'Cloud authority response is invalid',
+  })
 
   await expect(repository.get('client', 'client-1')).resolves.toBeNull()
 })
@@ -634,6 +734,7 @@ it('rejects non-entity conflict payloads before persisting them', async () => {
       localPayload: 'not a client',
       cloudPayload: client({ syncState: 'conflict' }),
       cloudVersion: 2,
+      cloudRows: [conflictCloudRow(client({ syncState: 'conflict' }))],
     }),
   ).rejects.toThrow()
 

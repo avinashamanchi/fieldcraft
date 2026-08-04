@@ -38,6 +38,7 @@ type RawRecord = Record<string, unknown>
 
 type CursorTuple = {
   updatedAt: string
+  changeSeq: number
   changeId: number
 }
 
@@ -116,6 +117,7 @@ const decodeCursor = (cursor: string | null): CursorTuple | null => {
     const parsed = asRecord(JSON.parse(cursor))
     return {
       updatedAt: requireTimestamp(parsed, 'updatedAt'),
+      changeSeq: requireInteger(parsed, 'changeSeq'),
       changeId: requireInteger(parsed, 'changeId'),
     }
   } catch (error) {
@@ -126,8 +128,10 @@ const decodeCursor = (cursor: string | null): CursorTuple | null => {
 
 const encodeCursor = (cursor: CursorTuple): string => JSON.stringify(cursor)
 
-const compareCursor = (left: CursorTuple, right: CursorTuple): number =>
-  left.updatedAt.localeCompare(right.updatedAt) || left.changeId - right.changeId
+const cursorEquals = (left: CursorTuple, right: CursorTuple): boolean =>
+  left.updatedAt === right.updatedAt &&
+  left.changeSeq === right.changeSeq &&
+  left.changeId === right.changeId
 
 const mapProviderFailure = (reply: ProviderReply): void => {
   if (!reply.error && (reply.status === undefined || (reply.status >= 200 && reply.status < 300))) {
@@ -245,7 +249,7 @@ const normalizePayload = (
         : asRecord(raw.jobs)
       const client = relatedClient ?? rowsByEntity.get('client')?.get(clientId)
       const job = jobId ? relatedJob ?? rowsByEntity.get('job')?.get(jobId) : undefined
-      if (!client) throw new RemoteGatewayError('invalid-response')
+      if (!client || (jobId && !job)) throw new RemoteGatewayError('invalid-response')
       return {
         ...common,
         clientId,
@@ -303,23 +307,30 @@ const envelopeFromRaw = (
 const receiptPosition = (
   value: unknown,
   expectedUpdatedAt: string,
-): Pick<CloudRowEnvelope, 'changeId' | 'changeSource'> => {
+  allowedSources: readonly NonNullable<CloudRowEnvelope['changeSource']>[],
+): Pick<CloudRowEnvelope, 'changeSeq' | 'changeId' | 'changeSource'> => {
   const position = asRecord(value)
   if (requireTimestamp(position, 'updated_at') !== expectedUpdatedAt) {
     throw new RemoteGatewayError('invalid-response')
   }
   const changeSource = requireString(position, 'source')
-  if (changeSource !== 'sync_changes' && changeSource !== 'legacy_receipt') {
+  if (!allowedSources.includes(changeSource as NonNullable<CloudRowEnvelope['changeSource']>)) {
     throw new RemoteGatewayError('invalid-response')
   }
+  const changeSeq = requireInteger(position, 'change_seq')
   const changeId = requireInteger(position, 'change_id')
   if (
-    (changeSource === 'legacy_receipt' && changeId !== 0) ||
-    (changeSource === 'sync_changes' && changeId === 0)
+    (changeSource === 'legacy_receipt' && (changeSeq !== 0 || changeId !== 0)) ||
+    (changeSource === 'sync_snapshot' && changeId !== 0) ||
+    (changeSource === 'sync_changes' && (changeSeq === 0 || changeId === 0))
   ) {
     throw new RemoteGatewayError('invalid-response')
   }
-  return { changeId, changeSource }
+  return {
+    changeSeq,
+    changeId,
+    changeSource: changeSource as NonNullable<CloudRowEnvelope['changeSource']>,
+  }
 }
 
 const mutationRpcPayload = (mutation: MutationEnvelope): unknown => {
@@ -376,7 +387,11 @@ const bundleRows = (
   ]
   const positions = asRecord(rawBundle.sync_positions)
   for (const row of rows) {
-    Object.assign(row, receiptPosition(positions[row.entity], row.updatedAt))
+    Object.assign(row, receiptPosition(
+      positions[row.entity],
+      row.updatedAt,
+      ['sync_changes', 'legacy_receipt'],
+    ))
   }
   if (
     rows[0].entityId !== local.client.id ||
@@ -446,9 +461,30 @@ const parseGenericConflict = (
     throw new RemoteGatewayError('invalid-response')
   }
   const cloudVersion = requireInteger(data, 'cloud_version')
-  const cloudPayload = data.cloud_payload === null
-    ? null
-    : envelopeFromRaw(mutation.entity, asRecord(data.cloud_payload), ownerId).payload
+  const positionRaw = asRecord(data.sync_position)
+  const positionUpdatedAt = requireTimestamp(positionRaw, 'updated_at')
+  const position = receiptPosition(
+    positionRaw,
+    data.cloud_payload === null
+      ? positionUpdatedAt
+      : String(envelopeFromRaw(mutation.entity, asRecord(data.cloud_payload), ownerId).updatedAt),
+    data.cloud_payload === null
+      ? ['sync_changes', 'sync_snapshot']
+      : ['sync_changes', 'legacy_receipt'],
+  )
+  const cloudEnvelope = data.cloud_payload === null
+    ? {
+        ownerId,
+        entity: mutation.entity,
+        entityId: mutation.entityId,
+        payload: null,
+        version: cloudVersion,
+        updatedAt: positionUpdatedAt,
+        ...position,
+        deleted: true,
+      } satisfies CloudRowEnvelope
+    : Object.assign(envelopeFromRaw(mutation.entity, asRecord(data.cloud_payload), ownerId), position)
+  const cloudPayload = cloudEnvelope.payload
   if (
     cloudPayload !== null &&
     (cloudPayload as Record<string, unknown>).version !== cloudVersion
@@ -466,6 +502,7 @@ const parseGenericConflict = (
       localPayload: mutation.payload,
       cloudPayload,
       cloudVersion,
+      cloudRows: [cloudEnvelope],
     },
   }
 }
@@ -502,6 +539,32 @@ const parseBundleConflict = (
   ) {
     throw new RemoteGatewayError('invalid-response')
   }
+  const positions = asRecord(data.sync_positions)
+  const cloudRows = (['client', 'job', 'invoice'] as const).map((entity) => {
+    const row = rows[entity]
+    const localRow = local[entity]
+    const positionRaw = asRecord(positions[entity])
+    const positionUpdatedAt = requireTimestamp(positionRaw, 'updated_at')
+    const position = receiptPosition(
+      positionRaw,
+      row?.updatedAt ?? positionUpdatedAt,
+      row === null
+        ? ['sync_changes', 'sync_snapshot']
+        : ['sync_changes', 'legacy_receipt'],
+    )
+    return row
+      ? Object.assign(row, position)
+      : {
+          ownerId,
+          entity,
+          entityId: localRow.id,
+          payload: null,
+          version: 0,
+          updatedAt: positionUpdatedAt,
+          ...position,
+          deleted: true,
+        } satisfies CloudRowEnvelope
+  })
   return {
     type: 'conflict',
     conflict: {
@@ -517,6 +580,7 @@ const parseBundleConflict = (
         invoice: rows.invoice?.payload ?? null,
       },
       cloudVersion: rows.invoice?.version ?? 0,
+      cloudRows,
     },
   }
 }
@@ -557,12 +621,13 @@ const parsePushResponse = (
       mutation.entity !== 'invoice' ||
       mutation.kind === 'delete' ||
       data.cloud !== null ||
+      requireInteger(position, 'change_seq') !== 0 ||
       requireInteger(position, 'change_id') !== 0 ||
       requireString(position, 'source') !== 'legacy_receipt'
     ) {
       throw new RemoteGatewayError('invalid-response')
     }
-    receiptPosition(position, positionUpdatedAt)
+    receiptPosition(position, positionUpdatedAt, ['legacy_receipt'])
     return { type: 'applied', rows: [], requiresBootstrapRepair: true }
   }
   if (mutation.kind === 'delete') {
@@ -576,14 +641,18 @@ const parsePushResponse = (
         payload: null,
         version: requireInteger(data, 'deleted_version'),
         updatedAt,
-        ...receiptPosition(data.sync_position, updatedAt),
+        ...receiptPosition(data.sync_position, updatedAt, ['sync_changes', 'legacy_receipt']),
         deleted: true,
       }],
     }
   }
   const row = envelopeFromRaw(mutation.entity, asRecord(data.cloud), ownerId)
   if (row.entityId !== mutation.entityId) throw new RemoteGatewayError('invalid-response')
-  Object.assign(row, receiptPosition(data.sync_position, row.updatedAt))
+  Object.assign(row, receiptPosition(
+    data.sync_position,
+    row.updatedAt,
+    ['sync_changes', 'legacy_receipt'],
+  ))
   return { type: 'applied', rows: [row] }
 }
 
@@ -599,10 +668,8 @@ const parsePull = (
   const cursorRaw = asRecord(data.cursor)
   const cursor = {
     updatedAt: requireTimestamp(cursorRaw, 'updated_at'),
+    changeSeq: requireInteger(cursorRaw, 'change_seq'),
     changeId: requireInteger(cursorRaw, 'change_id'),
-  }
-  if (previous && compareCursor(cursor, previous) < 0) {
-    throw new RemoteGatewayError('invalid-response')
   }
   const parsed = data.changes.map((value) => {
     const change = asRecord(value)
@@ -611,9 +678,10 @@ const parsePull = (
     }
     const position = {
       updatedAt: requireTimestamp(change, 'updated_at'),
+      changeSeq: requireInteger(change, 'change_seq'),
       changeId: requireInteger(change, 'change_id'),
     }
-    if (previous && compareCursor(position, previous) <= 0) {
+    if (position.changeSeq === 0 || position.changeId === 0) {
       throw new RemoteGatewayError('invalid-response')
     }
     return {
@@ -625,27 +693,32 @@ const parsePull = (
       deleted: requireBoolean(change, 'deleted'),
     }
   })
+  if (parsed.length > PULL_LIMIT) throw new RemoteGatewayError('invalid-response')
+  const expectedFirstSequence = (previous?.changeSeq ?? 0) + 1
+  if (parsed.length > 0 && parsed[0].position.changeSeq !== expectedFirstSequence) {
+    throw new RemoteGatewayError('invalid-response')
+  }
   for (let index = 1; index < parsed.length; index += 1) {
-    if (compareCursor(parsed[index - 1].position, parsed[index].position) >= 0) {
+    if (parsed[index].position.changeSeq !== parsed[index - 1].position.changeSeq + 1) {
       throw new RemoteGatewayError('invalid-response')
     }
   }
-  if (parsed.length > 0 && compareCursor(parsed.at(-1)!.position, cursor) !== 0) {
-    throw new RemoteGatewayError('invalid-response')
-  }
-  const rowsByEntity = new Map<EntityName, Map<string, RawRecord>>()
-  for (const item of parsed) {
-    if (item.deleted) {
-      if (item.change.payload !== null) throw new RemoteGatewayError('invalid-response')
-      continue
+  if (parsed.length > 0) {
+    if (!cursorEquals(parsed.at(-1)!.position, cursor)) {
+      throw new RemoteGatewayError('invalid-response')
     }
-    const raw = asRecord(item.change.payload)
-    const entityRows = rowsByEntity.get(item.entity) ?? new Map<string, RawRecord>()
-    entityRows.set(item.entityId, raw)
-    rowsByEntity.set(item.entity, entityRows)
+  } else if (previous) {
+    if (!cursorEquals(previous, cursor)) throw new RemoteGatewayError('invalid-response')
+  } else if (
+    cursor.changeSeq !== 0 ||
+    cursor.changeId !== 0 ||
+    Date.parse(cursor.updatedAt) !== 0
+  ) {
+    throw new RemoteGatewayError('invalid-response')
   }
   const rows = parsed.map((item): CloudRowEnvelope => {
     if (item.deleted) {
+      if (item.change.payload !== null) throw new RemoteGatewayError('invalid-response')
       return {
         ownerId,
         entity: item.entity,
@@ -653,6 +726,7 @@ const parsePull = (
         payload: null,
         version: item.version,
         updatedAt: item.position.updatedAt,
+        changeSeq: item.position.changeSeq,
         changeId: item.position.changeId,
         changeSource: 'sync_changes',
         deleted: true,
@@ -662,7 +736,6 @@ const parsePull = (
       item.entity,
       asRecord(item.change.payload),
       ownerId,
-      rowsByEntity,
     )
     if (
       row.entityId !== item.entityId ||
@@ -671,11 +744,14 @@ const parsePull = (
     ) {
       throw new RemoteGatewayError('invalid-response')
     }
+    row.changeSeq = item.position.changeSeq
     row.changeId = item.position.changeId
     row.changeSource = 'sync_changes'
     return row
   })
-  return { rows, cursor: encodeCursor(cursor), hasMore: requireBoolean(data, 'has_more') }
+  const hasMore = requireBoolean(data, 'has_more')
+  if (hasMore && rows.length === 0) throw new RemoteGatewayError('invalid-response')
+  return { rows, cursor: encodeCursor(cursor), hasMore }
 }
 
 export const createSupabaseGateway = (
@@ -693,8 +769,7 @@ export const createSupabaseGateway = (
       if (!ownerId) throw new RemoteGatewayError('invalid-response')
       const cursor = decodeCursor(cursorValue)
       const reply = await callProvider(() => client.rpc('pull_sync_changes', {
-        p_cursor_updated_at: cursor?.updatedAt ?? null,
-        p_cursor_change_id: cursor?.changeId ?? null,
+        p_cursor_change_seq: cursor?.changeSeq ?? null,
         p_limit: PULL_LIMIT,
       }), signal, deadlineMs)
       return parsePull(reply.data, ownerId, cursor)

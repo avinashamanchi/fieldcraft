@@ -20,8 +20,9 @@ export type CloudRowEnvelope = {
   payload: unknown
   version: number
   updatedAt: string
+  changeSeq?: number
   changeId?: number
-  changeSource?: 'sync_changes' | 'legacy_receipt'
+  changeSource?: 'sync_changes' | 'sync_snapshot' | 'legacy_receipt'
   deleted?: boolean
 }
 
@@ -82,5 +83,16 @@ export class DataCorruptionError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options)
     this.name = 'DataCorruptionError'
+  }
+}
+
+export class OutboxCorruptionError extends DataCorruptionError {
+  constructor(
+    readonly mutationId: string,
+    message = 'A durable local mutation is corrupt',
+    options?: ErrorOptions,
+  ) {
+    super(message, options)
+    this.name = 'OutboxCorruptionError'
   }
 }

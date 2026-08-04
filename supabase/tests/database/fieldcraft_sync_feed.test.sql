@@ -2,7 +2,7 @@ begin;
 
 create extension if not exists pgtap with schema extensions;
 
-select plan(79);
+select plan(90);
 
 insert into auth.users (id, email)
 values
@@ -10,11 +10,18 @@ values
   ('80000000-0000-0000-0000-000000000008', 'sync-b@example.test');
 
 select has_table('public', 'sync_changes', 'the append-only synchronization feed exists');
+select has_table('public', 'sync_owner_counters', 'the owner-committed sequence head exists');
+select has_column('public', 'sync_changes', 'change_seq', 'feed events carry an owner sequence');
 select has_function(
   'public',
   'pull_sync_changes',
-  array['timestamp with time zone', 'bigint', 'integer'],
-  'the cursor RPC has one global updated_at/change_id boundary'
+  array['bigint', 'integer'],
+  'the cursor RPC accepts only the committed owner sequence and page limit'
+);
+select matches(
+  pg_get_functiondef('public.pull_sync_changes(bigint,integer)'::regprocedure),
+  'change\.change_seq <= v_head_change_seq',
+  'pull pages are capped to the owner head captured for that response'
 );
 
 select set_config(
@@ -76,6 +83,7 @@ select is(
       and change.mutation_id = '71000000-0000-0000-0000-000000000007'
       and change.entity = 'client'
       and change.entity_id = '72000000-0000-0000-0000-000000000007'
+      and change.change_seq = (receipt.response #>> '{sync_position,change_seq}')::bigint
       and change.change_id = (receipt.response #>> '{sync_position,change_id}')::bigint
       and change.updated_at = (receipt.response #>> '{sync_position,updated_at}')::timestamptz
   ),
@@ -132,6 +140,7 @@ select is(
     join public.sync_changes as change
       on change.entity = position.entity
      and change.change_id = (position.value ->> 'change_id')::bigint
+     and change.change_seq = (position.value ->> 'change_seq')::bigint
      and change.updated_at = (position.value ->> 'updated_at')::timestamptz
      and change.entity_id = case position.entity
        when 'client' then '74000000-0000-0000-0000-000000000007'::uuid
@@ -188,19 +197,21 @@ select is(
       and change.mutation_id = '73150000-0000-0000-0000-000000000007'
       and change.entity = 'invoice'
       and change.entity_id = '76100000-0000-0000-0000-000000000007'
+      and change.change_seq = (receipt.response #>> '{sync_position,change_seq}')::bigint
       and change.change_id = (receipt.response #>> '{sync_position,change_id}')::bigint
       and change.updated_at = (receipt.response #>> '{sync_position,updated_at}')::timestamptz
   ),
   1::bigint,
   'a new generic invoice receipt position identifies its exact mutation event'
 );
+do $$ begin
+  perform public.fieldcraft_lock_sync_owner(
+    '70000000-0000-0000-0000-000000000007', null
+  );
+end $$;
 delete from public.invoices
 where user_id = '70000000-0000-0000-0000-000000000007'
   and id = '76100000-0000-0000-0000-000000000007';
-delete from public.sync_changes
-where user_id = '70000000-0000-0000-0000-000000000007'
-  and entity = 'invoice'
-  and entity_id = '76100000-0000-0000-0000-000000000007';
 delete from public.mutation_receipts
 where user_id = '70000000-0000-0000-0000-000000000007'
   and mutation_id = '73150000-0000-0000-0000-000000000007';
@@ -271,6 +282,57 @@ join public.invoices as invoice
 where client.id = '74000000-0000-0000-0000-000000000007'
   and job.id = '75000000-0000-0000-0000-000000000007'
   and invoice.id = '76000000-0000-0000-0000-000000000007';
+
+insert into public.mutation_receipts (user_id, mutation_id, response)
+select
+  '70000000-0000-0000-0000-000000000007',
+  '73350000-0000-0000-0000-000000000007',
+  jsonb_build_object(
+    'status', 'conflict',
+    'entity', 'invoice',
+    'kind', 'update',
+    'entity_id', invoice.id,
+    'cloud', jsonb_set(
+      jsonb_set(to_jsonb(invoice), '{version}', '1'::jsonb),
+      '{updated_at}',
+      '"2026-08-03T09:59:00Z"'::jsonb
+    ),
+    'cloud_version', 1
+  )
+from public.invoices as invoice
+where invoice.id = '76000000-0000-0000-0000-000000000007';
+
+insert into public.mutation_receipts (user_id, mutation_id, response)
+values (
+  '70000000-0000-0000-0000-000000000007',
+  '73360000-0000-0000-0000-000000000007',
+  jsonb_build_object(
+    'status', 'conflict',
+    'entity', 'invoice',
+    'kind', 'update',
+    'entity_id', '76000000-0000-0000-0000-000000000007',
+    'cloud', jsonb_build_object(
+      'id', '76000000-0000-0000-0000-000000000007',
+      'user_id', '70000000-0000-0000-0000-000000000007'
+    ),
+    'cloud_version', 1
+  )
+);
+
+insert into public.mutation_receipts (user_id, mutation_id, response)
+select
+  '70000000-0000-0000-0000-000000000007',
+  '73370000-0000-0000-0000-000000000007',
+  jsonb_build_object(
+    'status', 'conflict',
+    'entity', 'invoice',
+    'kind', 'update',
+    'entity_id', invoice.id,
+    'cloud', jsonb_set(to_jsonb(invoice), '{version}', '1'::jsonb),
+    'cloud_version', 999
+  )
+from public.invoices as invoice
+where invoice.id = '76000000-0000-0000-0000-000000000007';
 
 insert into public.mutation_receipts (user_id, mutation_id, response)
 select
@@ -478,6 +540,66 @@ select is(
   (select response::text from legacy_generic_conflict),
   'an upgraded legacy generic conflict remains idempotent'
 );
+
+create temporary table legacy_invoice_conflict (response jsonb not null) on commit drop;
+insert into legacy_invoice_conflict (response)
+select public.apply_entity_mutation(
+  '73350000-0000-0000-0000-000000000007',
+  'invoice',
+  'update',
+  '76000000-0000-0000-0000-000000000007',
+  0,
+  '{}'
+);
+select is(
+  concat_ws(
+    '|',
+    (select response #>> '{cloud_version}' from legacy_invoice_conflict),
+    (select response #>> '{cloud_payload,clients,name}' from legacy_invoice_conflict),
+    (select response #>> '{cloud_payload,jobs,title}' from legacy_invoice_conflict),
+    (select response #>> '{sync_position,source}' from legacy_invoice_conflict)
+  ),
+  '1|Bundle client|Bundle job|sync_changes',
+  'a raw legacy invoice conflict rebinds to one complete current canonical snapshot'
+);
+select is(
+  public.apply_entity_mutation(
+    '73350000-0000-0000-0000-000000000007',
+    'invoice',
+    'update',
+    '76000000-0000-0000-0000-000000000007',
+    99,
+    '{"changed":true}'
+  )::text,
+  (select response::text from legacy_invoice_conflict),
+  'the rebound legacy invoice conflict remains byte-stable'
+);
+select throws_ok(
+  $$ select public.apply_entity_mutation(
+    '73360000-0000-0000-0000-000000000007',
+    'invoice',
+    'update',
+    '76000000-0000-0000-0000-000000000007',
+    1,
+    '{}'
+  ) $$,
+  '22023',
+  null,
+  'a truncated legacy invoice conflict fails closed before canonical rebinding'
+);
+select throws_ok(
+  $$ select public.apply_entity_mutation(
+    '73370000-0000-0000-0000-000000000007',
+    'invoice',
+    'update',
+    '76000000-0000-0000-0000-000000000007',
+    1,
+    '{}'
+  ) $$,
+  '22023',
+  null,
+  'a legacy invoice conflict with a mismatched cloud version fails closed'
+);
 select throws_ok(
   $$ select public.apply_entity_mutation(
     '73300000-0000-0000-0000-000000000007',
@@ -665,10 +787,38 @@ select is(
   'null'::jsonb,
   'the missing-row conflict replays a genuine null cloud payload'
 );
+select is(
+  concat_ws(
+    '|',
+    public.apply_entity_mutation(
+      '77100000-0000-0000-0000-000000000007',
+      'client',
+      'update',
+      '72000000-0000-0000-0000-000000000007',
+      1,
+      '{"changed":true}'
+    ) #>> '{sync_position,source}',
+    public.apply_entity_mutation(
+      '77100000-0000-0000-0000-000000000007',
+      'client',
+      'update',
+      '72000000-0000-0000-0000-000000000007',
+      1,
+      '{"changed":true}'
+    ) #>> '{sync_position,change_id}'
+  ),
+  'sync_snapshot|0',
+  'a missing-row conflict carries an exact immutable absence watermark'
+);
 reset role;
 
 -- Flood user B before user A pulls. A correct implementation filters by owner and cursor
 -- before applying its page limit.
+do $$ begin
+  perform public.fieldcraft_lock_sync_owner(
+    '80000000-0000-0000-0000-000000000008', null
+  );
+end $$;
 insert into public.clients (id, user_id, name)
 select (
   md5('sync-owner-b-' || value::text)
@@ -677,6 +827,11 @@ select (
   'Other owner ' || value
 from generate_series(1, 550) as value;
 
+do $$ begin
+  perform public.fieldcraft_lock_sync_owner(
+    '70000000-0000-0000-0000-000000000007', null
+  );
+end $$;
 insert into public.clients (id, user_id, name)
 select (
   md5('sync-owner-a-' || value::text)
@@ -685,7 +840,27 @@ select (
   'Paged owner ' || value
 from generate_series(1, 510) as value;
 
--- Prove that change_id, rather than entity UUID, disambiguates equal timestamps.
+select throws_ok(
+  $$ update public.clients
+     set id = gen_random_uuid()
+     where id = (md5('sync-owner-a-1'))::uuid $$,
+  '22023',
+  null,
+  'a serialized canonical entity identity cannot be rewritten'
+);
+
+update public.sync_owner_counters
+set writer_xid = null, writer_mutation_id = null
+where user_id = '80000000-0000-0000-0000-000000000008';
+select throws_ok(
+  $$ delete from public.clients
+     where id = (md5('sync-owner-b-1'))::uuid $$,
+  '55000',
+  null,
+  'an unlocked canonical delete fails closed while its owner exists'
+);
+
+-- Timestamp mutation cannot affect the committed owner sequence boundary.
 update public.sync_changes
 set updated_at = '2026-08-03T12:00:00.000Z'
 where user_id = '70000000-0000-0000-0000-000000000007';
@@ -694,8 +869,7 @@ set local role authenticated;
 create temporary table invoice_only_page (response jsonb not null) on commit drop;
 insert into invoice_only_page (response)
 select public.pull_sync_changes(
-  '2026-08-03T12:00:00.000Z'::timestamptz,
-  ((select response #>> '{sync_positions,invoice,change_id}' from bundle_response))::bigint - 1,
+  ((select response #>> '{sync_positions,invoice,change_seq}' from bundle_response))::bigint - 1,
   1
 );
 select is(
@@ -711,7 +885,7 @@ select is(
 
 create temporary table first_page (response jsonb not null) on commit drop;
 insert into first_page (response)
-select public.pull_sync_changes(null, null, 500);
+select public.pull_sync_changes(null, 500);
 select is(
   jsonb_array_length((select response -> 'changes' from first_page)),
   500,
@@ -732,8 +906,7 @@ select is(
 create temporary table second_page (response jsonb not null) on commit drop;
 insert into second_page (response)
 select public.pull_sync_changes(
-  ((select response #>> '{cursor,updated_at}' from first_page))::timestamptz,
-  ((select response #>> '{cursor,change_id}' from first_page))::bigint,
+  ((select response #>> '{cursor,change_seq}' from first_page))::bigint,
   500
 );
 select is(
@@ -742,15 +915,15 @@ select is(
            jsonb_array_length(second.response -> 'changes')
     from first_page as first cross join second_page as second
   ),
-  515,
-  'two cursor pages contain every owner change exactly once even when timestamps tie'
+  517,
+  'two sequence pages contain every owner change exactly once even when timestamps tie'
 );
 select is(
   (select count(*) from jsonb_array_elements((select response -> 'changes' from first_page)) as first_item
    join jsonb_array_elements((select response -> 'changes' from second_page)) as second_item
-     on first_item ->> 'change_id' = second_item ->> 'change_id'),
+     on first_item ->> 'change_seq' = second_item ->> 'change_seq'),
   0::bigint,
-  'equal-timestamp pages do not duplicate a change ID'
+  'equal-timestamp pages do not duplicate an owner sequence'
 );
 select is(
   (select response ->> 'has_more' from second_page),
@@ -812,6 +985,11 @@ select is(
 );
 
 reset role;
+do $$ begin
+  perform public.fieldcraft_lock_sync_owner(
+    '70000000-0000-0000-0000-000000000007', null
+  );
+end $$;
 delete from public.invoices
 where user_id = '70000000-0000-0000-0000-000000000007'
   and id = '76000000-0000-0000-0000-000000000007';
@@ -865,6 +1043,11 @@ select is(
 );
 
 reset role;
+do $$ begin
+  perform public.fieldcraft_lock_sync_owner(
+    '70000000-0000-0000-0000-000000000007', null
+  );
+end $$;
 delete from public.invoices where id = '76000000-0000-0000-0000-000000000007';
 delete from public.jobs where id = '75000000-0000-0000-0000-000000000007';
 set local role authenticated;
@@ -882,12 +1065,17 @@ select is((select response -> 'cloud_payload' -> 'job' from missing_job_bundle),
 select is((select response -> 'cloud_payload' -> 'invoice' from missing_job_bundle), 'null'::jsonb, 'a deleted dependent invoice remains null with its job');
 
 reset role;
+do $$ begin
+  perform public.fieldcraft_lock_sync_owner(
+    '70000000-0000-0000-0000-000000000007', null
+  );
+end $$;
 delete from public.clients where id = '74000000-0000-0000-0000-000000000007';
 set local role authenticated;
 select is(
   (
     select change #>> '{payload,clients,name}'
-    from jsonb_array_elements(public.pull_sync_changes(null, null, 500) -> 'changes') as entry(change)
+    from jsonb_array_elements(public.pull_sync_changes(null, 500) -> 'changes') as entry(change)
     where change ->> 'entity' = 'invoice'
       and change ->> 'entity_id' = '76000000-0000-0000-0000-000000000007'
       and (change ->> 'deleted')::boolean = false
@@ -1124,6 +1312,24 @@ select ok(
     where invoice.id = '76000000-0000-0000-0000-000000000007'
   ),
   'the explicit compound recreation preserves every ownership relationship'
+);
+
+reset role;
+delete from auth.users
+where id = '80000000-0000-0000-0000-000000000008';
+select is(
+  (
+    (select count(*) from auth.users
+      where id = '80000000-0000-0000-0000-000000000008')
+    + (select count(*) from public.clients
+      where user_id = '80000000-0000-0000-0000-000000000008')
+    + (select count(*) from public.sync_owner_counters
+      where user_id = '80000000-0000-0000-0000-000000000008')
+    + (select count(*) from public.sync_changes
+      where user_id = '80000000-0000-0000-0000-000000000008')
+  ),
+  0::bigint,
+  'auth owner deletion cascades canonical and synchronization state without a writer lock'
 );
 
 select * from finish();
