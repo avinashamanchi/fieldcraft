@@ -36,6 +36,7 @@ export interface SyncRepository {
     mutationId: string,
     rows: CloudRowEnvelope[],
     isCurrent?: () => boolean,
+    requiresBootstrapRepair?: boolean,
   ): Promise<void>
   recordMutationFailure(
     ownerId: string,
@@ -338,6 +339,7 @@ export class SyncCoordinator {
           item.id,
           result.rows,
           () => this.isRunCurrent(generation, ownerId, signal),
+          result.requiresBootstrapRepair === true,
         )
         this.retryAttempts.push = 0
       } catch {

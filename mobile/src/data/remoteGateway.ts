@@ -8,7 +8,11 @@ export type PullResult = {
 }
 
 export type PushResult =
-  | { type: 'applied'; rows: CloudRowEnvelope[] }
+  | {
+      type: 'applied'
+      rows: CloudRowEnvelope[]
+      requiresBootstrapRepair?: true
+    }
   | { type: 'conflict'; conflict: ConflictRecord }
 
 export type RemoteFailureReason =

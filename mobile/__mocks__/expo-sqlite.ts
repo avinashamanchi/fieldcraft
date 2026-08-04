@@ -10,6 +10,10 @@ type RecordRow = {
   updated_at: string
 }
 
+type BootstrapRecordRow = RecordRow & {
+  change_id?: number
+}
+
 type OutboxRow = {
   owner_id: string
   mutation_id: string
@@ -46,7 +50,7 @@ export type MockDatabaseState = {
   userVersion: number
   tables: Set<string>
   records: RecordRow[]
-  bootstrapRecords: RecordRow[]
+  bootstrapRecords: BootstrapRecordRow[]
   outbox: OutboxRow[]
   conflicts: Record<string, unknown>[]
   syncCursors: Record<string, unknown>[]
@@ -149,13 +153,17 @@ const expectedSql = {
       updated_at = excluded.updated_at`),
   bootstrapUpsert: normalizeSql(`/* bootstrap:stage:upsert */
     INSERT INTO sync_bootstrap_records
-      (owner_id, entity, entity_id, payload_json, version, deleted, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+      (owner_id, entity, entity_id, payload_json, version, deleted, updated_at, change_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(owner_id, entity, entity_id) DO UPDATE SET
       payload_json = excluded.payload_json,
       version = excluded.version,
       deleted = excluded.deleted,
-      updated_at = excluded.updated_at`),
+      updated_at = excluded.updated_at,
+      change_id = excluded.change_id
+    WHERE excluded.updated_at > sync_bootstrap_records.updated_at
+       OR (excluded.updated_at = sync_bootstrap_records.updated_at
+           AND excluded.change_id >= sync_bootstrap_records.change_id)`),
   outboxInsert: normalizeSql(`/* outbox:insert */
     INSERT INTO outbox
       (owner_id, mutation_id, sequence, entity, entity_id, kind, base_version,
@@ -209,6 +217,14 @@ const expectedSql = {
     INSERT INTO metadata (owner_id, key, value)
     VALUES (?, ?, ?)
     ON CONFLICT(owner_id, key) DO UPDATE SET value = excluded.value`),
+  reconciliationSchedule: normalizeSql(`/* metadata:reconciliation:schedule */
+    INSERT INTO metadata (owner_id, key, value)
+    VALUES (?, ?, ?)
+    ON CONFLICT(owner_id, key) DO UPDATE SET value = excluded.value`),
+  initialPullDelete: normalizeSql(`/* metadata:initial-pull:delete */
+    DELETE FROM metadata WHERE owner_id = ? AND key = ?`),
+  bootstrapCursorReset: normalizeSql(`/* sync-cursors:bootstrap-reset */
+    DELETE FROM sync_cursors WHERE owner_id = ? AND entity = ?`),
   reconciliationTerminalDelete: '/* metadata:reconciliation-terminal:delete */ delete from metadata where owner_id = ? and key = ?',
   reconciliationDelete: '/* metadata:reconciliation:delete */ delete from metadata where owner_id = ? and key = ?',
   recordsGet: normalizeSql(`/* records:get */
@@ -252,12 +268,28 @@ const expectedSql = {
     SELECT value FROM metadata WHERE owner_id = ? AND key = ?`),
   reconciliationTerminalGet: normalizeSql(`/* metadata:reconciliation-terminal:get */
     SELECT value FROM metadata WHERE owner_id = ? AND key = ?`),
+  acknowledgementSequence: normalizeSql(`/* outbox:acknowledgement-sequence */
+    SELECT sequence FROM outbox
+    WHERE owner_id = ? AND mutation_id = ? AND state <> 'complete'`),
+  legacyFeedRepairMutation: normalizeSql(`/* outbox:legacy-feed-repair:get */
+    SELECT entity, kind FROM outbox
+    WHERE owner_id = ? AND mutation_id = ? AND state <> 'complete'`),
+  laterLocalIntents: normalizeSql(`/* outbox:later-local-intents */
+    SELECT sequence, mutation_id, entity, entity_id, kind, base_version,
+           payload_json, created_at, attempts, payload_hash
+    FROM outbox
+    WHERE owner_id = ? AND sequence > ? AND state <> 'complete'
+    ORDER BY sequence ASC`),
+  localIntentSnapshots: normalizeSql(`/* records:local-intent-snapshots */
+    SELECT entity, entity_id, payload_json, version, deleted, updated_at
+    FROM records
+    WHERE owner_id = ?`),
   bootstrapOutboxList: normalizeSql(`/* bootstrap:outbox:list */
     SELECT entity, entity_id, kind, payload_json
     FROM outbox
     WHERE owner_id = ? AND state <> 'complete'`),
   bootstrapRecordsList: normalizeSql(`/* bootstrap:records:list */
-    SELECT entity, entity_id, payload_json, version, deleted, updated_at
+    SELECT entity, entity_id, payload_json, version, deleted, updated_at, change_id
     FROM sync_bootstrap_records
     WHERE owner_id = ?`),
   bootstrapCurrentList: normalizeSql(`/* bootstrap:current:list */
@@ -337,6 +369,29 @@ class MockSQLiteDatabase {
         (row) => row.entity !== '__all__' || !legacyOwners.has(String(row.owner_id)),
       )
     }
+    if (source.includes('ALTER TABLE sync_bootstrap_records ADD COLUMN change_id')) {
+      const ambiguousOwners = new Set(this.state.bootstrapRecords.map((row) => row.owner_id))
+      for (const ownerId of ambiguousOwners) {
+        const marker = {
+          owner_id: ownerId,
+          key: 'sync-feed-v2-reconciliation-required',
+          value: 'true',
+        }
+        const markerIndex = this.state.metadata.findIndex(
+          (row) => row.owner_id === ownerId && row.key === marker.key,
+        )
+        if (markerIndex === -1) this.state.metadata.push(marker)
+        else this.state.metadata[markerIndex] = marker
+      }
+      this.state.metadata = this.state.metadata.filter((row) => (
+        !ambiguousOwners.has(String(row.owner_id)) ||
+        !['initial-cloud-pull-complete', 'sync-feed-v2-terminal-reconciliation-pending'].includes(String(row.key))
+      ))
+      this.state.syncCursors = this.state.syncCursors.filter((row) => (
+        row.entity !== '__all__' || !ambiguousOwners.has(String(row.owner_id))
+      ))
+      this.state.bootstrapRecords = []
+    }
     for (const match of source.matchAll(/CREATE TABLE IF NOT EXISTS\s+(\w+)/gi)) {
       this.state.tables.add(match[1])
     }
@@ -347,6 +402,7 @@ class MockSQLiteDatabase {
     assertSql(
       sql.includes('create table if not exists records') ||
         sql.includes('create table if not exists sync_bootstrap_records') ||
+        sql.includes('alter table sync_bootstrap_records add column change_id') ||
         /^pragma\s+user_version/.test(sql),
       'unsupported execAsync statement',
     )
@@ -375,7 +431,7 @@ class MockSQLiteDatabase {
     const sql = normalizeSql(source)
     if (source.includes('bootstrap:stage:upsert')) {
       requireExactSql(sql, expectedSql.bootstrapUpsert, 'bootstrap stage upsert')
-      const row: RecordRow = {
+      const row: BootstrapRecordRow = {
         owner_id: String(params[0]),
         entity: String(params[1]),
         entity_id: String(params[2]),
@@ -383,14 +439,23 @@ class MockSQLiteDatabase {
         version: Number(params[4]),
         deleted: Number(params[5]),
         updated_at: String(params[6]),
+        change_id: Number(params[7]),
       }
       const index = this.state.bootstrapRecords.findIndex(
         (candidate) => candidate.owner_id === row.owner_id &&
           candidate.entity === row.entity && candidate.entity_id === row.entity_id,
       )
-      if (index === -1) this.state.bootstrapRecords.push(row)
-      else this.state.bootstrapRecords[index] = row
-      return { changes: 1, lastInsertRowId: 0 }
+      if (index === -1) {
+        this.state.bootstrapRecords.push(row)
+        return { changes: 1, lastInsertRowId: 0 }
+      }
+      const existing = this.state.bootstrapRecords[index]
+      const isAtLeastAsNew = row.updated_at > existing.updated_at || (
+        row.updated_at === existing.updated_at &&
+        row.change_id! >= (existing.change_id ?? -1)
+      )
+      if (isAtLeastAsNew) this.state.bootstrapRecords[index] = row
+      return { changes: isAtLeastAsNew ? 1 : 0, lastInsertRowId: 0 }
     }
     if (source.includes('records:upsert')) {
       requireExactSql(sql, expectedSql.recordsUpsert, 'records upsert')
@@ -530,6 +595,34 @@ class MockSQLiteDatabase {
       if (index === -1) this.state.metadata.push(row)
       else this.state.metadata[index] = row
       return { changes: 1, lastInsertRowId: 0 }
+    }
+    if (source.includes('metadata:reconciliation:schedule')) {
+      requireExactSql(sql, expectedSql.reconciliationSchedule, 'bootstrap reconciliation schedule')
+      const row = { owner_id: params[0], key: params[1], value: params[2] }
+      const index = this.state.metadata.findIndex(
+        (item) => item.owner_id === params[0] && item.key === params[1],
+      )
+      if (index === -1) this.state.metadata.push(row)
+      else this.state.metadata[index] = row
+      return { changes: 1, lastInsertRowId: 0 }
+    }
+    if (source.includes('metadata:initial-pull:delete')) {
+      requireExactSql(sql, expectedSql.initialPullDelete, 'initial pull metadata delete')
+      requireOwnerPredicate(sql)
+      const before = this.state.metadata.length
+      this.state.metadata = this.state.metadata.filter(
+        (row) => !(row.owner_id === params[0] && row.key === params[1]),
+      )
+      return { changes: before - this.state.metadata.length, lastInsertRowId: 0 }
+    }
+    if (source.includes('sync-cursors:bootstrap-reset')) {
+      requireExactSql(sql, expectedSql.bootstrapCursorReset, 'bootstrap cursor reset')
+      requireOwnerPredicate(sql)
+      const before = this.state.syncCursors.length
+      this.state.syncCursors = this.state.syncCursors.filter(
+        (row) => !(row.owner_id === params[0] && row.entity === params[1]),
+      )
+      return { changes: before - this.state.syncCursors.length, lastInsertRowId: 0 }
     }
     if (source.includes('outbox:acknowledge')) {
       requireExactSql(sql, expectedSql.outboxAcknowledge, 'outbox acknowledgement')
@@ -761,6 +854,26 @@ class MockSQLiteDatabase {
         .reduce((largest, row) => Math.max(largest, row.sequence), 0)
       return { next_sequence: sequence + 1 } as T
     }
+    if (source.includes('outbox:acknowledgement-sequence')) {
+      requireExactSql(sql, expectedSql.acknowledgementSequence, 'acknowledgement sequence lookup')
+      requireOwnerPredicate(sql)
+      const row = this.state.outbox.find((candidate) => (
+        candidate.owner_id === params[0] &&
+        candidate.mutation_id === params[1] &&
+        candidate.state !== 'complete'
+      ))
+      return (row ? { sequence: row.sequence } : null) as T | null
+    }
+    if (source.includes('outbox:legacy-feed-repair:get')) {
+      requireExactSql(sql, expectedSql.legacyFeedRepairMutation, 'legacy feed repair mutation lookup')
+      requireOwnerPredicate(sql)
+      const row = this.state.outbox.find((candidate) => (
+        candidate.owner_id === params[0] &&
+        candidate.mutation_id === params[1] &&
+        candidate.state !== 'complete'
+      ))
+      return (row ? { entity: row.entity, kind: row.kind } : null) as T | null
+    }
     if (source.includes('sync-cursors:get')) {
       requireExactSql(sql, expectedSql.cursorGet, 'sync cursor get')
       requireOwnerPredicate(sql)
@@ -822,6 +935,36 @@ class MockSQLiteDatabase {
           kind: row.kind,
           payload_json: row.payload_json,
         })) as T[]
+    }
+    if (source.includes('outbox:later-local-intents')) {
+      requireExactSql(sql, expectedSql.laterLocalIntents, 'later local intent lookup')
+      requireOwnerPredicate(sql)
+      return this.state.outbox
+        .filter((row) => (
+          row.owner_id === params[0] &&
+          row.sequence > Number(params[1]) &&
+          row.state !== 'complete'
+        ))
+        .sort((left, right) => left.sequence - right.sequence)
+        .map((row) => ({
+          sequence: row.sequence,
+          mutation_id: row.mutation_id,
+          entity: row.entity,
+          entity_id: row.entity_id,
+          kind: row.kind,
+          base_version: row.base_version,
+          payload_json: row.payload_json,
+          created_at: row.created_at,
+          attempts: row.attempts,
+          payload_hash: row.payload_hash,
+        })) as T[]
+    }
+    if (source.includes('records:local-intent-snapshots')) {
+      requireExactSql(sql, expectedSql.localIntentSnapshots, 'local intent record snapshots')
+      requireOwnerPredicate(sql)
+      return this.state.records
+        .filter((row) => row.owner_id === params[0])
+        .map((row) => ({ ...row })) as T[]
     }
     if (source.includes('bootstrap:records:list')) {
       requireExactSql(sql, expectedSql.bootstrapRecordsList, 'bootstrap records list')

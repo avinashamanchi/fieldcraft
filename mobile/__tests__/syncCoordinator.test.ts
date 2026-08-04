@@ -100,6 +100,7 @@ class FakeRepository implements SyncRepository {
   failFailureRecording = false
   acknowledgementGate: Promise<void> | null = null
   acknowledgementStarted: (() => void) | null = null
+  readonly acknowledgementRepairFlags: boolean[] = []
 
   readonly outbox: {
     list(ownerId: string): Promise<MutationEnvelope[]>
@@ -125,7 +126,9 @@ class FakeRepository implements SyncRepository {
     mutationId: string,
     rows: CloudRowEnvelope[],
     isCurrent: () => boolean = () => true,
+    requiresBootstrapRepair = false,
   ): Promise<void> {
+    this.acknowledgementRepairFlags.push(requiresBootstrapRepair)
     this.events.push(`ack-start:${mutationId}:${rows.map((row) => row.entityId).join(',')}`)
     this.acknowledgementStarted?.()
     await (this.acknowledgementGate ?? Promise.resolve())
@@ -281,6 +284,23 @@ it('uploads mutations sequentially in durable dependency and FIFO order', async 
     'ack-start:00000000-0000-4000-8000-000000000011:job-child',
     'ack-commit:00000000-0000-4000-8000-000000000011',
   ])
+})
+
+it('passes an explicit staged-feed repair requirement into the atomic acknowledgement', async () => {
+  const { coordinator, repository, gateway } = makeCoordinator()
+  const item = mutation('00000000-0000-4000-8000-000000000012', 'legacy-repair')
+  repository.pending.set(OWNER_A, [item])
+  gateway.pushResult = { type: 'applied', rows: [], requiresBootstrapRepair: true }
+
+  await coordinator.setLifecycle({
+    ownerId: OWNER_A,
+    authenticated: true,
+    foreground: true,
+    online: true,
+  })
+
+  expect(repository.acknowledgementRepairFlags).toEqual([true])
+  expect(repository.pending.get(OWNER_A)).toEqual([])
 })
 
 it('coalesces duplicate triggers and permits only one pull in flight', async () => {
@@ -524,6 +544,9 @@ it('calls the reviewed RPC boundary with the stable mutation UUID', async () => 
       kind: 'create',
       entity_id: 'client-rpc',
       cloud: rawClient('client-rpc'),
+      sync_position: {
+        updated_at: '2026-08-03T10:00:02.000Z', change_id: 80, source: 'sync_changes',
+      },
     },
   }
   const gateway = createSupabaseGateway(client)
@@ -531,7 +554,9 @@ it('calls the reviewed RPC boundary with the stable mutation UUID', async () => 
 
   await expect(gateway.pushMutation(OWNER_A, item, new AbortController().signal)).resolves.toEqual({
     type: 'applied',
-    rows: [canonicalRow(OWNER_A, 'client-rpc')],
+    rows: [{
+      ...canonicalRow(OWNER_A, 'client-rpc'), changeId: 80, changeSource: 'sync_changes',
+    }],
   })
   expect(client.rpcCalls).toEqual([
     {
@@ -561,6 +586,9 @@ it('sends the reviewed object payload for deletes and returns a canonical tombst
       entity_id: 'client-delete',
       deleted_version: 4,
       deleted_at: '2026-08-03T10:00:00.000Z',
+      sync_position: {
+        updated_at: '2026-08-03T10:00:00.000Z', change_id: 84, source: 'sync_changes',
+      },
     },
   }
   const gateway = createSupabaseGateway(client)
@@ -580,6 +608,8 @@ it('sends the reviewed object payload for deletes and returns a canonical tombst
       payload: null,
       version: 4,
       updatedAt: item.createdAt,
+      changeId: 84,
+      changeSource: 'sync_changes',
       deleted: true,
     }],
   })

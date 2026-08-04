@@ -5,6 +5,7 @@ create table public.sync_changes (
     'profile', 'client', 'job', 'invoice', 'expense', 'service', 'inventory'
   )),
   entity_id uuid not null,
+  mutation_id uuid,
   version bigint not null check (version >= 0),
   payload jsonb,
   deleted boolean not null default false,
@@ -17,6 +18,9 @@ create table public.sync_changes (
 
 create index sync_changes_user_cursor_idx
   on public.sync_changes (user_id, updated_at, change_id);
+create index sync_changes_user_mutation_idx
+  on public.sync_changes (user_id, mutation_id, entity, entity_id)
+  where mutation_id is not null;
 
 alter table public.sync_changes enable row level security;
 revoke all on public.sync_changes from public, anon, authenticated;
@@ -32,6 +36,8 @@ declare
   v_row jsonb := case when tg_op = 'DELETE' then to_jsonb(old) else to_jsonb(new) end;
   v_entity text;
   v_user_id uuid;
+  v_mutation_id uuid := nullif(current_setting('fieldcraft.mutation_id', true), '')::uuid;
+  v_payload jsonb;
   v_updated_at timestamptz := case
     when tg_op = 'DELETE' then clock_timestamp()
     else new.updated_at
@@ -54,15 +60,38 @@ begin
     when tg_table_name = 'profiles' then (v_row ->> 'id')::uuid
     else (v_row ->> 'user_id')::uuid
   end;
+  v_payload := case when tg_op = 'DELETE' then null else v_row end;
+  if tg_op <> 'DELETE' and v_entity = 'invoice' then
+    v_payload := v_row || jsonb_build_object(
+      'clients', (
+        select jsonb_build_object('name', client.name)
+        from public.clients as client
+        where client.user_id = v_user_id
+          and client.id = (v_row ->> 'client_id')::uuid
+      ),
+      'jobs', (
+        select jsonb_build_object(
+          'title', job.title,
+          'address', job.address,
+          'description', job.description,
+          'trade_type', job.trade_type
+        )
+        from public.jobs as job
+        where job.user_id = v_user_id
+          and job.id = nullif(v_row ->> 'job_id', '')::uuid
+      )
+    );
+  end if;
 
   insert into public.sync_changes (
-    user_id, entity, entity_id, version, payload, deleted, updated_at
+    user_id, entity, entity_id, mutation_id, version, payload, deleted, updated_at
   ) values (
     v_user_id,
     v_entity,
     (v_row ->> 'id')::uuid,
+    v_mutation_id,
     (v_row ->> 'version')::bigint,
-    case when tg_op = 'DELETE' then null else v_row end,
+    v_payload,
     tg_op = 'DELETE',
     v_updated_at
   );
@@ -106,8 +135,22 @@ union all
 select user_id, 'job', id, version, to_jsonb(job), updated_at
 from public.jobs as job
 union all
-select user_id, 'invoice', id, version, to_jsonb(invoice), updated_at
+select invoice.user_id, 'invoice', invoice.id, invoice.version,
+  to_jsonb(invoice) || jsonb_build_object(
+    'clients', jsonb_build_object('name', client.name),
+    'jobs', case when job.id is null then null else jsonb_build_object(
+      'title', job.title,
+      'address', job.address,
+      'description', job.description,
+      'trade_type', job.trade_type
+    ) end
+  ),
+  invoice.updated_at
 from public.invoices as invoice
+join public.clients as client
+  on client.user_id = invoice.user_id and client.id = invoice.client_id
+left join public.jobs as job
+  on job.user_id = invoice.user_id and job.id = invoice.job_id
 union all
 select user_id, 'expense', id, version, to_jsonb(expense), updated_at
 from public.expenses as expense
@@ -172,34 +215,40 @@ begin
         when page.deleted then null
         when page.entity = 'invoice' then
           page.payload || jsonb_build_object(
-            'clients', (
-              select jsonb_build_object('name', client_change.payload ->> 'name')
-              from public.sync_changes as client_change
-              where client_change.user_id = page.user_id
-                and client_change.entity = 'client'
-                and client_change.entity_id = (page.payload ->> 'client_id')::uuid
-                and not client_change.deleted
-                and (client_change.updated_at, client_change.change_id)
-                    <= (page.updated_at, page.change_id)
-              order by client_change.updated_at desc, client_change.change_id desc
-              limit 1
-            ),
-            'jobs', (
-              select jsonb_build_object(
-                'title', job_change.payload ->> 'title',
-                'address', job_change.payload ->> 'address',
-                'description', job_change.payload ->> 'description',
-                'trade_type', job_change.payload ->> 'trade_type'
+            'clients', coalesce(
+              page.payload -> 'clients',
+              (
+                select jsonb_build_object('name', client_change.payload ->> 'name')
+                from public.sync_changes as client_change
+                where client_change.user_id = page.user_id
+                  and client_change.entity = 'client'
+                  and client_change.entity_id = (page.payload ->> 'client_id')::uuid
+                  and not client_change.deleted
+                  and (client_change.updated_at, client_change.change_id)
+                      <= (page.updated_at, page.change_id)
+                order by client_change.updated_at desc, client_change.change_id desc
+                limit 1
               )
-              from public.sync_changes as job_change
-              where job_change.user_id = page.user_id
-                and job_change.entity = 'job'
-                and job_change.entity_id = nullif(page.payload ->> 'job_id', '')::uuid
-                and not job_change.deleted
-                and (job_change.updated_at, job_change.change_id)
-                    <= (page.updated_at, page.change_id)
-              order by job_change.updated_at desc, job_change.change_id desc
-              limit 1
+            ),
+            'jobs', coalesce(
+              page.payload -> 'jobs',
+              (
+                select jsonb_build_object(
+                  'title', job_change.payload ->> 'title',
+                  'address', job_change.payload ->> 'address',
+                  'description', job_change.payload ->> 'description',
+                  'trade_type', job_change.payload ->> 'trade_type'
+                )
+                from public.sync_changes as job_change
+                where job_change.user_id = page.user_id
+                  and job_change.entity = 'job'
+                  and job_change.entity_id = nullif(page.payload ->> 'job_id', '')::uuid
+                  and not job_change.deleted
+                  and (job_change.updated_at, job_change.change_id)
+                      <= (page.updated_at, page.change_id)
+                order by job_change.updated_at desc, job_change.change_id desc
+                limit 1
+              )
             )
           )
         else page.payload
@@ -333,8 +382,32 @@ begin
     raise exception 'receipt cloud payload must be an object' using errcode = '22023';
   end if;
   if p_entity <> 'invoice' then return p_payload; end if;
+  if p_payload ->> 'user_id' <> p_user_id::text then
+    raise exception 'receipt invoice owner does not match the replay owner' using errcode = '22023';
+  end if;
 
+  perform public.require_jsonb_uuid(to_jsonb(p_payload ->> 'id'), 'receipt invoice id');
   perform public.require_jsonb_uuid(to_jsonb(p_payload ->> 'client_id'), 'receipt invoice client_id');
+  if p_payload ? 'clients' or p_payload ? 'jobs' then
+    if not (p_payload ? 'clients' and p_payload ? 'jobs')
+      or jsonb_typeof(p_payload -> 'clients') <> 'object'
+      or nullif(btrim(p_payload #>> '{clients,name}'), '') is null
+      or (
+        nullif(p_payload ->> 'job_id', '') is not null
+        and (
+          jsonb_typeof(p_payload -> 'jobs') <> 'object'
+          or nullif(btrim(p_payload #>> '{jobs,title}'), '') is null
+          or nullif(btrim(p_payload #>> '{jobs,trade_type}'), '') is null
+        )
+      )
+    then
+      raise exception 'receipt invoice relationship snapshot is malformed'
+        using errcode = '22023';
+    end if;
+  else
+    raise exception 'receipt invoice relationship snapshot is unavailable'
+      using errcode = '22023';
+  end if;
   if jsonb_typeof(p_payload -> 'clients') <> 'object'
     or nullif(btrim(p_payload #>> '{clients,name}'), '') is null
   then
@@ -356,6 +429,71 @@ $$;
 revoke execute on function public.fieldcraft_enrich_receipt_entity(uuid, text, jsonb)
   from public, anon, authenticated;
 
+create or replace function public.fieldcraft_receipt_sync_position(
+  p_user_id uuid,
+  p_mutation_id uuid,
+  p_entity text,
+  p_entity_id uuid,
+  p_payload jsonb,
+  p_deleted boolean,
+  p_fallback_updated_at timestamptz
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+declare
+  v_updated_at timestamptz;
+  v_change_id bigint;
+begin
+  select change.updated_at, change.change_id
+  into v_updated_at, v_change_id
+  from public.sync_changes as change
+  where change.user_id = p_user_id
+    and change.entity = p_entity
+    and change.entity_id = p_entity_id
+    and change.deleted = p_deleted
+    and (
+      change.mutation_id = p_mutation_id
+      or (
+        not p_deleted
+        and not change.deleted
+        and p_payload is not null
+        and case when p_entity = 'invoice'
+          then change.payload - 'clients' - 'jobs'
+          else change.payload
+        end = case when p_entity = 'invoice'
+          then p_payload - 'clients' - 'jobs'
+          else p_payload
+        end
+      )
+    )
+  order by (change.mutation_id = p_mutation_id) desc, change.change_id
+  limit 1;
+
+  if v_change_id is not null then
+    return jsonb_build_object(
+      'updated_at', v_updated_at,
+      'change_id', v_change_id,
+      'source', 'sync_changes'
+    );
+  end if;
+  if p_fallback_updated_at is null then
+    raise exception 'receipt has no comparable immutable event position' using errcode = '22023';
+  end if;
+  return jsonb_build_object(
+    'updated_at', p_fallback_updated_at,
+    'change_id', 0,
+    'source', 'legacy_receipt'
+  );
+end;
+$$;
+
+revoke execute on function public.fieldcraft_receipt_sync_position(
+  uuid, uuid, text, uuid, jsonb, boolean, timestamptz
+) from public, anon, authenticated;
+
 create or replace function public.fieldcraft_bind_generic_receipt(
   p_user_id uuid,
   p_response jsonb,
@@ -373,6 +511,18 @@ as $$
 declare
   v_status text;
   v_cloud jsonb;
+  v_raw_cloud jsonb;
+  v_mutation_cloud jsonb;
+  v_position_cloud jsonb;
+  v_position jsonb;
+  v_position_updated_at timestamptz;
+  v_fallback_updated_at timestamptz;
+  v_stored_repair boolean := false;
+  v_repair_from_feed boolean := false;
+  v_subtotal_cents bigint;
+  v_tax_basis_points integer;
+  v_tax_cents bigint;
+  v_total_cents bigint;
 begin
   if p_response is null or jsonb_typeof(p_response) <> 'object' then
     raise exception 'stored mutation receipt is invalid' using errcode = '22023';
@@ -389,8 +539,18 @@ begin
     raise exception 'mutation receipt identity does not match the replay contract'
       using errcode = '22023';
   end if;
+  if p_response ? 'repair_from_feed' then
+    if p_response -> 'repair_from_feed' <> 'true'::jsonb then
+      raise exception 'stored legacy feed repair marker is invalid' using errcode = '22023';
+    end if;
+    v_stored_repair := true;
+  end if;
 
-  p_response := p_response || jsonb_build_object(
+  v_raw_cloud := case
+    when v_stored_repair then p_response -> 'legacy_cloud'
+    else p_response -> 'cloud'
+  end;
+  p_response := (p_response - 'repair_from_feed' - 'legacy_cloud') || jsonb_build_object(
     'mutation_id', p_mutation_id,
     'entity', p_entity,
     'kind', p_kind,
@@ -423,17 +583,189 @@ begin
       )
     );
   else
-    v_cloud := p_response -> 'cloud';
+    v_cloud := v_raw_cloud;
     if v_cloud is null or jsonb_typeof(v_cloud) <> 'object'
       or v_cloud ->> 'id' <> p_entity_id::text
     then
       raise exception 'applied receipt cloud identity does not match the entity'
         using errcode = '22023';
     end if;
-    p_response := p_response || jsonb_build_object(
-      'cloud', public.fieldcraft_enrich_receipt_entity(p_user_id, p_entity, v_cloud)
+    v_repair_from_feed := v_stored_repair;
+    if not v_repair_from_feed then
+      if p_entity = 'invoice'
+        and not (v_raw_cloud ? 'clients')
+        and not (v_raw_cloud ? 'jobs')
+        and v_raw_cloud ->> 'user_id' = p_user_id::text
+      then
+        select change.payload
+        into v_mutation_cloud
+        from public.sync_changes as change
+        where change.user_id = p_user_id
+          and change.mutation_id = p_mutation_id
+          and change.entity = p_entity
+          and change.entity_id = p_entity_id
+          and not change.deleted
+        order by change.change_id
+        limit 1;
+
+        if found then
+          if jsonb_typeof(v_mutation_cloud) <> 'object'
+            or v_mutation_cloud - 'clients' - 'jobs' <> v_raw_cloud
+          then
+            raise exception 'mutation feed payload does not match the stored invoice receipt'
+              using errcode = '22023';
+          end if;
+          v_cloud := public.fieldcraft_enrich_receipt_entity(
+            p_user_id, p_entity, v_mutation_cloud
+          );
+        else
+          v_repair_from_feed := true;
+        end if;
+      else
+        v_cloud := public.fieldcraft_enrich_receipt_entity(p_user_id, p_entity, v_cloud);
+      end if;
+    end if;
+    if v_repair_from_feed then
+      if p_entity <> 'invoice'
+        or not (v_raw_cloud ?& array[
+          'id', 'user_id', 'client_id', 'job_id', 'number', 'line_items',
+          'subtotal_cents', 'tax_basis_points', 'tax_cents', 'total_cents',
+          'payment_terms', 'status', 'version', 'created_at', 'updated_at'
+        ])
+        or v_raw_cloud ->> 'id' <> p_entity_id::text
+        or v_raw_cloud ->> 'user_id' <> p_user_id::text
+        or not public.is_valid_invoice_line_items(v_raw_cloud -> 'line_items')
+        or nullif(v_raw_cloud ->> 'client_id', '') is null
+        or nullif(v_raw_cloud ->> 'number', '') is null
+        or char_length(v_raw_cloud ->> 'number') > 64
+        or v_raw_cloud ->> 'payment_terms' is null
+        or v_raw_cloud ->> 'payment_terms' not in ('Due on receipt', 'Net 14', 'Net 30')
+        or v_raw_cloud ->> 'status' is null
+        or v_raw_cloud ->> 'status' not in (
+          'Draft', 'Sent', 'Viewed', 'Partially Paid', 'Paid'
+        )
+        or (
+          v_raw_cloud ->> 'notes' is not null
+          and char_length(v_raw_cloud ->> 'notes') > 4000
+        )
+        or nullif(v_raw_cloud ->> 'version', '') is null
+        or nullif(v_raw_cloud ->> 'created_at', '') is null
+        or nullif(v_raw_cloud ->> 'updated_at', '') is null
+        or v_raw_cloud ? 'clients'
+        or v_raw_cloud ? 'jobs'
+      then
+        raise exception 'stored legacy invoice receipt cannot be repaired safely'
+          using errcode = '22023';
+      end if;
+      perform public.require_jsonb_uuid(to_jsonb(v_raw_cloud ->> 'id'), 'receipt invoice id');
+      perform public.require_jsonb_uuid(
+        to_jsonb(v_raw_cloud ->> 'client_id'), 'receipt invoice client_id'
+      );
+      if nullif(v_raw_cloud ->> 'job_id', '') is not null then
+        perform public.require_jsonb_uuid(
+          to_jsonb(v_raw_cloud ->> 'job_id'), 'receipt invoice job_id'
+        );
+      end if;
+      if (v_raw_cloud ->> 'version')::bigint < 1 then
+        raise exception 'stored legacy invoice receipt version is invalid' using errcode = '22023';
+      end if;
+      v_subtotal_cents := public.invoice_subtotal_cents(v_raw_cloud -> 'line_items');
+      v_tax_basis_points := public.require_jsonb_integer(
+        v_raw_cloud -> 'tax_basis_points', 'receipt invoice tax_basis_points', 0, 10000
+      )::integer;
+      v_tax_cents := round(
+        (v_subtotal_cents::numeric * v_tax_basis_points::numeric) / 10000
+      )::bigint;
+      v_total_cents := v_subtotal_cents + v_tax_cents;
+      if public.require_jsonb_integer(
+          v_raw_cloud -> 'subtotal_cents', 'receipt invoice subtotal_cents', 0, 100000000
+        ) <> v_subtotal_cents
+        or public.require_jsonb_integer(
+          v_raw_cloud -> 'tax_cents', 'receipt invoice tax_cents', 0, 100000000
+        ) <> v_tax_cents
+        or public.require_jsonb_integer(
+          v_raw_cloud -> 'total_cents', 'receipt invoice total_cents', 0, 100000000
+        ) <> v_total_cents
+        or v_total_cents > 100000000
+      then
+        raise exception 'stored legacy invoice receipt totals are invalid' using errcode = '22023';
+      end if;
+      perform (v_raw_cloud ->> 'created_at')::timestamptz;
+      perform (v_raw_cloud ->> 'updated_at')::timestamptz;
+      p_response := p_response || jsonb_build_object(
+        'cloud', null,
+        'legacy_cloud', v_raw_cloud,
+        'repair_from_feed', true
+      );
+      v_position_cloud := v_raw_cloud;
+    else
+      p_response := p_response || jsonb_build_object('cloud', v_cloud);
+      v_position_cloud := v_cloud;
+    end if;
+  end if;
+  v_cloud := case
+    when v_status = 'conflict' then p_response -> 'cloud_payload'
+    when p_kind = 'delete' then null
+    else p_response -> 'cloud'
+  end;
+  if not v_repair_from_feed then v_position_cloud := v_cloud; end if;
+  v_fallback_updated_at := case
+    when p_kind = 'delete' or v_position_cloud is null or v_position_cloud = 'null'::jsonb
+      then p_receipt_created_at
+    else nullif(v_position_cloud ->> 'updated_at', '')::timestamptz
+  end;
+  if v_stored_repair then
+    v_position := p_response -> 'sync_position';
+    if v_position is null
+      or jsonb_typeof(v_position) <> 'object'
+      or not (v_position ?& array['source', 'change_id', 'updated_at'])
+      or jsonb_typeof(v_position -> 'source') <> 'string'
+      or v_position ->> 'source' is distinct from 'legacy_receipt'
+      or jsonb_typeof(v_position -> 'updated_at') <> 'string'
+    then
+      raise exception 'stored legacy feed repair position is invalid' using errcode = '22023';
+    end if;
+    perform public.require_jsonb_integer(
+      v_position -> 'change_id', 'stored legacy feed repair change_id', 0, 0
+    );
+    begin
+      v_position_updated_at := (v_position ->> 'updated_at')::timestamptz;
+    exception when invalid_datetime_format or datetime_field_overflow then
+      raise exception 'stored legacy feed repair position is invalid' using errcode = '22023';
+    end;
+    if v_position_updated_at is distinct from v_fallback_updated_at then
+      raise exception 'stored legacy feed repair position is invalid' using errcode = '22023';
+    end if;
+  elsif v_repair_from_feed then
+    v_position := jsonb_build_object(
+      'updated_at', v_fallback_updated_at,
+      'change_id', 0,
+      'source', 'legacy_receipt'
+    );
+  else
+    v_position := public.fieldcraft_receipt_sync_position(
+      p_user_id,
+      p_mutation_id,
+      p_entity,
+      p_entity_id,
+      v_position_cloud,
+      p_kind = 'delete' or (
+        v_status = 'conflict'
+        and (v_position_cloud is null or v_position_cloud = 'null'::jsonb)
+      ),
+      v_fallback_updated_at
     );
   end if;
+  if v_status = 'applied' and p_kind = 'delete' then
+    p_response := p_response || jsonb_build_object(
+      'deleted_at', v_position -> 'updated_at'
+    );
+  end if;
+  if p_response ? 'sync_position' and p_response -> 'sync_position' <> v_position then
+    raise exception 'stored mutation receipt position does not match immutable history'
+      using errcode = '22023';
+  end if;
+  p_response := p_response || jsonb_build_object('sync_position', v_position);
   return p_response;
 end;
 $$;
@@ -443,7 +775,9 @@ revoke execute on function public.fieldcraft_bind_generic_receipt(
 ) from public, anon, authenticated;
 
 create or replace function public.fieldcraft_bind_bundle_receipt(
+  p_user_id uuid,
   p_response jsonb,
+  p_receipt_created_at timestamptz,
   p_mutation_id uuid,
   p_payload jsonb
 )
@@ -461,6 +795,7 @@ declare
   v_client jsonb;
   v_job jsonb;
   v_invoice jsonb;
+  v_positions jsonb;
 begin
   if public.require_jsonb_uuid(p_payload #> '{job,clientId}', 'job.clientId') <> v_client_id
     or public.require_jsonb_uuid(p_payload #> '{invoice,clientId}', 'invoice.clientId') <> v_client_id
@@ -526,6 +861,28 @@ begin
       using errcode = '22023';
   end if;
 
+  if v_status = 'applied' then
+    v_positions := jsonb_build_object(
+      'client', public.fieldcraft_receipt_sync_position(
+        p_user_id, p_mutation_id, 'client', v_client_id, v_client, false,
+        coalesce(nullif(v_client ->> 'updated_at', '')::timestamptz, p_receipt_created_at)
+      ),
+      'job', public.fieldcraft_receipt_sync_position(
+        p_user_id, p_mutation_id, 'job', v_job_id, v_job, false,
+        coalesce(nullif(v_job ->> 'updated_at', '')::timestamptz, p_receipt_created_at)
+      ),
+      'invoice', public.fieldcraft_receipt_sync_position(
+        p_user_id, p_mutation_id, 'invoice', v_invoice_id, v_invoice, false,
+        coalesce(nullif(v_invoice ->> 'updated_at', '')::timestamptz, p_receipt_created_at)
+      )
+    );
+    if p_response ? 'sync_positions' and p_response -> 'sync_positions' <> v_positions then
+      raise exception 'stored bundle receipt positions do not match immutable history'
+        using errcode = '22023';
+    end if;
+    p_response := p_response || jsonb_build_object('sync_positions', v_positions);
+  end if;
+
   return p_response || jsonb_build_object(
     'mutation_id', p_mutation_id,
     'entity', 'invoice_bundle',
@@ -543,10 +900,13 @@ begin
 end;
 $$;
 
-revoke execute on function public.fieldcraft_bind_bundle_receipt(jsonb, uuid, jsonb)
+revoke execute on function public.fieldcraft_bind_bundle_receipt(
+  uuid, jsonb, timestamptz, uuid, jsonb
+)
   from public, anon, authenticated;
 
 create or replace function public.fieldcraft_bundle_conflict_receipt(
+  p_user_id uuid,
   p_mutation_id uuid,
   p_payload jsonb,
   p_client jsonb,
@@ -559,6 +919,7 @@ security definer
 set search_path = pg_catalog, public
 as $$
   select public.fieldcraft_bind_bundle_receipt(
+    p_user_id,
     jsonb_build_object(
       'status', 'conflict',
       'local_payload', p_payload,
@@ -568,13 +929,14 @@ as $$
         'invoice', p_invoice
       )
     ),
+    clock_timestamp(),
     p_mutation_id,
     p_payload
   )
 $$;
 
 revoke execute on function public.fieldcraft_bundle_conflict_receipt(
-  uuid, jsonb, jsonb, jsonb, jsonb
+  uuid, uuid, jsonb, jsonb, jsonb, jsonb
 ) from public, anon, authenticated;
 
 alter function public.apply_entity_mutation(uuid, text, text, uuid, bigint, jsonb)
@@ -601,6 +963,8 @@ declare
   v_response jsonb;
   v_cloud jsonb;
   v_receipt_created_at timestamptz;
+  v_previous_mutation_id text;
+  v_handled_conflict boolean := false;
 begin
   if v_user_id is null then
     raise exception 'authentication required' using errcode = '42501';
@@ -661,68 +1025,71 @@ begin
     return v_response;
   end if;
 
+  v_previous_mutation_id := current_setting('fieldcraft.mutation_id', true);
+  perform set_config('fieldcraft.mutation_id', p_mutation_id::text, true);
   begin
-    v_response := public.apply_entity_mutation_v1_internal(
-      p_mutation_id, p_entity, p_kind, p_entity_id, p_base_version, p_payload
+    begin
+      v_response := public.apply_entity_mutation_v1_internal(
+        p_mutation_id, p_entity, p_kind, p_entity_id, p_base_version, p_payload
+      );
+    exception
+      when unique_violation then
+        v_cloud := public.fieldcraft_owned_entity(v_user_id, p_entity, p_entity_id);
+        if p_kind <> 'create' or v_cloud is null then raise; end if;
+        v_response := jsonb_build_object(
+          'status', 'conflict',
+          'mutation_id', p_mutation_id,
+          'entity', p_entity,
+          'kind', p_kind,
+          'entity_id', p_entity_id,
+          'base_version', p_base_version,
+          'local_version', p_base_version,
+          'local_payload', p_payload,
+          'cloud_version', (v_cloud ->> 'version')::bigint,
+          'cloud_payload', v_cloud
+        );
+        insert into public.mutation_receipts (user_id, mutation_id, response)
+        values (v_user_id, p_mutation_id, v_response);
+        v_handled_conflict := true;
+      when sqlstate '22023' then
+        v_cloud := public.fieldcraft_owned_entity(v_user_id, p_entity, p_entity_id);
+        if p_kind not in ('update', 'delete') or v_cloud is not null then raise; end if;
+        v_response := jsonb_build_object(
+          'status', 'conflict',
+          'mutation_id', p_mutation_id,
+          'entity', p_entity,
+          'kind', p_kind,
+          'entity_id', p_entity_id,
+          'base_version', p_base_version,
+          'local_version', p_base_version,
+          'local_payload', case when p_kind = 'delete' then null else p_payload end,
+          'cloud_version', 0,
+          'cloud_payload', null
+        );
+        insert into public.mutation_receipts (user_id, mutation_id, response)
+        values (v_user_id, p_mutation_id, v_response);
+        v_handled_conflict := true;
+    end;
+  exception when others then
+    perform set_config(
+      'fieldcraft.mutation_id', coalesce(v_previous_mutation_id, ''), true
     );
-  exception
-    when unique_violation then
-      v_cloud := public.fieldcraft_owned_entity(v_user_id, p_entity, p_entity_id);
-      if p_kind <> 'create' or v_cloud is null then raise; end if;
-      v_response := jsonb_build_object(
-        'status', 'conflict',
-        'mutation_id', p_mutation_id,
-        'entity', p_entity,
-        'kind', p_kind,
-        'entity_id', p_entity_id,
-        'base_version', p_base_version,
-        'local_version', p_base_version,
-        'local_payload', p_payload,
-        'cloud_version', (v_cloud ->> 'version')::bigint,
-        'cloud_payload', v_cloud
-      );
-      insert into public.mutation_receipts (user_id, mutation_id, response)
-      values (v_user_id, p_mutation_id, v_response);
-      return v_response;
-    when sqlstate '22023' then
-      v_cloud := public.fieldcraft_owned_entity(v_user_id, p_entity, p_entity_id);
-      if p_kind not in ('update', 'delete') or v_cloud is not null then raise; end if;
-      v_response := jsonb_build_object(
-        'status', 'conflict',
-        'mutation_id', p_mutation_id,
-        'entity', p_entity,
-        'kind', p_kind,
-        'entity_id', p_entity_id,
-        'base_version', p_base_version,
-        'local_version', p_base_version,
-        'local_payload', case when p_kind = 'delete' then null else p_payload end,
-        'cloud_version', 0,
-        'cloud_payload', null
-      );
-      insert into public.mutation_receipts (user_id, mutation_id, response)
-      values (v_user_id, p_mutation_id, v_response);
-      return v_response;
+    raise;
   end;
-  v_response := v_response || jsonb_build_object(
-    'mutation_id', p_mutation_id,
-    'entity', p_entity,
-    'kind', p_kind,
-    'entity_id', p_entity_id
+  perform set_config('fieldcraft.mutation_id', coalesce(v_previous_mutation_id, ''), true);
+  if v_handled_conflict then return v_response; end if;
+  select receipt.created_at into v_receipt_created_at
+  from public.mutation_receipts as receipt
+  where receipt.user_id = v_user_id and receipt.mutation_id = p_mutation_id;
+  v_response := public.fieldcraft_bind_generic_receipt(
+    v_user_id,
+    v_response,
+    v_receipt_created_at,
+    p_mutation_id,
+    p_entity,
+    p_kind,
+    p_entity_id
   );
-  if v_response ->> 'status' = 'conflict' then
-    v_cloud := public.fieldcraft_owned_entity(v_user_id, p_entity, p_entity_id);
-    v_response := v_response || jsonb_build_object(
-      'cloud', v_cloud,
-      'cloud_payload', v_cloud,
-      'cloud_version', (v_cloud ->> 'version')::bigint
-    );
-  elsif p_kind <> 'delete' then
-    v_cloud := public.fieldcraft_owned_entity(v_user_id, p_entity, p_entity_id);
-    v_response := v_response || jsonb_build_object('cloud', v_cloud);
-  end if;
-  if p_kind = 'delete' and v_response ->> 'status' = 'applied' then
-    v_response := v_response || jsonb_build_object('deleted_at', clock_timestamp());
-  end if;
   update public.mutation_receipts as receipt
   set response = v_response
   where receipt.user_id = v_user_id and receipt.mutation_id = p_mutation_id;
@@ -762,6 +1129,9 @@ declare
   v_client jsonb;
   v_job jsonb;
   v_invoice jsonb;
+  v_receipt_created_at timestamptz;
+  v_previous_mutation_id text;
+  v_handled_conflict boolean := false;
 begin
   if v_user_id is null then
     raise exception 'authentication required' using errcode = '42501';
@@ -789,11 +1159,13 @@ begin
   end if;
 
   perform pg_advisory_xact_lock(hashtextextended(v_user_id::text || ':' || p_mutation_id::text, 0));
-  select receipt.response into v_response
+  select receipt.response, receipt.created_at into v_response, v_receipt_created_at
   from public.mutation_receipts as receipt
   where receipt.user_id = v_user_id and receipt.mutation_id = p_mutation_id;
   if found then
-    v_response := public.fieldcraft_bind_bundle_receipt(v_response, p_mutation_id, p_payload);
+    v_response := public.fieldcraft_bind_bundle_receipt(
+      v_user_id, v_response, v_receipt_created_at, p_mutation_id, p_payload
+    );
     update public.mutation_receipts as receipt
     set response = v_response
     where receipt.user_id = v_user_id
@@ -836,37 +1208,53 @@ begin
     or (v_invoice is not null and (v_invoice_base = 0 or (v_invoice ->> 'version')::bigint <> v_invoice_base))
   then
     v_response := public.fieldcraft_bundle_conflict_receipt(
-      p_mutation_id, p_payload, v_client, v_job, v_invoice
+      v_user_id, p_mutation_id, p_payload, v_client, v_job, v_invoice
     );
     insert into public.mutation_receipts (user_id, mutation_id, response)
     values (v_user_id, p_mutation_id, v_response);
     return v_response;
   end if;
 
+  v_previous_mutation_id := current_setting('fieldcraft.mutation_id', true);
+  perform set_config('fieldcraft.mutation_id', p_mutation_id::text, true);
   begin
-    v_response := public.save_invoice_bundle_v1_internal(p_mutation_id, p_payload);
-    v_response := public.fieldcraft_bind_bundle_receipt(v_response, p_mutation_id, p_payload);
-    update public.mutation_receipts as receipt
-    set response = v_response
-    where receipt.user_id = v_user_id and receipt.mutation_id = p_mutation_id;
-    return v_response;
-  exception when unique_violation or serialization_failure then
-    select to_jsonb(client) into v_client
-    from public.clients as client
-    where client.user_id = v_user_id and client.id = v_client_id;
-    select to_jsonb(job) into v_job
-    from public.jobs as job
-    where job.user_id = v_user_id and job.id = v_job_id;
-    select to_jsonb(invoice) into v_invoice
-    from public.invoices as invoice
-    where invoice.user_id = v_user_id and invoice.id = v_invoice_id;
-    v_response := public.fieldcraft_bundle_conflict_receipt(
-      p_mutation_id, p_payload, v_client, v_job, v_invoice
+    begin
+      v_response := public.save_invoice_bundle_v1_internal(p_mutation_id, p_payload);
+    exception when unique_violation or serialization_failure then
+      select to_jsonb(client) into v_client
+      from public.clients as client
+      where client.user_id = v_user_id and client.id = v_client_id;
+      select to_jsonb(job) into v_job
+      from public.jobs as job
+      where job.user_id = v_user_id and job.id = v_job_id;
+      select to_jsonb(invoice) into v_invoice
+      from public.invoices as invoice
+      where invoice.user_id = v_user_id and invoice.id = v_invoice_id;
+      v_response := public.fieldcraft_bundle_conflict_receipt(
+        v_user_id, p_mutation_id, p_payload, v_client, v_job, v_invoice
+      );
+      insert into public.mutation_receipts (user_id, mutation_id, response)
+      values (v_user_id, p_mutation_id, v_response);
+      v_handled_conflict := true;
+    end;
+  exception when others then
+    perform set_config(
+      'fieldcraft.mutation_id', coalesce(v_previous_mutation_id, ''), true
     );
-    insert into public.mutation_receipts (user_id, mutation_id, response)
-    values (v_user_id, p_mutation_id, v_response);
-    return v_response;
+    raise;
   end;
+  perform set_config('fieldcraft.mutation_id', coalesce(v_previous_mutation_id, ''), true);
+  if v_handled_conflict then return v_response; end if;
+  select receipt.created_at into v_receipt_created_at
+  from public.mutation_receipts as receipt
+  where receipt.user_id = v_user_id and receipt.mutation_id = p_mutation_id;
+  v_response := public.fieldcraft_bind_bundle_receipt(
+    v_user_id, v_response, v_receipt_created_at, p_mutation_id, p_payload
+  );
+  update public.mutation_receipts as receipt
+  set response = v_response
+  where receipt.user_id = v_user_id and receipt.mutation_id = p_mutation_id;
+  return v_response;
 end;
 $$;
 

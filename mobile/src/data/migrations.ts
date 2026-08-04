@@ -1,6 +1,6 @@
 import type { SQLiteDatabase } from 'expo-sqlite'
 
-export const DATABASE_SCHEMA_VERSION = 2
+export const DATABASE_SCHEMA_VERSION = 3
 
 type UserVersionRow = { user_version: number }
 
@@ -104,6 +104,28 @@ const VERSION_TWO_SCHEMA = `
   PRAGMA user_version = 2;
 `
 
+const VERSION_THREE_SCHEMA = `
+  ALTER TABLE sync_bootstrap_records ADD COLUMN change_id INTEGER;
+
+  INSERT INTO metadata (owner_id, key, value)
+  SELECT DISTINCT staged.owner_id, 'sync-feed-v2-reconciliation-required', 'true'
+  FROM sync_bootstrap_records AS staged
+  WHERE true
+  ON CONFLICT(owner_id, key) DO UPDATE SET value = excluded.value;
+
+  DELETE FROM metadata
+  WHERE key IN ('initial-cloud-pull-complete', 'sync-feed-v2-terminal-reconciliation-pending')
+    AND owner_id IN (SELECT DISTINCT owner_id FROM sync_bootstrap_records);
+
+  DELETE FROM sync_cursors
+  WHERE entity = '__all__'
+    AND owner_id IN (SELECT DISTINCT owner_id FROM sync_bootstrap_records);
+
+  DELETE FROM sync_bootstrap_records;
+
+  PRAGMA user_version = 3;
+`
+
 export const applyMigrations = async (database: SQLiteDatabase): Promise<void> => {
   await database.withExclusiveTransactionAsync(async (transaction) => {
     const row = await transaction.getFirstAsync<UserVersionRow>('PRAGMA user_version')
@@ -122,6 +144,11 @@ export const applyMigrations = async (database: SQLiteDatabase): Promise<void> =
 
     if (currentVersion === 1) {
       await transaction.execAsync(VERSION_TWO_SCHEMA)
+      currentVersion = 2
+    }
+
+    if (currentVersion === 2) {
+      await transaction.execAsync(VERSION_THREE_SCHEMA)
     }
   })
 }

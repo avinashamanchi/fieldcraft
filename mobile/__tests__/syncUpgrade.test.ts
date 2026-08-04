@@ -19,6 +19,8 @@ const OWNER = 'owner-a'
 const DATABASE = 'legacy-feed-upgrade.db'
 const SHARED_TIME = '2026-08-03T10:00:10.000Z'
 
+type PositionedCloudRow = CloudRowEnvelope & { changeId: number }
+
 const localClient = (overrides: Record<string, unknown> = {}) => ({
   id: 'client-local',
   ownerId: OWNER,
@@ -136,7 +138,8 @@ const clientEnvelope = (
   name: string,
   version: number,
   updatedAt: string,
-): CloudRowEnvelope => ({
+  changeId = 1,
+): PositionedCloudRow => ({
   ownerId: OWNER,
   entity: 'client',
   entityId: id,
@@ -151,6 +154,7 @@ const clientEnvelope = (
   },
   version,
   updatedAt,
+  changeId,
 })
 
 const tombstone = (
@@ -158,13 +162,15 @@ const tombstone = (
   entityId: string,
   version: number,
   updatedAt: string,
-): CloudRowEnvelope => ({
+  changeId = 1,
+): PositionedCloudRow => ({
   ownerId: OWNER,
   entity,
   entityId,
   payload: null,
   version,
   updatedAt,
+  changeId,
   deleted: true,
 })
 
@@ -234,14 +240,18 @@ const pendingBundleMutation = (id: string): MutationEnvelope => ({
   attempts: 0,
 })
 
-const bundleRows = (bundle: InvoiceBundlePayload): CloudRowEnvelope[] => (
-  (['client', 'job', 'invoice'] as const).map((entity) => ({
+const bundleRows = (
+  bundle: InvoiceBundlePayload,
+  changeIds: readonly [number, number, number] = [1, 2, 3],
+): PositionedCloudRow[] => (
+  (['client', 'job', 'invoice'] as const).map((entity, index) => ({
     ownerId: OWNER,
     entity,
     entityId: bundle[entity].id,
     payload: bundle[entity],
     version: bundle[entity].version,
     updatedAt: bundle[entity].updatedAt,
+    changeId: changeIds[index],
   }))
 )
 
@@ -320,7 +330,7 @@ it('upgrades a packaged legacy cursor through crash-resumable staged reconciliat
 
   const repository = new SQLiteFieldCraftRepository({ databaseName: DATABASE })
   await repository.initialize(OWNER)
-  expect(raw.userVersion).toBe(2)
+  expect(raw.userVersion).toBe(3)
   await expect(repository.getSyncCursor(OWNER)).resolves.toBeNull()
   await expect(repository.hasCompletedInitialPull(OWNER)).resolves.toBe(false)
 
@@ -364,6 +374,9 @@ it('upgrades a packaged legacy cursor through crash-resumable staged reconciliat
         entity_id: 'client-local',
         kind: 'update',
         cloud: rawClient('client-local', 'Unsynced local edit', 8, '2026-08-03T10:00:11.000Z'),
+        sync_position: {
+          updated_at: '2026-08-03T10:00:11.000Z', change_id: 103, source: 'sync_changes',
+        },
       },
     },
   ]
@@ -609,12 +622,22 @@ it('preserves a conflict through bootstrap and applies staged authority when kee
     'Local conflict edit',
   )
   await repository.transactLocalMutation(mutation)
-  const conflictCloud = clientEnvelope('conflict-client', 'Conflict response row', 2, '2026-08-03T10:00:01.000Z')
-  const newer = clientEnvelope('conflict-client', 'Later staged authority', 3, '2026-08-03T10:00:02.000Z')
+  const conflictCloud = clientEnvelope(
+    'conflict-client',
+    'Conflict response row',
+    5,
+    '2026-08-03T10:00:00.000100Z',
+  )
+  const newer = clientEnvelope(
+    'conflict-client',
+    'Later staged recreation',
+    1,
+    '2026-08-03T10:00:00.000900Z',
+  )
   await repository.commitPull(
     OWNER,
     [newer],
-    '{"updatedAt":"2026-08-03T10:00:02.000Z","changeId":701}',
+    '{"updatedAt":"2026-08-03T10:00:00.000900Z","changeId":701}',
     true,
   )
   await repository.recordMutationConflict(OWNER, {
@@ -625,13 +648,13 @@ it('preserves a conflict through bootstrap and applies staged authority when kee
     entityId: 'conflict-client',
     localPayload: mutation.payload,
     cloudPayload: conflictCloud.payload,
-    cloudVersion: 2,
+    cloudVersion: 5,
   })
 
   await repository.resolveConflictKeepCloud(mutation.id)
 
   await expect(repository.get('client', 'conflict-client')).resolves.toMatchObject({
-    name: 'Later staged authority', version: 3,
+    name: 'Later staged recreation', version: 1,
   })
   await expect(repository.hasCompletedInitialPull(OWNER)).resolves.toBe(true)
   await expect(repository.countConflicts(OWNER)).resolves.toBe(0)
@@ -670,4 +693,665 @@ it('fails a malformed legacy replay closed while keeping its staged repair durab
   expect(raw.bootstrapRecords).toEqual(expect.arrayContaining([
     expect.objectContaining({ entity_id: 'malformed-receipt-client', version: 3 }),
   ]))
+})
+
+it('uses change_id to keep a same-time recreation newer than an older delete receipt', async () => {
+  const { repository } = await initializeLegacyRepository('bootstrap-equal-time-delete-then-recreate.db')
+  const mutation: MutationEnvelope = {
+    id: '00000000-0000-4000-8000-000000000101',
+    ownerId: OWNER,
+    entity: 'client',
+    entityId: 'equal-time-client',
+    kind: 'delete',
+    baseVersion: 4,
+    payload: null,
+    createdAt: SHARED_TIME,
+    attempts: 0,
+  }
+  await repository.transactLocalMutation(mutation)
+  const receiptDelete = tombstone('client', 'equal-time-client', 4, SHARED_TIME, 900)
+  const stagedRecreation = clientEnvelope(
+    'equal-time-client',
+    'Recreated after delete',
+    1,
+    SHARED_TIME,
+    901,
+  )
+
+  await repository.commitPull(
+    OWNER,
+    [receiptDelete],
+    JSON.stringify({ updatedAt: SHARED_TIME, changeId: 900 }),
+    false,
+  )
+  await repository.commitPull(
+    OWNER,
+    [stagedRecreation],
+    JSON.stringify({ updatedAt: SHARED_TIME, changeId: 901 }),
+    true,
+  )
+  await repository.acknowledgeMutation(OWNER, mutation.id, [receiptDelete])
+
+  await expect(repository.get('client', 'equal-time-client')).resolves.toMatchObject({
+    name: 'Recreated after delete',
+    version: 1,
+  })
+  await expect(repository.hasCompletedInitialPull(OWNER)).resolves.toBe(true)
+})
+
+it('preserves PostgreSQL microseconds when staged authority has the later timestamp but smaller change_id', async () => {
+  const { repository } = await initializeLegacyRepository('bootstrap-microsecond-stage-order.db')
+  const mutation = pendingClientMutation(
+    '00000000-0000-4000-8000-000000000120',
+    'microsecond-stage-client',
+    'Local edit',
+  )
+  await repository.transactLocalMutation(mutation)
+  const receipt = clientEnvelope(
+    mutation.entityId,
+    'Earlier receipt',
+    2,
+    '2026-08-03T10:00:00.000100Z',
+    2000,
+  )
+  const staged = clientEnvelope(
+    mutation.entityId,
+    'Later staged authority',
+    3,
+    '2026-08-03T10:00:00.000900Z',
+    1000,
+  )
+  await repository.commitPull(
+    OWNER,
+    [staged],
+    JSON.stringify({ updatedAt: staged.updatedAt, changeId: staged.changeId }),
+    true,
+  )
+
+  await repository.acknowledgeMutation(OWNER, mutation.id, [receipt])
+
+  await expect(repository.get('client', mutation.entityId)).resolves.toMatchObject({
+    name: 'Later staged authority',
+    version: 3,
+  })
+})
+
+it('keeps authoritative bootstrap absence over a pre-feed generic receipt', async () => {
+  const { repository } = await initializeLegacyRepository('bootstrap-absent-generic.db')
+  const mutation = pendingClientMutation(
+    '00000000-0000-4000-8000-000000000117',
+    'absent-generic-client',
+    'Applied before feed creation',
+  )
+  await repository.transactLocalMutation(mutation)
+  await repository.commitPull(
+    OWNER,
+    [],
+    JSON.stringify({ updatedAt: SHARED_TIME, changeId: 1000 }),
+    true,
+  )
+  const legacyReceipt: CloudRowEnvelope = {
+    ...clientEnvelope(
+      mutation.entityId,
+      'Old applied receipt',
+      2,
+      '2026-08-03T10:00:01.000Z',
+      0,
+    ),
+    changeSource: 'legacy_receipt',
+  }
+
+  await repository.acknowledgeMutation(OWNER, mutation.id, [legacyReceipt])
+
+  await expect(repository.get('client', mutation.entityId)).resolves.toBeNull()
+  await expect(repository.hasCompletedInitialPull(OWNER)).resolves.toBe(true)
+})
+
+it('keeps authoritative bootstrap absence over every pre-feed bundle receipt member', async () => {
+  const { repository } = await initializeLegacyRepository('bootstrap-absent-bundle.db')
+  const mutation = pendingBundleMutation('00000000-0000-4000-8000-000000000118')
+  await repository.transactLocalMutation(mutation)
+  await repository.commitPull(
+    OWNER,
+    [],
+    JSON.stringify({ updatedAt: SHARED_TIME, changeId: 1010 }),
+    true,
+  )
+  const legacyRows = bundleRows(
+    bundlePayload(2, '2026-08-03T10:00:01.000Z', 'current', 'Old applied'),
+    [0, 0, 0],
+  ).map((row) => ({ ...row, changeSource: 'legacy_receipt' as const }))
+
+  await repository.acknowledgeMutation(OWNER, mutation.id, legacyRows)
+
+  await expect(repository.get('client', 'bundle-client')).resolves.toBeNull()
+  await expect(repository.get('job', 'bundle-job')).resolves.toBeNull()
+  await expect(repository.get('invoice', 'bundle-invoice')).resolves.toBeNull()
+  await expect(repository.hasCompletedInitialPull(OWNER)).resolves.toBe(true)
+})
+
+it('keeps a new post-bootstrap receipt whose feed position is beyond the terminal cursor', async () => {
+  const { repository } = await initializeLegacyRepository('bootstrap-absent-new-receipt.db')
+  const mutation = pendingClientMutation(
+    '00000000-0000-4000-8000-000000000119',
+    'new-after-bootstrap-client',
+    'Created after bootstrap',
+    0,
+  )
+  await repository.transactLocalMutation(mutation)
+  await repository.commitPull(
+    OWNER,
+    [],
+    JSON.stringify({ updatedAt: SHARED_TIME, changeId: 1020 }),
+    true,
+  )
+  const newReceipt: CloudRowEnvelope = {
+    ...clientEnvelope(
+      mutation.entityId,
+      'New canonical create',
+      1,
+      '2026-08-03T10:00:11.000Z',
+      1021,
+    ),
+    changeSource: 'sync_changes',
+  }
+
+  await repository.acknowledgeMutation(OWNER, mutation.id, [newReceipt])
+
+  await expect(repository.get('client', mutation.entityId)).resolves.toMatchObject({
+    name: 'New canonical create',
+    version: 1,
+  })
+  await expect(repository.hasCompletedInitialPull(OWNER)).resolves.toBe(true)
+})
+
+it('preserves PostgreSQL microseconds when a post-terminal absent receipt has the later timestamp', async () => {
+  const { repository } = await initializeLegacyRepository('bootstrap-microsecond-post-terminal.db')
+  const mutation = pendingClientMutation(
+    '00000000-0000-4000-8000-000000000121',
+    'microsecond-post-terminal-client',
+    'Created after bootstrap',
+    0,
+  )
+  await repository.transactLocalMutation(mutation)
+  const terminalCursor = {
+    updatedAt: '2026-08-03T10:00:00.000100Z',
+    changeId: 2000,
+  }
+  await repository.commitPull(OWNER, [], JSON.stringify(terminalCursor), true)
+  const receipt: CloudRowEnvelope = {
+    ...clientEnvelope(
+      mutation.entityId,
+      'Later microsecond receipt',
+      1,
+      '2026-08-03T10:00:00.000900Z',
+      1000,
+    ),
+    changeSource: 'sync_changes',
+  }
+
+  await repository.acknowledgeMutation(OWNER, mutation.id, [receipt])
+
+  await expect(repository.get('client', mutation.entityId)).resolves.toMatchObject({
+    name: 'Later microsecond receipt',
+    version: 1,
+  })
+  await expect(repository.hasCompletedInitialPull(OWNER)).resolves.toBe(true)
+})
+
+it.each([
+  ['legacy receipt with a positive change ID', 'legacy_receipt', 7],
+  ['sync change with the reserved zero change ID', 'sync_changes', 0],
+] as const)('rejects a repository receipt invariant violation: %s', async (
+  _label,
+  changeSource,
+  changeId,
+) => {
+  const databaseName = `receipt-source-invariant-${changeSource}.db`
+  const repository = new SQLiteFieldCraftRepository({ databaseName })
+  await repository.initialize(OWNER)
+  const mutation = pendingClientMutation(
+    changeSource === 'legacy_receipt'
+      ? '00000000-0000-4000-8000-000000000122'
+      : '00000000-0000-4000-8000-000000000123',
+    `receipt-source-${changeSource}`,
+    'Pending local edit',
+  )
+  await repository.transactLocalMutation(mutation)
+  const malformed: CloudRowEnvelope = {
+    ...clientEnvelope(
+      mutation.entityId,
+      'Malformed receipt',
+      2,
+      '2026-08-03T10:00:01.000Z',
+      changeId,
+    ),
+    changeSource,
+  }
+
+  await expect(repository.acknowledgeMutation(OWNER, mutation.id, [malformed]))
+    .rejects.toThrow()
+  await expect(repository.outbox.list(OWNER)).resolves.toEqual([
+    expect.objectContaining({ id: mutation.id }),
+  ])
+})
+
+it('uses change_id to keep a receipt recreation newer than a same-time staged delete', async () => {
+  const { repository } = await initializeLegacyRepository('bootstrap-equal-time-staged-delete.db')
+  const mutation = pendingClientMutation(
+    '00000000-0000-4000-8000-000000000102',
+    'equal-time-inverse-client',
+    'Local edit',
+  )
+  await repository.transactLocalMutation(mutation)
+  const stagedDelete = tombstone('client', 'equal-time-inverse-client', 8, SHARED_TIME, 910)
+  const receiptRecreation = clientEnvelope(
+    'equal-time-inverse-client',
+    'Receipt recreation',
+    1,
+    SHARED_TIME,
+    911,
+  )
+
+  await repository.commitPull(
+    OWNER,
+    [stagedDelete],
+    JSON.stringify({ updatedAt: SHARED_TIME, changeId: 910 }),
+    true,
+  )
+  await repository.acknowledgeMutation(OWNER, mutation.id, [receiptRecreation])
+
+  await expect(repository.get('client', 'equal-time-inverse-client')).resolves.toMatchObject({
+    name: 'Receipt recreation',
+    version: 1,
+  })
+  await expect(repository.hasCompletedInitialPull(OWNER)).resolves.toBe(true)
+})
+
+it('orders every same-time bundle member by its own change_id after a crash restart', async () => {
+  const databaseName = 'bootstrap-equal-time-bundle.db'
+  const { repository } = await initializeLegacyRepository(databaseName)
+  const mutation = pendingBundleMutation('00000000-0000-4000-8000-000000000103')
+  await repository.transactLocalMutation(mutation)
+  const oldReceipt = bundlePayload(5, SHARED_TIME, 'current', 'Old receipt')
+  const laterRecreation = bundlePayload(1, SHARED_TIME, 'current', 'Later recreation')
+
+  await repository.commitPull(
+    OWNER,
+    bundleRows(oldReceipt, [920, 922, 924]),
+    JSON.stringify({ updatedAt: SHARED_TIME, changeId: 924 }),
+    false,
+  )
+  await repository.commitPull(
+    OWNER,
+    bundleRows(laterRecreation, [921, 923, 925]),
+    JSON.stringify({ updatedAt: SHARED_TIME, changeId: 925 }),
+    true,
+  )
+  await repository.close()
+
+  const resumed = new SQLiteFieldCraftRepository({ databaseName })
+  await resumed.initialize(OWNER)
+  await resumed.acknowledgeMutation(
+    OWNER,
+    mutation.id,
+    bundleRows(oldReceipt, [920, 922, 924]),
+  )
+
+  await expect(resumed.get('client', 'bundle-client')).resolves.toMatchObject({
+    name: 'Later recreation client', version: 1,
+  })
+  await expect(resumed.get('job', 'bundle-job')).resolves.toMatchObject({
+    title: 'Later recreation job', version: 1,
+  })
+  await expect(resumed.get('invoice', 'bundle-invoice')).resolves.toMatchObject({
+    version: 1,
+    draft: expect.objectContaining({ clientName: 'Later recreation client' }),
+  })
+  await expect(resumed.hasCompletedInitialPull(OWNER)).resolves.toBe(true)
+})
+
+it.each([
+  ['pending', null],
+  ['transient', 'transient'],
+  ['permanent', 'validation'],
+  ['conflict', 'conflict'],
+] as const)('reapplies a later same-key %s intent after acknowledging an older mutation', async (
+  label,
+  disposition,
+) => {
+  const { repository } = await initializeLegacyRepository(`ack-later-${label}.db`)
+  const first = pendingClientMutation(
+    '00000000-0000-4000-8000-000000000104',
+    `same-key-${label}`,
+    'First local edit',
+  )
+  const second = {
+    ...pendingClientMutation(
+      '00000000-0000-4000-8000-000000000105',
+      `same-key-${label}`,
+      'Second exact local edit',
+    ),
+    createdAt: '2026-08-03T09:02:00.000Z',
+    payload: {
+      ...(pendingClientMutation(
+        '00000000-0000-4000-8000-000000000105',
+        `same-key-${label}`,
+        'Second exact local edit',
+      ).payload as Record<string, unknown>),
+      updatedAt: '2026-08-03T09:02:00.000Z',
+    },
+  }
+  await repository.transactLocalMutation(first)
+  await repository.transactLocalMutation(second)
+  if (disposition === 'transient' || disposition === 'validation') {
+    await repository.recordMutationFailure(OWNER, second.id, disposition)
+  } else if (disposition === 'conflict') {
+    const cloud = clientEnvelope(
+      second.entityId,
+      'Conflicting cloud row',
+      4,
+      '2026-08-03T10:00:04.000Z',
+      940,
+    )
+    await repository.recordMutationConflict(OWNER, {
+      mutationId: second.id,
+      ownerId: OWNER,
+      mutationKind: 'update',
+      entity: 'client',
+      entityId: second.entityId,
+      localPayload: second.payload,
+      cloudPayload: cloud.payload,
+      cloudVersion: cloud.version,
+    })
+  }
+
+  const firstCanonical = clientEnvelope(
+    first.entityId,
+    'First canonical receipt',
+    2,
+    SHARED_TIME,
+    941,
+  )
+  await repository.applyCloudRows([firstCanonical])
+  await repository.acknowledgeMutation(OWNER, first.id, [firstCanonical])
+
+  await expect(repository.get('client', second.entityId)).resolves.toEqual(second.payload)
+  if (disposition === 'conflict') {
+    await expect(repository.getConflict(second.id)).resolves.toMatchObject({
+      mutationId: second.id,
+      localPayload: second.payload,
+    })
+  }
+})
+
+it('lets the later same-key canonical receipt win after its protected local intent succeeds', async () => {
+  const { repository } = await initializeLegacyRepository('ack-later-canonical-wins.db')
+  const first = pendingClientMutation(
+    '00000000-0000-4000-8000-000000000106',
+    'same-key-success',
+    'First local edit',
+  )
+  const second = pendingClientMutation(
+    '00000000-0000-4000-8000-000000000107',
+    'same-key-success',
+    'Second local edit',
+  )
+  await repository.transactLocalMutation(first)
+  await repository.transactLocalMutation(second)
+
+  await repository.acknowledgeMutation(OWNER, first.id, [
+    clientEnvelope(first.entityId, 'First canonical receipt', 2, SHARED_TIME, 950),
+  ])
+  await repository.acknowledgeMutation(OWNER, second.id, [
+    clientEnvelope(second.entityId, 'Second canonical receipt', 3, SHARED_TIME, 951),
+  ])
+
+  await expect(repository.get('client', second.entityId)).resolves.toMatchObject({
+    name: 'Second canonical receipt',
+    version: 3,
+    syncState: 'current',
+  })
+})
+
+it('reapplies a later overlapping bundle after an older bundle acknowledgement', async () => {
+  const { repository } = await initializeLegacyRepository('ack-overlapping-bundles.db')
+  const first = pendingBundleMutation('00000000-0000-4000-8000-000000000108')
+  const second: MutationEnvelope = {
+    ...pendingBundleMutation('00000000-0000-4000-8000-000000000109'),
+    payload: bundlePayload(2, '2026-08-03T09:02:00.000Z', 'pending', 'Second local'),
+    createdAt: '2026-08-03T09:02:00.000Z',
+  }
+  await repository.transactLocalMutation(first)
+  await repository.transactLocalMutation(second)
+
+  const firstCanonical = bundleRows(
+    bundlePayload(2, SHARED_TIME, 'current', 'First canonical'),
+    [960, 961, 962],
+  )
+  await repository.applyCloudRows(firstCanonical)
+  await repository.acknowledgeMutation(OWNER, first.id, firstCanonical)
+
+  await expect(repository.get('client', 'bundle-client')).resolves.toEqual(
+    (second.payload as InvoiceBundlePayload).client,
+  )
+  await expect(repository.get('job', 'bundle-job')).resolves.toEqual(
+    (second.payload as InvoiceBundlePayload).job,
+  )
+  await expect(repository.get('invoice', 'bundle-invoice')).resolves.toEqual(
+    (second.payload as InvoiceBundlePayload).invoice,
+  )
+})
+
+it('rolls back receipt, staging repair, and later-intent reapply when the generation changes', async () => {
+  const { raw, repository } = await initializeLegacyRepository('ack-later-generation-rollback.db')
+  const first = pendingClientMutation(
+    '00000000-0000-4000-8000-000000000110',
+    'generation-same-key',
+    'First local edit',
+  )
+  const second = pendingClientMutation(
+    '00000000-0000-4000-8000-000000000111',
+    'generation-same-key',
+    'Second local edit',
+  )
+  await repository.transactLocalMutation(first)
+  await repository.transactLocalMutation(second)
+  const staged = clientEnvelope(
+    second.entityId,
+    'Staged authority',
+    5,
+    '2026-08-03T10:00:05.000Z',
+    970,
+  )
+  await repository.commitPull(
+    OWNER,
+    [staged],
+    JSON.stringify({ updatedAt: staged.updatedAt, changeId: staged.changeId }),
+    true,
+  )
+
+  await expect(repository.acknowledgeMutation(
+    OWNER,
+    first.id,
+    [clientEnvelope(first.entityId, 'First canonical', 2, SHARED_TIME, 969)],
+    () => false,
+  )).rejects.toThrow(/owner changed/i)
+
+  await expect(repository.get('client', second.entityId)).resolves.toEqual(second.payload)
+  expect(raw.outbox.filter((row) => row.state !== 'complete')).toHaveLength(2)
+  expect(raw.bootstrapRecords).toEqual(expect.arrayContaining([
+    expect.objectContaining({ entity_id: second.entityId, version: 5 }),
+  ]))
+  await expect(repository.hasCompletedInitialPull(OWNER)).resolves.toBe(false)
+})
+
+it('uses a completed staged bootstrap to repair an unreconstructable legacy invoice receipt', async () => {
+  const { repository } = await initializeLegacyRepository('legacy-invoice-feed-repair.db')
+  const local = bundlePayload(1, '2026-08-03T09:01:00.000Z', 'pending', 'Legacy local')
+  const mutation: MutationEnvelope = {
+    id: '00000000-0000-4000-8000-000000000112',
+    ownerId: OWNER,
+    entity: 'invoice',
+    entityId: local.invoice.id,
+    kind: 'update',
+    baseVersion: 1,
+    payload: local.invoice,
+    createdAt: local.invoice.updatedAt,
+    attempts: 0,
+  }
+  await repository.transactLocalMutation(mutation)
+  const staged = bundlePayload(4, SHARED_TIME, 'current', 'Staged server')
+  await repository.commitPull(
+    OWNER,
+    bundleRows(staged, [980, 981, 982]),
+    JSON.stringify({ updatedAt: SHARED_TIME, changeId: 982 }),
+    true,
+  )
+
+  await repository.acknowledgeMutation(OWNER, mutation.id, [], () => true, true)
+
+  await expect(repository.get('invoice', staged.invoice.id)).resolves.toEqual(staged.invoice)
+  await expect(repository.get('client', staged.client.id)).resolves.toEqual(staged.client)
+  await expect(repository.get('job', staged.job.id)).resolves.toEqual(staged.job)
+  await expect(repository.hasCompletedInitialPull(OWNER)).resolves.toBe(true)
+})
+
+it('schedules and completes a fresh bootstrap for a hydrated owner needing legacy repair', async () => {
+  const databaseName = 'legacy-invoice-repair-no-stage.db'
+  const repository = new SQLiteFieldCraftRepository({ databaseName })
+  await repository.initialize(OWNER)
+  const hydratedCursor = JSON.stringify({ updatedAt: SHARED_TIME, changeId: 970 })
+  await repository.commitPull(OWNER, [], hydratedCursor, true)
+  const raw = __getRawDatabase(databaseName)
+  const local = bundlePayload(1, '2026-08-03T09:01:00.000Z', 'pending', 'Legacy local')
+  const mutation: MutationEnvelope = {
+    id: '00000000-0000-4000-8000-000000000113',
+    ownerId: OWNER,
+    entity: 'invoice',
+    entityId: local.invoice.id,
+    kind: 'update',
+    baseVersion: 1,
+    payload: local.invoice,
+    createdAt: local.invoice.updatedAt,
+    attempts: 0,
+  }
+  await repository.transactLocalMutation(mutation)
+
+  await expect(repository.acknowledgeMutation(
+    OWNER,
+    mutation.id,
+    [],
+    () => true,
+    true,
+  )).rejects.toThrow(/scheduled a fresh bootstrap/i)
+
+  await expect(repository.get('invoice', local.invoice.id)).resolves.toEqual(local.invoice)
+  expect(raw.outbox.find((row) => row.mutation_id === mutation.id)?.state).toBe('pending')
+  await expect(repository.hasCompletedInitialPull(OWNER)).resolves.toBe(false)
+  await expect(repository.getSyncCursor(OWNER)).resolves.toBeNull()
+  expect(raw.metadata).toEqual(expect.arrayContaining([
+    expect.objectContaining({
+      owner_id: OWNER,
+      key: 'sync-feed-v2-reconciliation-required',
+      value: 'true',
+    }),
+  ]))
+
+  const staged = bundlePayload(4, SHARED_TIME, 'current', 'Fresh bootstrap')
+  await repository.commitPull(
+    OWNER,
+    bundleRows(staged, [983, 984, 985]),
+    JSON.stringify({ updatedAt: SHARED_TIME, changeId: 985 }),
+    true,
+  )
+  await repository.acknowledgeMutation(OWNER, mutation.id, [], () => true, true)
+
+  await expect(repository.get('invoice', mutation.entityId)).resolves.toEqual(staged.invoice)
+  await expect(repository.hasCompletedInitialPull(OWNER)).resolves.toBe(true)
+})
+
+it('preserves a later invoice intent during legacy feed repair and lets its receipt win', async () => {
+  const { repository } = await initializeLegacyRepository('legacy-invoice-repair-later-intent.db')
+  const firstBundle = bundlePayload(1, '2026-08-03T09:01:00.000Z', 'pending', 'First local')
+  const secondBundle = bundlePayload(2, '2026-08-03T09:02:00.000Z', 'pending', 'Second local')
+  const first: MutationEnvelope = {
+    id: '00000000-0000-4000-8000-000000000114',
+    ownerId: OWNER,
+    entity: 'invoice',
+    entityId: firstBundle.invoice.id,
+    kind: 'update',
+    baseVersion: 1,
+    payload: firstBundle.invoice,
+    createdAt: firstBundle.invoice.updatedAt,
+    attempts: 0,
+  }
+  const second: MutationEnvelope = {
+    ...first,
+    id: '00000000-0000-4000-8000-000000000115',
+    baseVersion: 2,
+    payload: secondBundle.invoice,
+    createdAt: secondBundle.invoice.updatedAt,
+  }
+  await repository.transactLocalMutation(first)
+  await repository.transactLocalMutation(second)
+  const staged = bundlePayload(4, SHARED_TIME, 'current', 'Staged server')
+  await repository.commitPull(
+    OWNER,
+    bundleRows(staged, [990, 991, 992]),
+    JSON.stringify({ updatedAt: SHARED_TIME, changeId: 992 }),
+    true,
+  )
+
+  await repository.acknowledgeMutation(OWNER, first.id, [], () => true, true)
+
+  await expect(repository.get('invoice', second.entityId)).resolves.toEqual(second.payload)
+  await expect(repository.hasCompletedInitialPull(OWNER)).resolves.toBe(false)
+
+  const canonical = bundlePayload(5, '2026-08-03T10:00:11.000Z', 'current', 'Second canonical')
+  await repository.acknowledgeMutation(OWNER, second.id, [
+    { ...bundleRows(canonical, [993, 994, 995])[2], changeId: 995 },
+  ])
+
+  await expect(repository.get('invoice', second.entityId)).resolves.toEqual(canonical.invoice)
+  await expect(repository.hasCompletedInitialPull(OWNER)).resolves.toBe(true)
+})
+
+it('rolls back a legacy feed repair when the owner generation changes', async () => {
+  const { raw, repository } = await initializeLegacyRepository('legacy-invoice-repair-rollback.db')
+  const local = bundlePayload(1, '2026-08-03T09:01:00.000Z', 'pending', 'Legacy local')
+  const mutation: MutationEnvelope = {
+    id: '00000000-0000-4000-8000-000000000116',
+    ownerId: OWNER,
+    entity: 'invoice',
+    entityId: local.invoice.id,
+    kind: 'update',
+    baseVersion: 1,
+    payload: local.invoice,
+    createdAt: local.invoice.updatedAt,
+    attempts: 0,
+  }
+  await repository.transactLocalMutation(mutation)
+  const staged = bundlePayload(4, SHARED_TIME, 'current', 'Staged server')
+  await repository.commitPull(
+    OWNER,
+    bundleRows(staged, [996, 997, 998]),
+    JSON.stringify({ updatedAt: SHARED_TIME, changeId: 998 }),
+    true,
+  )
+
+  await expect(repository.acknowledgeMutation(
+    OWNER,
+    mutation.id,
+    [],
+    () => false,
+    true,
+  )).rejects.toThrow(/owner changed/i)
+
+  await expect(repository.get('invoice', mutation.entityId)).resolves.toEqual(local.invoice)
+  expect(raw.outbox.find((row) => row.mutation_id === mutation.id)?.state).toBe('pending')
+  expect(raw.bootstrapRecords).toEqual(expect.arrayContaining([
+    expect.objectContaining({ entity: 'invoice', entity_id: mutation.entityId, change_id: 998 }),
+  ]))
+  await expect(repository.hasCompletedInitialPull(OWNER)).resolves.toBe(false)
 })

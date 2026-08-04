@@ -85,6 +85,18 @@ const bundleMutation = (): MutationEnvelope => ({
   attempts: 0,
 })
 
+const invoiceMutation = (): MutationEnvelope => ({
+  id: MUTATION_ID,
+  ownerId: OWNER,
+  entity: 'invoice',
+  entityId: 'invoice-1',
+  kind: 'update',
+  baseVersion: 2,
+  payload: (bundleMutation().payload as { invoice: unknown }).invoice,
+  createdAt: '2026-08-03T10:00:02.000Z',
+  attempts: 0,
+})
+
 const rawJob = (overrides: Record<string, unknown> = {}) => ({
   id: 'job-1', user_id: OWNER, client_id: 'client-1', title: 'Cloud job',
   trade_type: 'Plumbing', status: 'Invoiced', version: 5,
@@ -152,7 +164,10 @@ it('pulls one owner-filtered global change feed page with an updated_at/change_i
       p_limit: 500,
     },
   }])
-  expect(result.rows.map((row) => row.entityId)).toEqual(['client-a', 'client-b'])
+  expect(result.rows.map((row) => ({ entityId: row.entityId, changeId: row.changeId }))).toEqual([
+    { entityId: 'client-a', changeId: 41 },
+    { entityId: 'client-b', changeId: 42 },
+  ])
   expect(result).toMatchObject({ hasMore: true })
   expect(JSON.parse(result.cursor)).toEqual({
     updatedAt: '2026-08-03T10:00:04.000Z',
@@ -185,9 +200,333 @@ it('accepts a null tombstone from the change feed without borrowing local payloa
   await expect(
     createSupabaseGateway(client).pullSince(OWNER, null, new AbortController().signal),
   ).resolves.toMatchObject({
-    rows: [{ entityId: 'client-1', payload: null, deleted: true, version: 4 }],
+    rows: [{ entityId: 'client-1', payload: null, deleted: true, version: 4, changeId: 9 }],
     hasMore: false,
   })
+})
+
+it('normalizes historical invoices identically across relation-event page boundaries', async () => {
+  const invoiceChange = {
+    change_id: 31,
+    owner_id: OWNER,
+    entity: 'invoice',
+    entity_id: 'invoice-1',
+    version: 6,
+    updated_at: '2026-08-03T10:00:06.000Z',
+    deleted: false,
+    payload: rawInvoice({
+      clients: { name: 'Historical client' },
+      jobs: { title: 'Historical job', trade_type: 'Electrical' },
+    }),
+  }
+  const samePageClient = new Client()
+  samePageClient.replies = [{
+    status: 200,
+    error: null,
+    data: {
+      status: 'ok',
+      changes: [
+        invoiceChange,
+        {
+          change_id: 32,
+          owner_id: OWNER,
+          entity: 'client',
+          entity_id: 'client-1',
+          version: 5,
+          updated_at: '2026-08-03T10:00:07.000Z',
+          deleted: false,
+          payload: rawClient({
+            name: 'Later client on same page',
+            version: 5,
+            updated_at: '2026-08-03T10:00:07.000Z',
+          }),
+        },
+        {
+          change_id: 33,
+          owner_id: OWNER,
+          entity: 'job',
+          entity_id: 'job-1',
+          version: 6,
+          updated_at: '2026-08-03T10:00:08.000Z',
+          deleted: false,
+          payload: rawJob({
+            title: 'Later job on same page',
+            trade_type: 'Plumbing',
+            version: 6,
+            updated_at: '2026-08-03T10:00:08.000Z',
+          }),
+        },
+      ],
+      cursor: { updated_at: '2026-08-03T10:00:08.000Z', change_id: 33 },
+      has_more: false,
+    },
+  }]
+  const splitPageClient = new Client()
+  splitPageClient.replies = [{
+    status: 200,
+    error: null,
+    data: {
+      status: 'ok',
+      changes: [invoiceChange],
+      cursor: { updated_at: '2026-08-03T10:00:06.000Z', change_id: 31 },
+      has_more: true,
+    },
+  }]
+
+  const samePage = await createSupabaseGateway(samePageClient).pullSince(
+    OWNER,
+    null,
+    new AbortController().signal,
+  )
+  const splitPage = await createSupabaseGateway(splitPageClient).pullSince(
+    OWNER,
+    null,
+    new AbortController().signal,
+  )
+  const samePageInvoice = samePage.rows.find((row) => row.entity === 'invoice')
+  const splitPageInvoice = splitPage.rows.find((row) => row.entity === 'invoice')
+
+  expect((samePageInvoice?.payload as { draft: unknown }).draft).toEqual(
+    (splitPageInvoice?.payload as { draft: unknown }).draft,
+  )
+  expect(samePageInvoice).toMatchObject({
+    payload: {
+      draft: {
+        clientName: 'Historical client',
+        jobTitle: 'Historical job',
+        tradeType: 'Electrical',
+      },
+    },
+  })
+})
+
+it('carries the immutable generic receipt position into the acknowledged cloud row', async () => {
+  const client = new Client()
+  client.replies = [{
+    status: 200,
+    error: null,
+    data: {
+      status: 'applied',
+      mutation_id: MUTATION_ID,
+      entity: 'client',
+      kind: 'update',
+      entity_id: 'client-1',
+      cloud: rawClient(),
+      sync_position: {
+        updated_at: '2026-08-03T10:00:04.000Z', change_id: 77, source: 'sync_changes',
+      },
+    },
+  }]
+
+  await expect(createSupabaseGateway(client).pushMutation(
+    OWNER,
+    clientMutation(),
+    new AbortController().signal,
+  )).resolves.toMatchObject({
+    type: 'applied',
+    rows: [{ entityId: 'client-1', updatedAt: '2026-08-03T10:00:04.000Z', changeId: 77 }],
+  })
+})
+
+it.each([
+  ['legacy receipt with a positive change ID', 'legacy_receipt', 77],
+  ['sync change with the reserved zero change ID', 'sync_changes', 0],
+] as const)('rejects a generic receipt position with %s', async (
+  _label,
+  source,
+  changeId,
+) => {
+  const client = new Client()
+  client.replies = [{
+    status: 200,
+    error: null,
+    data: {
+      status: 'applied',
+      mutation_id: MUTATION_ID,
+      entity: 'client',
+      kind: 'update',
+      entity_id: 'client-1',
+      cloud: rawClient(),
+      sync_position: {
+        updated_at: '2026-08-03T10:00:04.000Z',
+        change_id: changeId,
+        source,
+      },
+    },
+  }]
+
+  await expect(createSupabaseGateway(client).pushMutation(
+    OWNER,
+    clientMutation(),
+    new AbortController().signal,
+  )).rejects.toMatchObject({ reason: 'invalid-response' })
+})
+
+it('rejects an otherwise valid applied receipt without comparable immutable position metadata', async () => {
+  const client = new Client()
+  client.replies = [{
+    status: 200,
+    error: null,
+    data: {
+      status: 'applied',
+      mutation_id: MUTATION_ID,
+      entity: 'client',
+      kind: 'update',
+      entity_id: 'client-1',
+      cloud: rawClient(),
+    },
+  }]
+
+  await expect(createSupabaseGateway(client).pushMutation(
+    OWNER,
+    clientMutation(),
+    new AbortController().signal,
+  )).rejects.toMatchObject({ reason: 'invalid-response' })
+})
+
+it('accepts an identity-bound legacy invoice repair only with an immutable feed position', async () => {
+  const client = new Client()
+  client.replies = [{
+    status: 200,
+    error: null,
+    data: {
+      status: 'applied',
+      mutation_id: MUTATION_ID,
+      entity: 'invoice',
+      kind: 'update',
+      entity_id: 'invoice-1',
+      cloud: null,
+      repair_from_feed: true,
+      sync_position: {
+        updated_at: '2026-08-03T10:00:06.000Z',
+        change_id: 0,
+        source: 'legacy_receipt',
+      },
+    },
+  }]
+
+  await expect(createSupabaseGateway(client).pushMutation(
+    OWNER,
+    invoiceMutation(),
+    new AbortController().signal,
+  )).resolves.toEqual({
+    type: 'applied',
+    rows: [],
+    requiresBootstrapRepair: true,
+  })
+})
+
+it.each([
+  {
+    label: 'another entity',
+    mutation: clientMutation(),
+    position: { updated_at: '2026-08-03T10:00:04.000Z', change_id: 0 },
+  },
+  {
+    label: 'no immutable position',
+    mutation: invoiceMutation(),
+    position: undefined,
+  },
+])('rejects a legacy repair marker with $label', async ({ mutation, position }) => {
+  const client = new Client()
+  client.replies = [{
+    status: 200,
+    error: null,
+    data: {
+      status: 'applied',
+      mutation_id: MUTATION_ID,
+      entity: mutation.entity,
+      kind: mutation.kind,
+      entity_id: mutation.entityId,
+      cloud: null,
+      repair_from_feed: true,
+      ...(position ? { sync_position: position } : {}),
+    },
+  }]
+
+  await expect(createSupabaseGateway(client).pushMutation(
+    OWNER,
+    mutation,
+    new AbortController().signal,
+  )).rejects.toMatchObject({ reason: 'invalid-response' })
+})
+
+it('binds each applied bundle member to its own immutable receipt position', async () => {
+  const client = new Client()
+  client.replies = [{
+    status: 200,
+    error: null,
+    data: {
+      status: 'applied', mutation_id: MUTATION_ID, entity: 'invoice_bundle',
+      entity_ids: { client: 'client-1', job: 'job-1', invoice: 'invoice-1' },
+      client: rawClient(),
+      job: rawJob(),
+      invoice: rawInvoice(),
+      sync_positions: {
+        client: {
+          updated_at: '2026-08-03T10:00:04.000Z', change_id: 81, source: 'sync_changes',
+        },
+        job: {
+          updated_at: '2026-08-03T10:00:05.000Z', change_id: 82, source: 'sync_changes',
+        },
+        invoice: {
+          updated_at: '2026-08-03T10:00:06.000Z', change_id: 83, source: 'sync_changes',
+        },
+      },
+    },
+  }]
+
+  await expect(createSupabaseGateway(client).pushMutation(
+    OWNER,
+    bundleMutation(),
+    new AbortController().signal,
+  )).resolves.toMatchObject({
+    type: 'applied',
+    rows: [
+      { entity: 'client', changeId: 81 },
+      { entity: 'job', changeId: 82 },
+      { entity: 'invoice', changeId: 83 },
+    ],
+  })
+})
+
+it.each([
+  ['legacy receipt with a positive change ID', 'legacy_receipt', 81],
+  ['sync change with the reserved zero change ID', 'sync_changes', 0],
+] as const)('rejects a bundle member position with %s', async (
+  _label,
+  source,
+  changeId,
+) => {
+  const client = new Client()
+  client.replies = [{
+    status: 200,
+    error: null,
+    data: {
+      status: 'applied', mutation_id: MUTATION_ID, entity: 'invoice_bundle',
+      entity_ids: { client: 'client-1', job: 'job-1', invoice: 'invoice-1' },
+      client: rawClient(),
+      job: rawJob(),
+      invoice: rawInvoice(),
+      sync_positions: {
+        client: {
+          updated_at: '2026-08-03T10:00:04.000Z', change_id: changeId, source,
+        },
+        job: {
+          updated_at: '2026-08-03T10:00:05.000Z', change_id: 82, source: 'sync_changes',
+        },
+        invoice: {
+          updated_at: '2026-08-03T10:00:06.000Z', change_id: 83, source: 'sync_changes',
+        },
+      },
+    },
+  }]
+
+  await expect(createSupabaseGateway(client).pushMutation(
+    OWNER,
+    bundleMutation(),
+    new AbortController().signal,
+  )).rejects.toMatchObject({ reason: 'invalid-response' })
 })
 
 it('rejects applied replies that are not bound to the exact mutation and entity identity', async () => {

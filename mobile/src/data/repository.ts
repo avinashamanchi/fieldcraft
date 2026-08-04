@@ -20,6 +20,8 @@ export type CloudRowEnvelope = {
   payload: unknown
   version: number
   updatedAt: string
+  changeId?: number
+  changeSource?: 'sync_changes' | 'legacy_receipt'
   deleted?: boolean
 }
 
@@ -52,6 +54,7 @@ export interface FieldCraftRepository {
     mutationId: string,
     rows: CloudRowEnvelope[],
     isCurrent?: () => boolean,
+    requiresBootstrapRepair?: boolean,
   ): Promise<void>
   recordMutationFailure(
     ownerId: string,

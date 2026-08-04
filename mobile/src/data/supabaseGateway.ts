@@ -243,8 +243,8 @@ const normalizePayload = (
       const relatedJob = raw.jobs === undefined || raw.jobs === null
         ? undefined
         : asRecord(raw.jobs)
-      const client = rowsByEntity.get('client')?.get(clientId) ?? relatedClient
-      const job = jobId ? rowsByEntity.get('job')?.get(jobId) ?? relatedJob : undefined
+      const client = relatedClient ?? rowsByEntity.get('client')?.get(clientId)
+      const job = jobId ? relatedJob ?? rowsByEntity.get('job')?.get(jobId) : undefined
       if (!client) throw new RemoteGatewayError('invalid-response')
       return {
         ...common,
@@ -300,6 +300,28 @@ const envelopeFromRaw = (
   }
 }
 
+const receiptPosition = (
+  value: unknown,
+  expectedUpdatedAt: string,
+): Pick<CloudRowEnvelope, 'changeId' | 'changeSource'> => {
+  const position = asRecord(value)
+  if (requireTimestamp(position, 'updated_at') !== expectedUpdatedAt) {
+    throw new RemoteGatewayError('invalid-response')
+  }
+  const changeSource = requireString(position, 'source')
+  if (changeSource !== 'sync_changes' && changeSource !== 'legacy_receipt') {
+    throw new RemoteGatewayError('invalid-response')
+  }
+  const changeId = requireInteger(position, 'change_id')
+  if (
+    (changeSource === 'legacy_receipt' && changeId !== 0) ||
+    (changeSource === 'sync_changes' && changeId === 0)
+  ) {
+    throw new RemoteGatewayError('invalid-response')
+  }
+  return { changeId, changeSource }
+}
+
 const mutationRpcPayload = (mutation: MutationEnvelope): unknown => {
   if (mutation.kind !== 'save_invoice_bundle') return mutation.payload
   const bundle = mutation.payload as InvoiceBundlePayload
@@ -352,6 +374,10 @@ const bundleRows = (
     envelopeFromRaw('job', job, ownerId, rowsByEntity),
     envelopeFromRaw('invoice', invoice, ownerId, rowsByEntity),
   ]
+  const positions = asRecord(rawBundle.sync_positions)
+  for (const row of rows) {
+    Object.assign(row, receiptPosition(positions[row.entity], row.updatedAt))
+  }
   if (
     rows[0].entityId !== local.client.id ||
     rows[1].entityId !== local.job.id ||
@@ -523,7 +549,24 @@ const parsePushResponse = (
   ) {
     throw new RemoteGatewayError('invalid-response')
   }
+  if (Object.prototype.hasOwnProperty.call(data, 'repair_from_feed')) {
+    const position = asRecord(data.sync_position)
+    const positionUpdatedAt = requireTimestamp(position, 'updated_at')
+    if (
+      data.repair_from_feed !== true ||
+      mutation.entity !== 'invoice' ||
+      mutation.kind === 'delete' ||
+      data.cloud !== null ||
+      requireInteger(position, 'change_id') !== 0 ||
+      requireString(position, 'source') !== 'legacy_receipt'
+    ) {
+      throw new RemoteGatewayError('invalid-response')
+    }
+    receiptPosition(position, positionUpdatedAt)
+    return { type: 'applied', rows: [], requiresBootstrapRepair: true }
+  }
   if (mutation.kind === 'delete') {
+    const updatedAt = requireTimestamp(data, 'deleted_at')
     return {
       type: 'applied',
       rows: [{
@@ -532,13 +575,15 @@ const parsePushResponse = (
         entityId: mutation.entityId,
         payload: null,
         version: requireInteger(data, 'deleted_version'),
-        updatedAt: requireTimestamp(data, 'deleted_at'),
+        updatedAt,
+        ...receiptPosition(data.sync_position, updatedAt),
         deleted: true,
       }],
     }
   }
   const row = envelopeFromRaw(mutation.entity, asRecord(data.cloud), ownerId)
   if (row.entityId !== mutation.entityId) throw new RemoteGatewayError('invalid-response')
+  Object.assign(row, receiptPosition(data.sync_position, row.updatedAt))
   return { type: 'applied', rows: [row] }
 }
 
@@ -608,6 +653,8 @@ const parsePull = (
         payload: null,
         version: item.version,
         updatedAt: item.position.updatedAt,
+        changeId: item.position.changeId,
+        changeSource: 'sync_changes',
         deleted: true,
       }
     }
@@ -624,6 +671,8 @@ const parsePull = (
     ) {
       throw new RemoteGatewayError('invalid-response')
     }
+    row.changeId = item.position.changeId
+    row.changeSource = 'sync_changes'
     return row
   })
   return { rows, cursor: encodeCursor(cursor), hasMore: requireBoolean(data, 'has_more') }
