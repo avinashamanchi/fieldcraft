@@ -53,14 +53,162 @@ type OwnerClear = {
   status: 'pending' | 'failed'
   promise: Promise<void>
 }
+type RefreshLifecycleHandlers = {
+  onBlocked(): void
+  onFailure(): void
+  onForegroundApplied(): void
+}
+type RefreshLifecycleLease = {
+  update(shouldRefresh: boolean): void
+  release(): void
+}
 
 const ownerClearRegistries = new WeakMap<object, Map<string, OwnerClear>>()
+const refreshLifecycleControllers = new WeakMap<object, RefreshLifecycleController>()
+const REFRESH_RETRY_BASE_DELAY_MS = 25
+const REFRESH_RETRY_MAX_DELAY_MS = 1_000
+const MAX_UNMOUNT_REFRESH_FAILURES = 3
+
+class RefreshLifecycleController {
+  private desiredRefresh = false
+  private desiredVersion = 0
+  private appliedRefresh: boolean | null = null
+  private stopRequired = false
+  private draining = false
+  private mounted = false
+  private consecutiveFailures = 0
+  private unmountFailures = 0
+  private activeLease: symbol | null = null
+  private retryTimer: ReturnType<typeof setTimeout> | null = null
+  private handlers: RefreshLifecycleHandlers = {
+    onBlocked: () => {},
+    onFailure: () => {},
+    onForegroundApplied: () => {},
+  }
+
+  constructor(private readonly service: AuthService) {}
+
+  attach(
+    shouldRefresh: boolean,
+    handlers: RefreshLifecycleHandlers,
+  ): RefreshLifecycleLease {
+    const lease = Symbol('refresh-lifecycle')
+    this.activeLease = lease
+    this.mounted = true
+    this.handlers = handlers
+    this.desiredRefresh = shouldRefresh
+    this.desiredVersion += 1
+    this.consecutiveFailures = 0
+    this.unmountFailures = 0
+    this.clearRetryTimer()
+    if (this.draining || this.needsTransition()) this.handlers.onBlocked()
+    if (this.stopRequired) this.handlers.onFailure()
+    void this.drain()
+
+    return {
+      update: (nextRefresh) => {
+        if (this.activeLease !== lease) return
+        const changed = this.desiredRefresh !== nextRefresh
+        this.desiredRefresh = nextRefresh
+        if (changed) {
+          this.desiredVersion += 1
+          this.consecutiveFailures = 0
+          this.unmountFailures = 0
+          this.clearRetryTimer()
+        }
+        if (changed || this.needsTransition()) void this.drain()
+      },
+      release: () => {
+        if (this.activeLease !== lease) return
+        this.activeLease = null
+        this.mounted = false
+        this.handlers = {
+          onBlocked: () => {},
+          onFailure: () => {},
+          onForegroundApplied: () => {},
+        }
+        this.desiredRefresh = false
+        this.desiredVersion += 1
+        this.consecutiveFailures = 0
+        this.unmountFailures = 0
+        this.clearRetryTimer()
+        void this.drain()
+      },
+    }
+  }
+
+  private needsTransition(): boolean {
+    return this.stopRequired || this.appliedRefresh !== this.desiredRefresh
+  }
+
+  private clearRetryTimer(): void {
+    if (this.retryTimer === null) return
+    clearTimeout(this.retryTimer)
+    this.retryTimer = null
+  }
+
+  private scheduleRetry(): void {
+    if (this.retryTimer !== null || !this.needsTransition()) return
+    if (!this.mounted && this.unmountFailures >= MAX_UNMOUNT_REFRESH_FAILURES) return
+    const scheduledVersion = this.desiredVersion
+    const delay = Math.min(
+      REFRESH_RETRY_MAX_DELAY_MS,
+      REFRESH_RETRY_BASE_DELAY_MS * 2 ** Math.min(Math.max(this.consecutiveFailures - 1, 0), 5),
+    )
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null
+      if (scheduledVersion !== this.desiredVersion || this.needsTransition()) {
+        void this.drain()
+      }
+    }, delay)
+  }
+
+  private async drain(): Promise<void> {
+    if (this.draining) return
+    this.draining = true
+    try {
+      while (this.needsTransition()) {
+        const targetRefresh = this.stopRequired ? false : this.desiredRefresh
+        const attemptedVersion = this.desiredVersion
+        try {
+          if (targetRefresh) await this.service.startAutoRefresh()
+          else await this.service.stopAutoRefresh()
+        } catch {
+          this.appliedRefresh = null
+          if (!targetRefresh) this.stopRequired = true
+          this.consecutiveFailures += 1
+          if (!this.mounted) this.unmountFailures += 1
+          this.handlers.onFailure()
+          if (attemptedVersion !== this.desiredVersion) continue
+          this.scheduleRetry()
+          return
+        }
+
+        this.appliedRefresh = targetRefresh
+        this.consecutiveFailures = 0
+        if (!targetRefresh) this.stopRequired = false
+        if (targetRefresh) this.handlers.onForegroundApplied()
+      }
+    } finally {
+      this.draining = false
+      if (this.needsTransition() && this.retryTimer === null) this.scheduleRetry()
+    }
+  }
+}
 
 const getOwnerClearRegistry = (dataLifecycle: AuthDataLifecycle): Map<string, OwnerClear> => {
   const existing = ownerClearRegistries.get(dataLifecycle)
   if (existing) return existing
   const created = new Map<string, OwnerClear>()
   ownerClearRegistries.set(dataLifecycle, created)
+  return created
+}
+
+const getRefreshLifecycleController = (service: AuthService): RefreshLifecycleController => {
+  const existing = refreshLifecycleControllers.get(service)
+  if (existing) return existing
+  const created = new RefreshLifecycleController(service)
+  refreshLifecycleControllers.set(service, created)
   return created
 }
 
@@ -141,16 +289,17 @@ export const AuthProvider = ({
       }
     }
 
-    const awaitOwnerClear = async (ownerId: string, currentGeneration: number): Promise<boolean> => {
-      const existing = ownerClears.get(ownerId)
-      if (!existing) return true
-      try {
-        await startOwnerClear(ownerId, existing.status === 'failed')
-        return currentGeneration === generation
-      } catch {
-        failOwnerLifecycle(currentGeneration)
-        return false
+    const drainOwnerClears = async (currentGeneration: number): Promise<boolean> => {
+      for (const [ownerId, record] of [...ownerClears.entries()]) {
+        try {
+          await startOwnerClear(ownerId, record.status === 'failed')
+        } catch {
+          failOwnerLifecycle(currentGeneration)
+          return false
+        }
+        if (currentGeneration !== generation) return false
       }
+      return currentGeneration === generation
     }
 
     const reconcile = async (session: AuthSession | null) => {
@@ -183,7 +332,7 @@ export const AuthProvider = ({
         return
       }
 
-      if (targetOwnerId === user.id) return
+      if (targetOwnerId === user.id && ownerClears.size === 0) return
       const previousOwnerId = targetOwnerId ?? activeOwnerId
       targetOwnerId = user.id
       activeOwnerId = null
@@ -199,7 +348,7 @@ export const AuthProvider = ({
           return
         }
       }
-      if (!(await awaitOwnerClear(user.id, currentGeneration))) return
+      if (!(await drainOwnerClears(currentGeneration))) return
       if (
         disposed ||
         lifecycleBlocks.current.size > 0 ||
@@ -287,65 +436,40 @@ export const AuthProvider = ({
   }, [dataLifecycle, service])
 
   useEffect(() => {
-    let desiredRefresh = false
-    let appliedRefresh: boolean | null = null
-    let draining = false
     let mounted = true
 
-    const failRefreshLifecycle = () => {
+    const blockRefreshLifecycle = () => {
       lifecycleBlocks.current.add('refresh')
       invalidateSession.current()
+    }
+
+    const failRefreshLifecycle = () => {
+      blockRefreshLifecycle()
       if (mounted) setState({ status: 'storageError', message: SESSION_LIFECYCLE_MESSAGE })
     }
 
-    const drainTransitions = async () => {
-      if (draining) return
-      draining = true
-      let transitionFailed = false
-      let failedTarget: boolean | null = null
-      try {
-        while (appliedRefresh !== desiredRefresh) {
-          const nextRefresh = desiredRefresh
-          try {
-            if (nextRefresh) await service.startAutoRefresh()
-            else await service.stopAutoRefresh()
-          } catch {
-            transitionFailed = true
-            failedTarget = nextRefresh
-            appliedRefresh = null
-            failRefreshLifecycle()
-            break
-          }
-          appliedRefresh = nextRefresh
-          if (nextRefresh && lifecycleBlocks.current.delete('refresh')) {
-            if (lifecycleBlocks.current.size === 0) restoreSession.current()
-          }
+    const controller = getRefreshLifecycleController(service)
+    const initiallyActive = (appState.currentState ?? 'background') === 'active'
+    if (!initiallyActive) blockRefreshLifecycle()
+    const lease = controller.attach(initiallyActive, {
+      onBlocked: () => lifecycleBlocks.current.add('refresh'),
+      onFailure: failRefreshLifecycle,
+      onForegroundApplied: () => {
+        if (lifecycleBlocks.current.delete('refresh') && lifecycleBlocks.current.size === 0) {
+          restoreSession.current()
         }
-      } finally {
-        draining = false
-        if (
-          appliedRefresh !== desiredRefresh &&
-          (!transitionFailed || failedTarget !== desiredRefresh)
-        ) {
-          void drainTransitions()
-        }
-      }
-    }
-
-    const updateRefresh = (nextState: string) => {
+      },
+    })
+    const subscription = appState.addEventListener('change', (nextState) => {
       const shouldRefresh = nextState === 'active'
-      if (desiredRefresh === shouldRefresh && appliedRefresh === shouldRefresh) return
-      desiredRefresh = shouldRefresh
-      void drainTransitions()
-    }
-
-    updateRefresh(appState.currentState ?? 'background')
-    const subscription = appState.addEventListener('change', updateRefresh)
+      if (!shouldRefresh) blockRefreshLifecycle()
+      lease.update(shouldRefresh)
+    })
     return () => {
       mounted = false
       subscription.remove()
-      desiredRefresh = false
-      void drainTransitions()
+      blockRefreshLifecycle()
+      lease.release()
     }
   }, [appState, dataLifecycle, service])
 

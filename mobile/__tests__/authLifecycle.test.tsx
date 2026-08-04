@@ -42,8 +42,12 @@ class FakeAuthService implements AuthService {
   refreshRunning = false
   startGate: Promise<void> | null = null
   stopGate: Promise<void> | null = null
+  readonly startGates: Promise<void>[] = []
+  readonly stopGates: Promise<void>[] = []
   startFailures = 0
   stopFailures = 0
+  transitionsInFlight = 0
+  maxTransitionsInFlight = 0
 
   async getSession(): Promise<AuthSession | null> {
     if (this.sessionError) throw this.sessionError
@@ -62,22 +66,40 @@ class FakeAuthService implements AuthService {
 
   async startAutoRefresh(): Promise<void> {
     this.starts += 1
-    await (this.startGate ?? Promise.resolve())
-    if (this.startFailures > 0) {
-      this.startFailures -= 1
-      throw new Error('start refresh provider-secret')
+    this.transitionsInFlight += 1
+    this.maxTransitionsInFlight = Math.max(
+      this.maxTransitionsInFlight,
+      this.transitionsInFlight,
+    )
+    try {
+      await (this.startGates[this.starts - 1] ?? this.startGate ?? Promise.resolve())
+      if (this.startFailures > 0) {
+        this.startFailures -= 1
+        throw new Error('start refresh provider-secret')
+      }
+      this.refreshRunning = true
+    } finally {
+      this.transitionsInFlight -= 1
     }
-    this.refreshRunning = true
   }
 
   async stopAutoRefresh(): Promise<void> {
     this.stops += 1
-    await (this.stopGate ?? Promise.resolve())
-    if (this.stopFailures > 0) {
-      this.stopFailures -= 1
-      throw new Error('stop refresh provider-secret')
+    this.transitionsInFlight += 1
+    this.maxTransitionsInFlight = Math.max(
+      this.maxTransitionsInFlight,
+      this.transitionsInFlight,
+    )
+    try {
+      await (this.stopGates[this.stops - 1] ?? this.stopGate ?? Promise.resolve())
+      if (this.stopFailures > 0) {
+        this.stopFailures -= 1
+        throw new Error('stop refresh provider-secret')
+      }
+      this.refreshRunning = false
+    } finally {
+      this.transitionsInFlight -= 1
     }
-    this.refreshRunning = false
   }
 
   async signIn(): Promise<void> {}
@@ -97,20 +119,27 @@ class FakeDataLifecycle implements AuthDataLifecycle {
   readonly initializers = new Map<string, Promise<void>>()
   readonly clearers = new Map<string, Promise<void>>()
   readonly clearFailures = new Set<string>()
+  readonly retainedOwners = new Set<string>()
+  activeOwnerId: string | null = null
 
   async initialize(ownerId: string): Promise<void> {
     this.calls.push(`initialize:${ownerId}`)
     await (this.initializers.get(ownerId) ?? Promise.resolve())
+    this.retainedOwners.add(ownerId)
+    this.activeOwnerId = ownerId
   }
 
   deactivateOwner(): void {
     this.calls.push('deactivate')
+    this.activeOwnerId = null
   }
 
   async clearOwner(ownerId: string): Promise<void> {
     this.calls.push(`clear:${ownerId}`)
     await (this.clearers.get(ownerId) ?? Promise.resolve())
     if (this.clearFailures.has(ownerId)) throw new Error('clear failed: provider-secret')
+    this.retainedOwners.delete(ownerId)
+    if (this.activeOwnerId === ownerId) this.activeOwnerId = null
   }
 }
 
@@ -178,6 +207,7 @@ it('starts refresh only while active, stops in background, and cleans up on unmo
   unmount()
   await waitFor(() => expect(service.stops).toBe(2))
   expect(service.listeners.size).toBe(0)
+  expect(service.maxTransitionsInFlight).toBe(1)
 })
 
 it('finishes a delayed foreground start by stopping refresh when background wins the race', async () => {
@@ -194,13 +224,42 @@ it('finishes a delayed foreground start by stopping refresh when background wins
 
   await waitFor(() => expect(service.stops).toBe(1))
   expect(service.refreshRunning).toBe(false)
+  expect(service.maxTransitionsInFlight).toBe(1)
   unmount()
 })
 
-it('fails closed on foreground refresh rejection and retries truthfully on the next active event', async () => {
+it('deactivates owner access while a background stop is still pending', async () => {
+  let finishStop!: () => void
+  const service = new FakeAuthService()
+  service.session = verifiedSession('owner-a')
+  const { appState, dataLifecycle } = renderProvider(service)
+  await waitFor(() => expect(readState()).toMatchObject({ userId: 'owner-a', hydrated: true }))
+  service.stopGate = new Promise<void>((resolve) => {
+    finishStop = resolve
+  })
+
+  act(() => appState.emit('background'))
+  await waitFor(() => expect(service.stops).toBe(1))
+
+  expect(dataLifecycle.activeOwnerId).toBe(null)
+  expect(service.refreshRunning).toBe(true)
+
+  act(() => appState.emit('active'))
+  expect(service.starts).toBe(1)
+  service.stopGate = null
+  act(() => finishStop())
+  await waitFor(() => expect(service.starts).toBe(2))
+  await waitFor(() => expect(dataLifecycle.activeOwnerId).toBe('owner-a'))
+})
+
+it('fails closed on foreground refresh rejection and retries without another AppState event', async () => {
+  let finishRetry!: () => void
   const service = new FakeAuthService()
   service.session = verifiedSession('owner-a')
   service.startFailures = 1
+  service.startGates[1] = new Promise<void>((resolve) => {
+    finishRetry = resolve
+  })
   const { appState, dataLifecycle } = renderProvider(service)
 
   await waitFor(() =>
@@ -212,18 +271,23 @@ it('fails closed on foreground refresh rejection and retries truthfully on the n
   expect(dataLifecycle.calls.at(-1)).toBe('deactivate')
   expect(service.refreshRunning).toBe(false)
 
-  act(() => appState.emit('active'))
   await waitFor(() => expect(service.starts).toBe(2))
+  act(() => finishRetry())
   await waitFor(() => expect(readState()).toMatchObject({ userId: 'owner-a', hydrated: true }))
+  expect(appState.currentState).toBe('active')
 })
 
-it('does not mark a failed background stop applied and retries before restoring owner access', async () => {
+it('retries a failed background stop without another event and keeps owner access closed', async () => {
+  let finishRetry!: () => void
   const service = new FakeAuthService()
   service.session = verifiedSession('owner-a')
   const { appState, dataLifecycle } = renderProvider(service)
   await waitFor(() => expect(readState()).toMatchObject({ userId: 'owner-a', hydrated: true }))
   expect(service.refreshRunning).toBe(true)
   service.stopFailures = 1
+  service.stopGates[1] = new Promise<void>((resolve) => {
+    finishRetry = resolve
+  })
 
   act(() => appState.emit('background'))
   await waitFor(() =>
@@ -235,8 +299,11 @@ it('does not mark a failed background stop applied and retries before restoring 
   expect(service.refreshRunning).toBe(true)
   expect(dataLifecycle.calls.at(-1)).toBe('deactivate')
 
-  act(() => appState.emit('background'))
   await waitFor(() => expect(service.stops).toBe(2))
+  expect(readState().status).toBe('storageError')
+  expect(dataLifecycle.calls.at(-1)).toBe('deactivate')
+  act(() => finishRetry())
+  await waitFor(() => expect(service.refreshRunning).toBe(false))
   expect(service.refreshRunning).toBe(false)
   expect(readState().status).toBe('storageError')
 
@@ -257,11 +324,108 @@ it('reasserts foreground refresh when a stale background stop rejects after retu
   act(() => appState.emit('background'))
   await waitFor(() => expect(service.stops).toBe(1))
   act(() => appState.emit('active'))
+  service.stopGate = null
   rejectStop(new Error('stale background stop failed'))
 
+  await waitFor(() => expect(service.stops).toBe(2))
   await waitFor(() => expect(service.starts).toBe(2))
   await waitFor(() => expect(readState()).toMatchObject({ userId: 'owner-a', hydrated: true }))
   expect(service.refreshRunning).toBe(true)
+  expect(service.maxTransitionsInFlight).toBe(1)
+})
+
+it('finishes required stop retries before a newer foreground start without overlapping calls', async () => {
+  let finishSecondStop!: () => void
+  const service = new FakeAuthService()
+  service.session = verifiedSession('owner-a')
+  const { appState } = renderProvider(service)
+  await waitFor(() => expect(readState()).toMatchObject({ userId: 'owner-a', hydrated: true }))
+  service.stopFailures = 2
+  service.stopGates[1] = new Promise<void>((resolve) => {
+    finishSecondStop = resolve
+  })
+
+  act(() => appState.emit('background'))
+  await waitFor(() => expect(service.stops).toBe(2))
+  act(() => appState.emit('active'))
+  act(() => finishSecondStop())
+
+  await waitFor(() => expect(service.stops).toBe(3))
+  await waitFor(() => expect(service.starts).toBe(2))
+  await waitFor(() => expect(readState()).toMatchObject({ userId: 'owner-a', hydrated: true }))
+  expect(service.refreshRunning).toBe(true)
+  expect(service.maxTransitionsInFlight).toBe(1)
+})
+
+it('retries a failed unmount stop without another lifecycle event', async () => {
+  const service = new FakeAuthService()
+  const { unmount } = renderProvider(service)
+  await waitFor(() => expect(service.starts).toBe(1))
+  service.stopFailures = 1
+
+  unmount()
+
+  await waitFor(() => expect(service.stops).toBe(2))
+  expect(service.refreshRunning).toBe(false)
+  expect(service.maxTransitionsInFlight).toBe(1)
+})
+
+it('bounds unmount failures and resumes the required stop before starting after remount', async () => {
+  let finishRemountStop!: () => void
+  const service = new FakeAuthService()
+  service.session = verifiedSession('owner-a')
+  service.stopFailures = 3
+  service.stopGates[3] = new Promise<void>((resolve) => {
+    finishRemountStop = resolve
+  })
+  const dataLifecycle = new FakeDataLifecycle()
+  const appState = new FakeAppState()
+  const first = renderProvider(service, dataLifecycle, appState)
+  await waitFor(() => expect(readState()).toMatchObject({ userId: 'owner-a', hydrated: true }))
+
+  first.unmount()
+  await waitFor(() => expect(service.stops).toBe(3))
+  await new Promise((resolve) => setTimeout(resolve, 60))
+  expect(service.stops).toBe(3)
+  expect(dataLifecycle.activeOwnerId).toBe(null)
+
+  const second = renderProvider(service, dataLifecycle, appState)
+  await waitFor(() => expect(service.stops).toBe(4))
+  expect(service.starts).toBe(1)
+  expect(dataLifecycle.activeOwnerId).toBe(null)
+
+  act(() => finishRemountStop())
+  await waitFor(() => expect(service.starts).toBe(2))
+  await waitFor(() => expect(readState()).toMatchObject({ userId: 'owner-a', hydrated: true }))
+  expect(service.maxTransitionsInFlight).toBe(1)
+  second.unmount()
+})
+
+it('keeps a remount closed while the previous unmount stop remains pending', async () => {
+  let finishUnmountStop!: () => void
+  const service = new FakeAuthService()
+  service.session = verifiedSession('owner-a')
+  const dataLifecycle = new FakeDataLifecycle()
+  const appState = new FakeAppState()
+  const first = renderProvider(service, dataLifecycle, appState)
+  await waitFor(() => expect(readState()).toMatchObject({ userId: 'owner-a', hydrated: true }))
+  service.stopGate = new Promise<void>((resolve) => {
+    finishUnmountStop = resolve
+  })
+
+  first.unmount()
+  await waitFor(() => expect(service.stops).toBe(1))
+  const second = renderProvider(service, dataLifecycle, appState)
+  await act(async () => Promise.resolve())
+
+  expect(dataLifecycle.activeOwnerId).toBe(null)
+  expect(service.starts).toBe(1)
+
+  service.stopGate = null
+  act(() => finishUnmountStop())
+  await waitFor(() => expect(service.starts).toBe(2))
+  await waitFor(() => expect(readState()).toMatchObject({ userId: 'owner-a', hydrated: true }))
+  second.unmount()
 })
 
 it('invalidates and clears the signed-out owner before exposing signed-out state', async () => {
@@ -299,6 +463,98 @@ it('awaits an outstanding owner clear before the same verified owner can hydrate
   await waitFor(() => expect(readState()).toMatchObject({ userId: 'owner-a', hydrated: true }))
   expect(dataLifecycle.calls.filter((call) => call === 'initialize:owner-a')).toHaveLength(2)
   rendered.unmount()
+})
+
+it('drains owner A clear before B can hydrate after an intervening signed-out callback', async () => {
+  let finishClear!: () => void
+  const pendingClear = new Promise<void>((resolve) => {
+    finishClear = resolve
+  })
+  const service = new FakeAuthService()
+  service.session = verifiedSession('owner-a')
+  const dataLifecycle = new FakeDataLifecycle()
+  renderProvider(service, dataLifecycle)
+  await waitFor(() => expect(readState()).toMatchObject({ userId: 'owner-a', hydrated: true }))
+  dataLifecycle.clearers.set('owner-a', pendingClear)
+
+  act(() => service.emit(null))
+  await waitFor(() => expect(dataLifecycle.calls).toContain('clear:owner-a'))
+  act(() => service.emit(verifiedSession('owner-b')))
+  await waitFor(() => expect(readState()).toMatchObject({ userId: 'owner-b', hydrated: false }))
+  await act(async () => Promise.resolve())
+
+  expect(dataLifecycle.calls.filter((call) => call === 'initialize:owner-b')).toHaveLength(0)
+  expect(dataLifecycle.retainedOwners.has('owner-a')).toBe(true)
+
+  act(() => finishClear())
+  await waitFor(() => expect(readState()).toMatchObject({ userId: 'owner-b', hydrated: true }))
+  expect(dataLifecycle.retainedOwners.has('owner-a')).toBe(false)
+})
+
+it('does not let repeated B callbacks bypass a failed owner A clear', async () => {
+  const service = new FakeAuthService()
+  service.session = verifiedSession('owner-a')
+  const dataLifecycle = new FakeDataLifecycle()
+  renderProvider(service, dataLifecycle)
+  await waitFor(() => expect(readState()).toMatchObject({ userId: 'owner-a', hydrated: true }))
+  dataLifecycle.clearFailures.add('owner-a')
+
+  act(() => service.emit(null))
+  await waitFor(() => expect(readState().status).toBe('storageError'))
+  act(() => service.emit(verifiedSession('owner-b')))
+  await waitFor(() => expect(readState().status).toBe('storageError'))
+  act(() => service.emit(verifiedSession('owner-b')))
+  await waitFor(() =>
+    expect(dataLifecycle.calls.filter((call) => call === 'clear:owner-a')).toHaveLength(3),
+  )
+
+  expect(dataLifecycle.calls.filter((call) => call === 'initialize:owner-b')).toHaveLength(0)
+  expect(dataLifecycle.retainedOwners.has('owner-a')).toBe(true)
+
+  dataLifecycle.clearFailures.delete('owner-a')
+  act(() => service.emit(verifiedSession('owner-b')))
+  await waitFor(() => expect(readState()).toMatchObject({ userId: 'owner-b', hydrated: true }))
+  expect(dataLifecycle.retainedOwners.has('owner-a')).toBe(false)
+})
+
+it('fails a direct A-to-B switch closed until owner A clearing succeeds', async () => {
+  const service = new FakeAuthService()
+  service.session = verifiedSession('owner-a')
+  const dataLifecycle = new FakeDataLifecycle()
+  renderProvider(service, dataLifecycle)
+  await waitFor(() => expect(readState()).toMatchObject({ userId: 'owner-a', hydrated: true }))
+  dataLifecycle.clearFailures.add('owner-a')
+
+  act(() => service.emit(verifiedSession('owner-b')))
+  await waitFor(() => expect(readState().status).toBe('storageError'))
+  expect(dataLifecycle.calls.filter((call) => call === 'initialize:owner-b')).toHaveLength(0)
+  expect(dataLifecycle.retainedOwners.has('owner-a')).toBe(true)
+
+  dataLifecycle.clearFailures.delete('owner-a')
+  act(() => service.emit(verifiedSession('owner-b')))
+  await waitFor(() => expect(readState()).toMatchObject({ userId: 'owner-b', hydrated: true }))
+  expect(dataLifecycle.retainedOwners.has('owner-a')).toBe(false)
+})
+
+it('retries every unresolved prior-owner clear after provider remount before B hydration', async () => {
+  const service = new FakeAuthService()
+  service.session = verifiedSession('owner-a')
+  const dataLifecycle = new FakeDataLifecycle()
+  const first = renderProvider(service, dataLifecycle)
+  await waitFor(() => expect(readState()).toMatchObject({ userId: 'owner-a', hydrated: true }))
+  dataLifecycle.clearFailures.add('owner-a')
+
+  act(() => service.emit(verifiedSession('owner-b')))
+  await waitFor(() => expect(readState().status).toBe('storageError'))
+  first.unmount()
+  dataLifecycle.clearFailures.delete('owner-a')
+  service.session = verifiedSession('owner-b')
+
+  const second = renderProvider(service, dataLifecycle)
+  await waitFor(() => expect(readState()).toMatchObject({ userId: 'owner-b', hydrated: true }))
+  expect(dataLifecycle.calls.filter((call) => call === 'clear:owner-a')).toHaveLength(2)
+  expect(dataLifecycle.retainedOwners.has('owner-a')).toBe(false)
+  second.unmount()
 })
 
 it('retains an outstanding owner-clear gate across provider remount', async () => {
