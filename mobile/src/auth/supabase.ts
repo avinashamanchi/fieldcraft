@@ -12,6 +12,8 @@ import { secureStoreAuthStorage } from './secureStoreAuthStorage'
 const CONFIGURATION_ERROR_MESSAGE = 'FieldCraft authentication is not configured.'
 const EXAMPLE_URL = 'https://your-project-id.supabase.co'
 const EXAMPLE_KEY = 'your-anon-key-here'
+const MODERN_PUBLISHABLE_KEY = /^sb_publishable_[A-Za-z0-9_-]+$/
+const JWT_SEGMENT = /^[A-Za-z0-9_-]+$/
 
 export class SupabaseConfigurationError extends Error {
   constructor() {
@@ -37,10 +39,41 @@ type CreateConfiguredSupabaseClientOptions = {
   storage?: typeof secureStoreAuthStorage
 }
 
+const decodeJwtObject = (segment: string): Record<string, unknown> | null => {
+  if (!JWT_SEGMENT.test(segment) || segment.length % 4 === 1) return null
+  try {
+    const base64 = segment.replace(/-/g, '+').replace(/_/g, '/')
+    const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, '=')
+    const parsed: unknown = JSON.parse(globalThis.atob(padded))
+    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null
+  } catch {
+    return null
+  }
+}
+
+const isAllowedPublishableKey = (key: string): boolean => {
+  if (MODERN_PUBLISHABLE_KEY.test(key)) return true
+  const segments = key.split('.')
+  if (segments.length !== 3 || segments.some((segment) => !JWT_SEGMENT.test(segment))) {
+    return false
+  }
+  const header = decodeJwtObject(segments[0])
+  const payload = decodeJwtObject(segments[1])
+  return header?.typ === 'JWT' && typeof header.alg === 'string' && payload?.role === 'anon'
+}
+
 const readConfiguration = (env: SupabaseEnvironment): { url: string; key: string } => {
   const url = env.EXPO_PUBLIC_SUPABASE_URL?.trim()
   const key = env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY?.trim()
-  if (!url || !key || url === EXAMPLE_URL || key === EXAMPLE_KEY) {
+  if (
+    !url ||
+    !key ||
+    url === EXAMPLE_URL ||
+    key === EXAMPLE_KEY ||
+    !isAllowedPublishableKey(key)
+  ) {
     throw new SupabaseConfigurationError()
   }
   try {

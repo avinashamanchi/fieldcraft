@@ -1,6 +1,12 @@
 jest.mock('expo-crypto', () => ({
   CryptoDigestAlgorithm: { SHA256: 'SHA-256' },
-  digestStringAsync: async () => 'non-sensitive-fingerprint',
+  digestStringAsync: async (_algorithm: string, value: string) => {
+    let hash = 0
+    for (let index = 0; index < value.length; index += 1) {
+      hash = (hash * 31 + value.charCodeAt(index)) >>> 0
+    }
+    return `fingerprint-${hash}`
+  },
 }))
 
 import {
@@ -96,4 +102,71 @@ it('redacts provider failures and clears recovery tokens even when processing fa
   })
   expect(failure).not.toHaveProperty('cause')
   expect(replace).toHaveBeenCalledWith('/(auth)/reset-password')
+})
+
+it.each([
+  ['fieldcraft://auth/callback?code=one&code=two', '/(auth)/login'],
+  [
+    'fieldcraft://auth/verify?token_hash=sensitive-token&type=recovery',
+    '/(auth)/verify-email',
+  ],
+  [
+    'fieldcraft://auth/reset?token_hash=sensitive-token&type=recovery&extra=value',
+    '/(auth)/reset-password',
+  ],
+  [
+    'fieldcraft://auth/reset?token_hash=sensitive-token&type=recovery#access_token=fragment-token',
+    '/(auth)/reset-password',
+  ],
+] as const)('sanitizes recognized malformed auth navigation for %s', async (url, safeRoute) => {
+  const replace = jest.fn()
+  const processor = createAuthDeepLinkProcessor({
+    exchangeCode: jest.fn(),
+    verifySignup: jest.fn(),
+    recoverPassword: jest.fn(),
+    replace,
+  })
+
+  await expect(processor.handle(url)).rejects.toBeInstanceOf(AuthDeepLinkError)
+  expect(replace).toHaveBeenCalledWith(safeRoute)
+  expect(JSON.stringify(replace.mock.calls)).not.toContain('sensitive-token')
+})
+
+it('cancels navigation effects while preserving process-wide pending deduplication', async () => {
+  let release!: () => void
+  const pending = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const firstVerify = jest.fn(async () => pending)
+  const firstReplace = jest.fn()
+  const first = createAuthDeepLinkProcessor({
+    exchangeCode: jest.fn(),
+    verifySignup: firstVerify,
+    recoverPassword: jest.fn(),
+    replace: firstReplace,
+  })
+  const url = 'fieldcraft://auth/verify?token_hash=remounted-link-token&type=signup'
+  const firstHandling = first.handle(url)
+  await Promise.resolve()
+  first.cancel()
+
+  const secondVerify = jest.fn()
+  const secondReplace = jest.fn()
+  const second = createAuthDeepLinkProcessor({
+    exchangeCode: jest.fn(),
+    verifySignup: secondVerify,
+    recoverPassword: jest.fn(),
+    replace: secondReplace,
+  })
+  const secondHandling = second.handle(url)
+  release()
+
+  await expect(Promise.all([firstHandling, secondHandling])).resolves.toEqual([
+    'processed',
+    'duplicate',
+  ])
+  expect(firstVerify).toHaveBeenCalledTimes(1)
+  expect(secondVerify).not.toHaveBeenCalled()
+  expect(firstReplace).not.toHaveBeenCalled()
+  expect(secondReplace).toHaveBeenCalledWith('/(auth)/verify-email')
 })

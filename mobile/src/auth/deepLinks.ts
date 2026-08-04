@@ -2,6 +2,7 @@ import * as Crypto from 'expo-crypto'
 
 const LINK_ERROR_MESSAGE = 'This authentication link could not be completed.'
 const MAX_TOKEN_LENGTH = 4_096
+const MAX_DEDUPE_ENTRIES = 64
 
 export type SafeAuthRoute =
   | '/(auth)/login'
@@ -24,9 +25,8 @@ export type AuthDeepLink =
     }
 
 export class AuthDeepLinkError extends Error {
-  constructor(_cause?: unknown) {
+  constructor() {
     super(LINK_ERROR_MESSAGE)
-    void _cause
     this.name = 'AuthDeepLinkError'
   }
 }
@@ -53,23 +53,39 @@ const requireExactParameters = (
   return values
 }
 
-export const parseAuthDeepLink = (input: string): AuthDeepLink => {
+const readAuthUrl = (input: string): URL => {
+  try {
+    return new URL(input)
+  } catch {
+    throw new AuthDeepLinkError()
+  }
+}
+
+const isExactAuthOrigin = (url: URL): boolean =>
+  url.protocol === 'fieldcraft:' &&
+  url.hostname === 'auth' &&
+  url.username === '' &&
+  url.password === '' &&
+  url.port === '' &&
+  url.hash === ''
+
+const recognizedSafeRoute = (input: string): SafeAuthRoute | null => {
   let url: URL
   try {
     url = new URL(input)
-  } catch (error) {
-    throw new AuthDeepLinkError(error)
+  } catch {
+    return null
   }
-  if (
-    url.protocol !== 'fieldcraft:' ||
-    url.hostname !== 'auth' ||
-    url.username !== '' ||
-    url.password !== '' ||
-    url.port !== '' ||
-    url.hash !== ''
-  ) {
-    throw new AuthDeepLinkError()
-  }
+  if (url.protocol !== 'fieldcraft:' || url.hostname !== 'auth') return null
+  if (url.pathname === '/callback') return '/(auth)/login'
+  if (url.pathname === '/verify') return '/(auth)/verify-email'
+  if (url.pathname === '/reset') return '/(auth)/reset-password'
+  return null
+}
+
+export const parseAuthDeepLink = (input: string): AuthDeepLink => {
+  const url = readAuthUrl(input)
+  if (!isExactAuthOrigin(url)) throw new AuthDeepLinkError()
 
   if (url.pathname === '/callback') {
     const { code } = requireExactParameters(url, ['code'])
@@ -97,54 +113,68 @@ export type AuthDeepLinkProcessorDependencies = {
 
 export type AuthDeepLinkProcessor = {
   handle(url: string): Promise<'processed' | 'duplicate'>
+  cancel(): void
+}
+
+const sharedPending = new Map<string, Promise<void>>()
+const sharedCompleted = new Set<string>()
+const sharedCompletionOrder: string[] = []
+
+const rememberCompletion = (fingerprint: string): void => {
+  if (sharedCompleted.has(fingerprint)) return
+  sharedCompleted.add(fingerprint)
+  sharedCompletionOrder.push(fingerprint)
+  if (sharedCompletionOrder.length > MAX_DEDUPE_ENTRIES) {
+    const oldest = sharedCompletionOrder.shift()
+    if (oldest) sharedCompleted.delete(oldest)
+  }
 }
 
 export const createAuthDeepLinkProcessor = (
   dependencies: AuthDeepLinkProcessorDependencies,
 ): AuthDeepLinkProcessor => {
-  const pending = new Map<string, Promise<void>>()
-  const completed = new Set<string>()
-  const completionOrder: string[] = []
+  let active = true
 
   return {
+    cancel() {
+      active = false
+    },
+
     async handle(input) {
-      const link = parseAuthDeepLink(input)
+      const safeRoute = recognizedSafeRoute(input)
       try {
+        const link = parseAuthDeepLink(input)
         const sensitiveValue = link.kind === 'callback' ? link.code : link.tokenHash
         const fingerprint = await Crypto.digestStringAsync(
           Crypto.CryptoDigestAlgorithm.SHA256,
           `${link.kind}:${sensitiveValue}`,
         )
-        if (completed.has(fingerprint)) return 'duplicate'
-        const existing = pending.get(fingerprint)
-        if (existing) {
-          await existing
-          return 'duplicate'
+        if (sharedCompleted.has(fingerprint)) return 'duplicate'
+
+        let operation = sharedPending.get(fingerprint)
+        let ownsOperation = false
+        if (!operation) {
+          if (sharedPending.size >= MAX_DEDUPE_ENTRIES) throw new AuthDeepLinkError()
+          ownsOperation = true
+          operation = (async () => {
+            if (link.kind === 'callback') await dependencies.exchangeCode(link.code)
+            else if (link.kind === 'verify') await dependencies.verifySignup(link.tokenHash)
+            else await dependencies.recoverPassword(link.tokenHash)
+          })()
+          sharedPending.set(fingerprint, operation)
         }
 
-        const operation = (async () => {
-          if (link.kind === 'callback') await dependencies.exchangeCode(link.code)
-          else if (link.kind === 'verify') await dependencies.verifySignup(link.tokenHash)
-          else await dependencies.recoverPassword(link.tokenHash)
-        })()
-        pending.set(fingerprint, operation)
         try {
           await operation
-          completed.add(fingerprint)
-          completionOrder.push(fingerprint)
-          if (completionOrder.length > 64) {
-            const oldest = completionOrder.shift()
-            if (oldest) completed.delete(oldest)
-          }
-          return 'processed'
+          if (ownsOperation) rememberCompletion(fingerprint)
+          return ownsOperation ? 'processed' : 'duplicate'
         } finally {
-          pending.delete(fingerprint)
+          if (ownsOperation) sharedPending.delete(fingerprint)
         }
-      } catch (error) {
-        if (error instanceof AuthDeepLinkError) throw error
-        throw new AuthDeepLinkError(error)
+      } catch {
+        throw new AuthDeepLinkError()
       } finally {
-        dependencies.replace(link.safeRoute)
+        if (active && safeRoute) dependencies.replace(safeRoute)
       }
     },
   }

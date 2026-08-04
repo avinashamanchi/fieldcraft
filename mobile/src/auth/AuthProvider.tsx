@@ -4,6 +4,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from 'react'
 import { AppState } from 'react-native'
@@ -47,10 +48,27 @@ type AuthProviderProps = PropsWithChildren<{
   replaceRoute?: (route: SafeAuthRoute) => void
 }>
 
+type LifecycleBlock = 'refresh' | 'subscription'
+type OwnerClear = {
+  status: 'pending' | 'failed'
+  promise: Promise<void>
+}
+
+const ownerClearRegistries = new WeakMap<object, Map<string, OwnerClear>>()
+
+const getOwnerClearRegistry = (dataLifecycle: AuthDataLifecycle): Map<string, OwnerClear> => {
+  const existing = ownerClearRegistries.get(dataLifecycle)
+  if (existing) return existing
+  const created = new Map<string, OwnerClear>()
+  ownerClearRegistries.set(dataLifecycle, created)
+  return created
+}
+
 const AuthContext = createContext<AuthState | null>(null)
 
 const STORAGE_MESSAGE = 'Secure authentication storage is unavailable.'
 const LOCAL_DATA_MESSAGE = 'Local data could not be prepared securely.'
+const SESSION_LIFECYCLE_MESSAGE = 'Authentication session lifecycle is unavailable.'
 const defaultReplaceRoute = (route: SafeAuthRoute) => router.replace(route)
 
 export const AuthProvider = ({
@@ -63,6 +81,9 @@ export const AuthProvider = ({
 }: AuthProviderProps) => {
   const [state, setState] = useState<AuthState>({ status: 'initializing' })
   const service = useMemo(() => suppliedService ?? getAuthService(), [suppliedService])
+  const lifecycleBlocks = useRef(new Set<LifecycleBlock>())
+  const restoreSession = useRef<() => void>(() => {})
+  const invalidateSession = useRef<() => void>(() => dataLifecycle.deactivateOwner())
 
   useEffect(() => {
     let disposed = false
@@ -70,23 +91,73 @@ export const AuthProvider = ({
     let targetOwnerId: string | null = null
     let activeOwnerId = dataLifecycle.ownerBoundary?.getSnapshot().ownerId ?? null
     let callbackVersion = 0
+    const ownerClears = getOwnerClearRegistry(dataLifecycle)
 
     dataLifecycle.deactivateOwner()
+    invalidateSession.current = () => {
+      generation += 1
+      targetOwnerId = null
+      activeOwnerId = null
+      dataLifecycle.deactivateOwner()
+    }
 
     const showStorageError = (message: string) => {
       if (!disposed) setState({ status: 'storageError', message })
     }
 
+    const startOwnerClear = (ownerId: string, retryFailed: boolean): Promise<void> => {
+      const existing = ownerClears.get(ownerId)
+      if (existing && (existing.status === 'pending' || !retryFailed)) return existing.promise
+
+      const record: OwnerClear = { status: 'pending', promise: Promise.resolve() }
+      const clearing = Promise.resolve()
+        .then(() => dataLifecycle.clearOwner(ownerId))
+        .then(() => {
+          if (ownerClears.get(ownerId) === record) ownerClears.delete(ownerId)
+        })
+        .catch(() => {
+          record.status = 'failed'
+          throw new Error(LOCAL_DATA_MESSAGE)
+        })
+      record.promise = clearing
+      ownerClears.set(ownerId, record)
+      return clearing
+    }
+
+    const failOwnerLifecycle = (currentGeneration: number) => {
+      if (currentGeneration !== generation) return
+      targetOwnerId = null
+      activeOwnerId = null
+      dataLifecycle.deactivateOwner()
+      showStorageError(LOCAL_DATA_MESSAGE)
+    }
+
     const clearPreviousOwner = async (ownerId: string, currentGeneration: number) => {
       try {
-        await dataLifecycle.clearOwner(ownerId)
+        await startOwnerClear(ownerId, true)
       } catch {
-        if (!disposed && currentGeneration === generation) showStorageError(LOCAL_DATA_MESSAGE)
+        failOwnerLifecycle(currentGeneration)
         throw new Error(LOCAL_DATA_MESSAGE)
       }
     }
 
+    const awaitOwnerClear = async (ownerId: string, currentGeneration: number): Promise<boolean> => {
+      const existing = ownerClears.get(ownerId)
+      if (!existing) return true
+      try {
+        await startOwnerClear(ownerId, existing.status === 'failed')
+        return currentGeneration === generation
+      } catch {
+        failOwnerLifecycle(currentGeneration)
+        return false
+      }
+    }
+
     const reconcile = async (session: AuthSession | null) => {
+      if (lifecycleBlocks.current.size > 0) {
+        dataLifecycle.deactivateOwner()
+        return
+      }
       const currentGeneration = ++generation
       const user = session?.user
 
@@ -106,7 +177,7 @@ export const AuthProvider = ({
           try {
             await clearPreviousOwner(previousOwnerId, currentGeneration)
           } catch {
-            // clearPreviousOwner already put the provider in a fail-closed state.
+            // clearPreviousOwner already left the provider fail-closed.
           }
         }
         return
@@ -128,7 +199,15 @@ export const AuthProvider = ({
           return
         }
       }
-      if (disposed || currentGeneration !== generation || targetOwnerId !== user.id) return
+      if (!(await awaitOwnerClear(user.id, currentGeneration))) return
+      if (
+        disposed ||
+        lifecycleBlocks.current.size > 0 ||
+        currentGeneration !== generation ||
+        targetOwnerId !== user.id
+      ) {
+        return
+      }
 
       try {
         await dataLifecycle.initialize(user.id)
@@ -140,7 +219,14 @@ export const AuthProvider = ({
         }
         return
       }
-      if (disposed || currentGeneration !== generation || targetOwnerId !== user.id) return
+      if (
+        disposed ||
+        lifecycleBlocks.current.size > 0 ||
+        currentGeneration !== generation ||
+        targetOwnerId !== user.id
+      ) {
+        return
+      }
       activeOwnerId = user.id
       setState({ status: 'signedIn', userId: user.id, email: user.email, hydrated: true })
     }
@@ -151,29 +237,50 @@ export const AuthProvider = ({
         callbackVersion += 1
         void reconcile(session)
       })
+      lifecycleBlocks.current.delete('subscription')
     } catch {
+      lifecycleBlocks.current.add('subscription')
+      dataLifecycle.deactivateOwner()
       showStorageError(STORAGE_MESSAGE)
+      restoreSession.current = () => {}
+      return () => {
+        disposed = true
+        generation += 1
+        dataLifecycle.deactivateOwner()
+      }
     }
 
-    const versionBeforeInitialSession = callbackVersion
-    void service
-      .getSession()
-      .then((session) => {
-        if (!disposed && callbackVersion === versionBeforeInitialSession) return reconcile(session)
-      })
-      .catch(() => {
-        if (!disposed && callbackVersion === versionBeforeInitialSession) {
-          generation += 1
-          targetOwnerId = null
-          activeOwnerId = null
-          dataLifecycle.deactivateOwner()
-          showStorageError(STORAGE_MESSAGE)
-        }
-      })
+    const restore = () => {
+      const versionBeforeSession = callbackVersion
+      void service
+        .getSession()
+        .then((session) => {
+          if (
+            !disposed &&
+            lifecycleBlocks.current.size === 0 &&
+            callbackVersion === versionBeforeSession
+          ) {
+            return reconcile(session)
+          }
+        })
+        .catch(() => {
+          if (!disposed && callbackVersion === versionBeforeSession) {
+            generation += 1
+            targetOwnerId = null
+            activeOwnerId = null
+            dataLifecycle.deactivateOwner()
+            showStorageError(STORAGE_MESSAGE)
+          }
+        })
+    }
+    restoreSession.current = restore
+    restore()
 
     return () => {
       disposed = true
       generation += 1
+      restoreSession.current = () => {}
+      invalidateSession.current = () => dataLifecycle.deactivateOwner()
       unsubscribe()
       dataLifecycle.deactivateOwner()
     }
@@ -183,10 +290,19 @@ export const AuthProvider = ({
     let desiredRefresh = false
     let appliedRefresh: boolean | null = null
     let draining = false
+    let mounted = true
+
+    const failRefreshLifecycle = () => {
+      lifecycleBlocks.current.add('refresh')
+      invalidateSession.current()
+      if (mounted) setState({ status: 'storageError', message: SESSION_LIFECYCLE_MESSAGE })
+    }
 
     const drainTransitions = async () => {
       if (draining) return
       draining = true
+      let transitionFailed = false
+      let failedTarget: boolean | null = null
       try {
         while (appliedRefresh !== desiredRefresh) {
           const nextRefresh = desiredRefresh
@@ -194,19 +310,31 @@ export const AuthProvider = ({
             if (nextRefresh) await service.startAutoRefresh()
             else await service.stopAutoRefresh()
           } catch {
-            // Auth state callbacks surface session failures without provider details.
+            transitionFailed = true
+            failedTarget = nextRefresh
+            appliedRefresh = null
+            failRefreshLifecycle()
+            break
           }
           appliedRefresh = nextRefresh
+          if (nextRefresh && lifecycleBlocks.current.delete('refresh')) {
+            if (lifecycleBlocks.current.size === 0) restoreSession.current()
+          }
         }
       } finally {
         draining = false
-        if (appliedRefresh !== desiredRefresh) void drainTransitions()
+        if (
+          appliedRefresh !== desiredRefresh &&
+          (!transitionFailed || failedTarget !== desiredRefresh)
+        ) {
+          void drainTransitions()
+        }
       }
     }
 
     const updateRefresh = (nextState: string) => {
       const shouldRefresh = nextState === 'active'
-      if (desiredRefresh === shouldRefresh && appliedRefresh !== null) return
+      if (desiredRefresh === shouldRefresh && appliedRefresh === shouldRefresh) return
       desiredRefresh = shouldRefresh
       void drainTransitions()
     }
@@ -214,11 +342,12 @@ export const AuthProvider = ({
     updateRefresh(appState.currentState ?? 'background')
     const subscription = appState.addEventListener('change', updateRefresh)
     return () => {
+      mounted = false
       subscription.remove()
       desiredRefresh = false
       void drainTransitions()
     }
-  }, [appState, service])
+  }, [appState, dataLifecycle, service])
 
   useEffect(() => {
     const processor = createAuthDeepLinkProcessor({
@@ -237,6 +366,7 @@ export const AuthProvider = ({
     const subscription = linking.addEventListener('url', ({ url }) => handle(url))
     return () => {
       disposed = true
+      processor.cancel()
       subscription.remove()
     }
   }, [linking, replaceRoute, service])
