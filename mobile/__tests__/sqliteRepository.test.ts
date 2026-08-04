@@ -5,6 +5,7 @@ jest.mock('expo-crypto', () => ({
 }))
 
 import {
+  __failNextOutboxAcknowledge,
   __failNextOutboxInsert,
   __failNextMigration,
   __getRawDatabase,
@@ -146,6 +147,193 @@ it('rejects a non-UUID mutation id before writing cache state', async () => {
 
   await expect(repository.transactLocalMutation(mutation({ id: 'not-a-uuid' }))).rejects.toThrow()
   await expect(repository.get('client', 'client-1')).resolves.toBeNull()
+})
+
+it('atomically applies canonical rows before completing an acknowledged mutation', async () => {
+  const repository = new SQLiteFieldCraftRepository({ databaseName: 'acknowledge.db' })
+  await repository.initialize(OWNER)
+  await repository.transactLocalMutation(mutation())
+
+  await repository.acknowledgeMutation(OWNER, MUTATION_ONE, [{
+    ownerId: OWNER,
+    entity: 'client',
+    entityId: 'client-1',
+    payload: client({ version: 2, updatedAt: '2026-08-03T10:00:02.000Z', syncState: 'current' }),
+    version: 2,
+    updatedAt: '2026-08-03T10:00:02.000Z',
+  }])
+
+  await expect(repository.get('client', 'client-1')).resolves.toMatchObject({
+    version: 2,
+    syncState: 'current',
+  })
+  await expect(repository.outbox.list(OWNER)).resolves.toEqual([])
+  expect(__getRawDatabase('acknowledge.db').outbox).toEqual([
+    expect.objectContaining({ mutation_id: MUTATION_ONE, state: 'complete' }),
+  ])
+})
+
+it('rolls back canonical rows when durable acknowledgement fails', async () => {
+  const repository = new SQLiteFieldCraftRepository({ databaseName: 'acknowledge-rollback.db' })
+  await repository.initialize(OWNER)
+  await repository.transactLocalMutation(mutation())
+  __failNextOutboxAcknowledge('acknowledge-rollback.db')
+
+  await expect(repository.acknowledgeMutation(OWNER, MUTATION_ONE, [{
+    ownerId: OWNER,
+    entity: 'client',
+    entityId: 'client-1',
+    payload: client({ version: 2, updatedAt: '2026-08-03T10:00:02.000Z', syncState: 'current' }),
+    version: 2,
+    updatedAt: '2026-08-03T10:00:02.000Z',
+  }])).rejects.toThrow(/acknowledgement/i)
+
+  await expect(repository.get('client', 'client-1')).resolves.toMatchObject({
+    version: 1,
+    syncState: 'pending',
+  })
+  await expect(repository.outbox.list(OWNER)).resolves.toHaveLength(1)
+})
+
+it('commits pulled rows and the global cursor in one owner-scoped transaction', async () => {
+  const repository = new SQLiteFieldCraftRepository({ databaseName: 'pull-cursor.db' })
+  await repository.initialize(OWNER)
+
+  await repository.commitPull(OWNER, [{
+    ownerId: OWNER,
+    entity: 'client',
+    entityId: 'client-1',
+    payload: client({ version: 2, updatedAt: '2026-08-03T10:00:02.000Z', syncState: 'current' }),
+    version: 2,
+    updatedAt: '2026-08-03T10:00:02.000Z',
+  }], 'cursor-two')
+
+  await expect(repository.getSyncCursor(OWNER)).resolves.toBe('cursor-two')
+  await expect(repository.get('client', 'client-1')).resolves.toMatchObject({ version: 2 })
+})
+
+it('retains failed work while only transient and reauthentication failures remain sendable', async () => {
+  const repository = new SQLiteFieldCraftRepository({ databaseName: 'failure-state.db' })
+  await repository.initialize(OWNER)
+  await repository.transactLocalMutation(mutation())
+
+  await repository.recordMutationFailure(OWNER, MUTATION_ONE, 'transient')
+  await expect(repository.outbox.list(OWNER)).resolves.toEqual([
+    expect.objectContaining({ id: MUTATION_ONE, attempts: 1 }),
+  ])
+
+  await repository.recordMutationFailure(OWNER, MUTATION_ONE, 'validation')
+  await expect(repository.outbox.list(OWNER)).resolves.toEqual([])
+  expect(__getRawDatabase('failure-state.db').outbox).toEqual([
+    expect.objectContaining({
+      mutation_id: MUTATION_ONE,
+      attempts: 2,
+      state: 'failed',
+      last_error: 'validation',
+    }),
+  ])
+})
+
+it('atomically records a conflict and removes it from the sendable FIFO', async () => {
+  const repository = new SQLiteFieldCraftRepository({ databaseName: 'record-conflict.db' })
+  await repository.initialize(OWNER)
+  await repository.transactLocalMutation(mutation({
+    kind: 'update',
+    baseVersion: 1,
+    payload: client({ version: 1 }),
+  }))
+  const record = {
+    mutationId: MUTATION_ONE,
+    mutationKind: 'update' as const,
+    entity: 'client' as const,
+    entityId: 'client-1',
+    localPayload: client({ version: 1, syncState: 'conflict' }),
+    cloudPayload: client({
+      version: 3,
+      updatedAt: '2026-08-03T10:00:03.000Z',
+      syncState: 'current',
+      name: 'Cloud',
+    }),
+    cloudVersion: 3,
+  }
+
+  await repository.recordMutationConflict(OWNER, record)
+
+  await expect(repository.outbox.list(OWNER)).resolves.toEqual([])
+  await expect(repository.countConflicts(OWNER)).resolves.toBe(1)
+  await expect(repository.getConflict(MUTATION_ONE)).resolves.toEqual(record)
+  expect(__getRawDatabase('record-conflict.db').outbox[0]).toMatchObject({ state: 'conflict' })
+})
+
+it('keeps cloud by applying the preserved canonical value before resolving the original', async () => {
+  const repository = new SQLiteFieldCraftRepository({ databaseName: 'keep-cloud.db' })
+  await repository.initialize(OWNER)
+  await repository.transactLocalMutation(mutation({ kind: 'update', baseVersion: 1 }))
+  await repository.recordMutationConflict(OWNER, {
+    mutationId: MUTATION_ONE,
+    mutationKind: 'update',
+    entity: 'client',
+    entityId: 'client-1',
+    localPayload: client({ syncState: 'conflict' }),
+    cloudPayload: client({
+      version: 3,
+      updatedAt: '2026-08-03T10:00:03.000Z',
+      syncState: 'current',
+      name: 'Cloud wins',
+    }),
+    cloudVersion: 3,
+  })
+
+  await repository.resolveConflictKeepCloud(MUTATION_ONE)
+
+  await expect(repository.get('client', 'client-1')).resolves.toMatchObject({
+    name: 'Cloud wins', version: 3, syncState: 'current',
+  })
+  await expect(repository.getConflict(MUTATION_ONE)).resolves.toBeNull()
+  expect(__getRawDatabase('keep-cloud.db').outbox[0]).toMatchObject({ state: 'complete' })
+})
+
+it('preserves the original outbox record while atomically creating a new current-version edit', async () => {
+  const repository = new SQLiteFieldCraftRepository({ databaseName: 'apply-edit.db' })
+  await repository.initialize(OWNER)
+  await repository.transactLocalMutation(mutation({ kind: 'update', baseVersion: 1 }))
+  await repository.recordMutationConflict(OWNER, {
+    mutationId: MUTATION_ONE,
+    mutationKind: 'update',
+    entity: 'client',
+    entityId: 'client-1',
+    localPayload: client({ syncState: 'conflict', name: 'My edit' }),
+    cloudPayload: client({
+      version: 3,
+      updatedAt: '2026-08-03T10:00:03.000Z',
+      syncState: 'current',
+      name: 'Cloud',
+    }),
+    cloudVersion: 3,
+  })
+  const replacement = mutation({
+    id: MUTATION_TWO,
+    kind: 'update',
+    baseVersion: 3,
+    createdAt: '2026-08-03T10:00:04.000Z',
+    payload: client({
+      version: 3,
+      updatedAt: '2026-08-03T10:00:04.000Z',
+      syncState: 'pending',
+      name: 'My edit',
+    }),
+  })
+
+  await repository.resolveConflictWithMutation(MUTATION_ONE, replacement)
+
+  expect(__getRawDatabase('apply-edit.db').outbox).toEqual([
+    expect.objectContaining({ mutation_id: MUTATION_ONE, state: 'complete' }),
+    expect.objectContaining({ mutation_id: MUTATION_TWO, state: 'pending' }),
+  ])
+  await expect(repository.outbox.list(OWNER)).resolves.toEqual([
+    expect.objectContaining({ id: MUTATION_TWO, baseVersion: 3 }),
+  ])
+  await expect(repository.getConflict(MUTATION_ONE)).resolves.toBeNull()
 })
 
 it('accepts a canonically equivalent duplicate mutation ID exactly once', async () => {

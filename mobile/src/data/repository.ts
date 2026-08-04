@@ -17,6 +17,12 @@ export type CloudRowEnvelope = {
   deleted?: boolean
 }
 
+export type MutationFailureReason =
+  | 'transient'
+  | 'reauthentication'
+  | 'validation'
+  | 'invalid-response'
+
 export interface FieldCraftRepository {
   initialize(ownerId: string): Promise<void>
   list<T>(entity: EntityName): Promise<T[]>
@@ -24,6 +30,37 @@ export interface FieldCraftRepository {
   transactLocalMutation(mutation: MutationEnvelope): Promise<void>
   applyCloudRows(rows: CloudRowEnvelope[]): Promise<void>
   markConflict(conflict: ConflictRecord): Promise<void>
+  getSyncCursor(ownerId: string): Promise<string | null>
+  commitPull(
+    ownerId: string,
+    rows: CloudRowEnvelope[],
+    cursor: string,
+    isCurrent?: () => boolean,
+  ): Promise<void>
+  acknowledgeMutation(
+    ownerId: string,
+    mutationId: string,
+    rows: CloudRowEnvelope[],
+    isCurrent?: () => boolean,
+  ): Promise<void>
+  recordMutationFailure(
+    ownerId: string,
+    mutationId: string,
+    reason: MutationFailureReason,
+    isCurrent?: () => boolean,
+  ): Promise<void>
+  recordMutationConflict(
+    ownerId: string,
+    conflict: ConflictRecord,
+    isCurrent?: () => boolean,
+  ): Promise<void>
+  countConflicts(ownerId: string): Promise<number>
+  getConflict(mutationId: string): Promise<ConflictRecord | null>
+  resolveConflictKeepCloud(mutationId: string): Promise<void>
+  resolveConflictWithMutation(
+    originalMutationId: string,
+    replacement: MutationEnvelope,
+  ): Promise<void>
   clearOwner(ownerId: string): Promise<void>
   close(): Promise<void>
 }

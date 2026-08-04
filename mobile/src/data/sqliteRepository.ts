@@ -18,6 +18,7 @@ import {
   type CloudRowEnvelope,
   type FieldCraftRepository,
   type InvoiceBundlePayload,
+  type MutationFailureReason,
 } from './repository'
 
 const EntityNameSchema = z.enum([
@@ -105,6 +106,7 @@ const CloudRowEnvelopeSchema = z
 const ConflictRecordSchema = z
   .object({
     mutationId: z.uuid(),
+    mutationKind: MutationKindSchema.optional(),
     entity: EntityNameSchema,
     entityId: z.string().min(1),
     localPayload: z.unknown(),
@@ -112,6 +114,13 @@ const ConflictRecordSchema = z
     cloudVersion: z.number().finite().int().min(0),
   })
   .strict()
+
+const MutationFailureReasonSchema = z.enum([
+  'transient',
+  'reauthentication',
+  'validation',
+  'invalid-response',
+])
 
 type RecordRow = {
   entity_id: string
@@ -124,6 +133,29 @@ type ExistingMutationRow = {
 
 type NextSequenceRow = {
   next_sequence: number
+}
+
+type SyncCursorRow = {
+  cursor: string
+}
+
+type ConflictRow = {
+  mutation_id: string
+  mutation_kind: MutationEnvelope['kind']
+  entity: EntityName
+  entity_id: string
+  local_payload_json: string
+  cloud_payload_json: string
+  cloud_version: number
+}
+
+type CountRow = {
+  count: number
+}
+
+type PreparedCloudRow = {
+  row: CloudRowEnvelope
+  payloadJson: string
 }
 
 const validateEntityPayload = (
@@ -172,6 +204,113 @@ const validateBundlePayload = (
     throw new Error('Invoice bundle client, job, and invoice relationships must match')
   }
   return { client, job, invoice } as InvoiceBundlePayload
+}
+
+const prepareCloudRows = (
+  inputRows: CloudRowEnvelope[],
+  ownerId: string,
+): PreparedCloudRow[] => inputRows.map((input) => {
+  const row = CloudRowEnvelopeSchema.parse(input) as CloudRowEnvelope
+  if (row.ownerId !== ownerId) {
+    throw new Error('Cloud row owner does not match the active repository owner')
+  }
+  if (row.deleted && row.payload !== null) {
+    throw new Error('Deleted cloud rows require a null tombstone payload')
+  }
+  const payload = row.deleted
+    ? null
+    : validateEntityPayload(row.entity, row.payload, row.ownerId, row.entityId)
+  if (payload) {
+    if (payload.version !== row.version) {
+      throw new Error('Cloud row payload version must match its envelope version')
+    }
+    if (payload.updatedAt !== row.updatedAt) {
+      throw new Error('Cloud row payload updatedAt must match its envelope updatedAt')
+    }
+  }
+  return { row, payloadJson: canonicalStringify(payload) }
+})
+
+const writeCloudRows = async (
+  database: SQLiteDatabase,
+  prepared: PreparedCloudRow[],
+): Promise<void> => {
+  for (const { row, payloadJson } of prepared) {
+    await database.runAsync(
+      `/* records:upsert */
+       INSERT INTO records
+         (owner_id, entity, entity_id, payload_json, version, deleted, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(owner_id, entity, entity_id) DO UPDATE SET
+         payload_json = excluded.payload_json,
+         version = excluded.version,
+         deleted = excluded.deleted,
+         updated_at = excluded.updated_at`,
+      [row.ownerId, row.entity, row.entityId, payloadJson, row.version, row.deleted ? 1 : 0, row.updatedAt],
+    )
+  }
+}
+
+const prepareConflict = (
+  input: ConflictRecord,
+  ownerId: string,
+): { conflict: ConflictRecord; localPayloadJson: string; cloudPayloadJson: string } => {
+  const conflict = ConflictRecordSchema.parse(input) as ConflictRecord
+  const localPayload = conflict.mutationKind === 'delete'
+    ? conflict.localPayload
+    : validateEntityPayload(
+        conflict.entity,
+        conflict.localPayload,
+        ownerId,
+        conflict.entityId,
+      )
+  if (conflict.mutationKind === 'delete' && localPayload !== null) {
+    throw new Error('Delete conflicts require a null local tombstone payload')
+  }
+  const cloudPayload = validateEntityPayload(
+    conflict.entity,
+    conflict.cloudPayload,
+    ownerId,
+    conflict.entityId,
+  )
+  if (cloudPayload.version !== conflict.cloudVersion) {
+    throw new Error('Conflict cloud payload version must match the conflict record')
+  }
+  return {
+    conflict,
+    localPayloadJson: canonicalStringify(localPayload),
+    cloudPayloadJson: canonicalStringify(cloudPayload),
+  }
+}
+
+const writeConflict = async (
+  database: SQLiteDatabase,
+  ownerId: string,
+  prepared: ReturnType<typeof prepareConflict>,
+): Promise<void> => {
+  const { conflict, localPayloadJson, cloudPayloadJson } = prepared
+  await database.runAsync(
+    `/* conflicts:upsert */
+     INSERT INTO conflicts
+       (owner_id, mutation_id, entity, entity_id, local_payload_json,
+        cloud_payload_json, cloud_version)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(owner_id, mutation_id) DO UPDATE SET
+       entity = excluded.entity,
+       entity_id = excluded.entity_id,
+       local_payload_json = excluded.local_payload_json,
+       cloud_payload_json = excluded.cloud_payload_json,
+       cloud_version = excluded.cloud_version`,
+    [
+      ownerId,
+      conflict.mutationId,
+      conflict.entity,
+      conflict.entityId,
+      localPayloadJson,
+      cloudPayloadJson,
+      conflict.cloudVersion,
+    ],
+  )
 }
 
 export const validateMutationEnvelope = (input: MutationEnvelope): MutationEnvelope => {
@@ -438,33 +577,311 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
 
   async applyCloudRows(inputRows: CloudRowEnvelope[]): Promise<void> {
     const snapshot = this.requireOwnerSnapshot()
-    const rows = inputRows.map((row) => CloudRowEnvelopeSchema.parse(row) as CloudRowEnvelope)
-    const prepared = rows.map((row) => {
-      if (row.ownerId !== snapshot.ownerId) {
-        throw new Error('Cloud row owner does not match the active repository owner')
-      }
-      if (row.deleted && row.payload !== null) {
-        throw new Error('Deleted cloud rows require a null tombstone payload')
-      }
-      const payload = row.deleted
-        ? null
-        : validateEntityPayload(row.entity, row.payload, row.ownerId, row.entityId)
-      if (payload) {
-        if (payload.version !== row.version) {
-          throw new Error('Cloud row payload version must match its envelope version')
-        }
-        if (payload.updatedAt !== row.updatedAt) {
-          throw new Error('Cloud row payload updatedAt must match its envelope updatedAt')
-        }
-      }
-      return { row, payloadJson: canonicalStringify(payload) }
-    })
+    const prepared = prepareCloudRows(inputRows, snapshot.ownerId)
 
     await this.serializeWrite(async () => {
       this.assertSharedOwnerAvailable(snapshot.ownerId)
       await this.accessDatabase(async (database) => {
         await database.withExclusiveTransactionAsync(async (transaction) => {
-        for (const { row, payloadJson } of prepared) {
+          await writeCloudRows(transaction, prepared)
+          if (!this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
+            throw new Error('Owner changed while applying cloud rows')
+          }
+        })
+      }, true)
+    })
+    if (prepared.length > 0 && this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
+      this.ownerBoundary.markDataChanged()
+    }
+  }
+
+  async markConflict(input: ConflictRecord): Promise<void> {
+    const snapshot = this.requireOwnerSnapshot()
+    const prepared = prepareConflict(input, snapshot.ownerId)
+
+    await this.serializeWrite(async () => {
+      this.assertSharedOwnerAvailable(snapshot.ownerId)
+      await this.accessDatabase(async (database) => {
+        await database.withExclusiveTransactionAsync(async (transaction) => {
+          await writeConflict(transaction, snapshot.ownerId, prepared)
+          if (!this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
+            throw new Error('Owner changed while recording a conflict')
+          }
+        })
+      }, true)
+    })
+    if (this.ownerBoundary.isOwnerEpochCurrent(snapshot)) this.ownerBoundary.markDataChanged()
+  }
+
+  async getSyncCursor(ownerId: string): Promise<string | null> {
+    const snapshot = this.requireOwnerSnapshot()
+    if (ownerId !== snapshot.ownerId) throw new Error('Sync cursor owner must match the active owner')
+    const row = await this.accessDatabase((database) => database.getFirstAsync<SyncCursorRow>(
+      `/* sync-cursors:get */
+       SELECT cursor FROM sync_cursors WHERE owner_id = ? AND entity = ?`,
+      [ownerId, '__all__'],
+    ))
+    return this.ownerBoundary.isCurrent(snapshot) ? row?.cursor ?? null : null
+  }
+
+  async commitPull(
+    ownerId: string,
+    inputRows: CloudRowEnvelope[],
+    cursor: string,
+    isCurrent: () => boolean = () => true,
+  ): Promise<void> {
+    if (!cursor) throw new Error('A durable pull cursor is required')
+    const snapshot = this.requireOwnerSnapshot()
+    if (ownerId !== snapshot.ownerId) throw new Error('Pull owner must match the active owner')
+    const prepared = prepareCloudRows(inputRows, ownerId)
+
+    await this.serializeWrite(async () => {
+      this.assertSharedOwnerAvailable(ownerId)
+      await this.accessDatabase(async (database) => {
+        await database.withExclusiveTransactionAsync(async (transaction) => {
+          await writeCloudRows(transaction, prepared)
+          await transaction.runAsync(
+            `/* sync-cursors:upsert */
+             INSERT INTO sync_cursors (owner_id, entity, cursor)
+             VALUES (?, ?, ?)
+             ON CONFLICT(owner_id, entity) DO UPDATE SET cursor = excluded.cursor`,
+            [ownerId, '__all__', cursor],
+          )
+          if (!isCurrent() || !this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
+            throw new Error('Owner changed while committing a pull')
+          }
+        })
+      }, true)
+    })
+    if (prepared.length > 0 && this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
+      this.ownerBoundary.markDataChanged()
+    }
+  }
+
+  async acknowledgeMutation(
+    ownerId: string,
+    mutationId: string,
+    inputRows: CloudRowEnvelope[],
+    isCurrent: () => boolean = () => true,
+  ): Promise<void> {
+    if (!mutationId) throw new Error('A mutation ID is required for acknowledgement')
+    const snapshot = this.requireOwnerSnapshot()
+    if (ownerId !== snapshot.ownerId) throw new Error('Acknowledgement owner must match the active owner')
+    const prepared = prepareCloudRows(inputRows, ownerId)
+
+    await this.serializeWrite(async () => {
+      this.assertSharedOwnerAvailable(ownerId)
+      await this.accessDatabase(async (database) => {
+        await database.withExclusiveTransactionAsync(async (transaction) => {
+          await writeCloudRows(transaction, prepared)
+          const result = await transaction.runAsync(
+            `/* outbox:acknowledge */
+             UPDATE outbox SET state = 'complete', last_error = NULL
+             WHERE owner_id = ? AND mutation_id = ?
+               AND state IN ('pending', 'failed', 'syncing')`,
+            [ownerId, mutationId],
+          )
+          if (result.changes !== 1) {
+            throw new Error('Mutation acknowledgement did not match one sendable outbox record')
+          }
+          if (!isCurrent() || !this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
+            throw new Error('Owner changed while acknowledging a mutation')
+          }
+        })
+      }, true)
+    })
+    if (this.ownerBoundary.isOwnerEpochCurrent(snapshot)) this.ownerBoundary.markDataChanged()
+  }
+
+  async recordMutationFailure(
+    ownerId: string,
+    mutationId: string,
+    inputReason: MutationFailureReason,
+    isCurrent: () => boolean = () => true,
+  ): Promise<void> {
+    const reason = MutationFailureReasonSchema.parse(inputReason)
+    const snapshot = this.requireOwnerSnapshot()
+    if (ownerId !== snapshot.ownerId) throw new Error('Failure owner must match the active owner')
+    await this.serializeWrite(async () => {
+      this.assertSharedOwnerAvailable(ownerId)
+      await this.accessDatabase(async (database) => {
+        await database.withExclusiveTransactionAsync(async (transaction) => {
+          const result = await transaction.runAsync(
+            `/* outbox:failure */
+             UPDATE outbox
+             SET state = 'failed', attempts = attempts + 1, last_error = ?
+             WHERE owner_id = ? AND mutation_id = ?
+               AND state IN ('pending', 'failed', 'syncing')`,
+            [reason, ownerId, mutationId],
+          )
+          if (result.changes !== 1) throw new Error('Mutation failure did not match one outbox record')
+          if (!isCurrent() || !this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
+            throw new Error('Owner changed while recording a mutation failure')
+          }
+        })
+      }, true)
+    })
+    if (this.ownerBoundary.isOwnerEpochCurrent(snapshot)) this.ownerBoundary.markDataChanged()
+  }
+
+  async recordMutationConflict(
+    ownerId: string,
+    input: ConflictRecord,
+    isCurrent: () => boolean = () => true,
+  ): Promise<void> {
+    const snapshot = this.requireOwnerSnapshot()
+    if (ownerId !== snapshot.ownerId) throw new Error('Conflict owner must match the active owner')
+    const prepared = prepareConflict(input, ownerId)
+    await this.serializeWrite(async () => {
+      this.assertSharedOwnerAvailable(ownerId)
+      await this.accessDatabase(async (database) => {
+        await database.withExclusiveTransactionAsync(async (transaction) => {
+          await writeConflict(transaction, ownerId, prepared)
+          const result = await transaction.runAsync(
+            `/* outbox:conflict */
+             UPDATE outbox SET state = 'conflict', last_error = NULL
+             WHERE owner_id = ? AND mutation_id = ?
+               AND state IN ('pending', 'failed', 'syncing')`,
+            [ownerId, input.mutationId],
+          )
+          if (result.changes !== 1) throw new Error('Conflict did not match one outbox record')
+          if (!isCurrent() || !this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
+            throw new Error('Owner changed while committing a conflict')
+          }
+        })
+      }, true)
+    })
+    if (this.ownerBoundary.isOwnerEpochCurrent(snapshot)) this.ownerBoundary.markDataChanged()
+  }
+
+  async countConflicts(ownerId: string): Promise<number> {
+    const snapshot = this.requireOwnerSnapshot()
+    if (ownerId !== snapshot.ownerId) throw new Error('Conflict owner must match the active owner')
+    const row = await this.accessDatabase((database) => database.getFirstAsync<CountRow>(
+      `/* conflicts:count */ SELECT COUNT(*) AS count FROM conflicts WHERE owner_id = ?`,
+      [ownerId],
+    ))
+    return this.ownerBoundary.isCurrent(snapshot) ? row?.count ?? 0 : 0
+  }
+
+  async getConflict(mutationId: string): Promise<ConflictRecord | null> {
+    if (!mutationId) throw new Error('A mutation ID is required')
+    const snapshot = this.requireOwnerSnapshot()
+    const row = await this.accessDatabase((database) => database.getFirstAsync<ConflictRow>(
+      `/* conflicts:get */
+       SELECT conflict.mutation_id, outbox.kind AS mutation_kind,
+              conflict.entity, conflict.entity_id, conflict.local_payload_json,
+              conflict.cloud_payload_json, conflict.cloud_version
+       FROM conflicts AS conflict
+       INNER JOIN outbox AS outbox
+         ON outbox.owner_id = conflict.owner_id
+        AND outbox.mutation_id = conflict.mutation_id
+       WHERE conflict.owner_id = ? AND conflict.mutation_id = ?`,
+      [snapshot.ownerId, mutationId],
+    ))
+    if (!this.ownerBoundary.isCurrent(snapshot) || !row) return null
+    return this.parseConflictRow(row, snapshot.ownerId)
+  }
+
+  async resolveConflictKeepCloud(mutationId: string): Promise<void> {
+    const snapshot = this.requireOwnerSnapshot()
+    await this.serializeWrite(async () => {
+      this.assertSharedOwnerAvailable(snapshot.ownerId)
+      await this.accessDatabase(async (database) => {
+        await database.withExclusiveTransactionAsync(async (transaction) => {
+          const row = await transaction.getFirstAsync<ConflictRow>(
+            `/* conflicts:get */
+             SELECT conflict.mutation_id, outbox.kind AS mutation_kind,
+                    conflict.entity, conflict.entity_id, conflict.local_payload_json,
+                    conflict.cloud_payload_json, conflict.cloud_version
+             FROM conflicts AS conflict
+             INNER JOIN outbox AS outbox
+               ON outbox.owner_id = conflict.owner_id
+              AND outbox.mutation_id = conflict.mutation_id
+             WHERE conflict.owner_id = ? AND conflict.mutation_id = ?`,
+            [snapshot.ownerId, mutationId],
+          )
+          if (!row) throw new Error('The conflict is no longer available')
+          const conflict = this.parseConflictRow(row, snapshot.ownerId)
+          const cloud = conflict.cloudPayload as Record<string, unknown>
+          await writeCloudRows(transaction, prepareCloudRows([{
+            ownerId: snapshot.ownerId,
+            entity: conflict.entity,
+            entityId: conflict.entityId,
+            payload: conflict.cloudPayload,
+            version: conflict.cloudVersion,
+            updatedAt: String(cloud.updatedAt),
+          }], snapshot.ownerId))
+          const completed = await transaction.runAsync(
+            `/* outbox:resolve */
+             UPDATE outbox SET state = 'complete', last_error = NULL
+             WHERE owner_id = ? AND mutation_id = ? AND state = 'conflict'`,
+            [snapshot.ownerId, mutationId],
+          )
+          if (completed.changes !== 1) throw new Error('Conflict resolution did not match its outbox record')
+          await transaction.runAsync(
+            `/* conflicts:delete */ DELETE FROM conflicts WHERE owner_id = ? AND mutation_id = ?`,
+            [snapshot.ownerId, mutationId],
+          )
+          if (!this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
+            throw new Error('Owner changed while resolving a conflict')
+          }
+        })
+      }, true)
+    })
+    if (this.ownerBoundary.isOwnerEpochCurrent(snapshot)) this.ownerBoundary.markDataChanged()
+  }
+
+  async resolveConflictWithMutation(
+    originalMutationId: string,
+    inputReplacement: MutationEnvelope,
+  ): Promise<void> {
+    const replacement = validateMutationEnvelope(inputReplacement)
+    if (replacement.kind !== 'update' && replacement.kind !== 'delete') {
+      throw new Error('Conflict edits require an update or delete mutation')
+    }
+    if (replacement.id === originalMutationId) throw new Error('Conflict edits require a new mutation ID')
+    const snapshot = this.requireOwnerSnapshot()
+    if (replacement.ownerId !== snapshot.ownerId) {
+      throw new Error('Conflict replacement owner must match the active owner')
+    }
+    const hash = await hashMutationEnvelope(replacement)
+    const payloadJson = canonicalStringify(replacement.payload)
+
+    await this.serializeWrite(async () => {
+      this.assertSharedOwnerAvailable(snapshot.ownerId)
+      await this.accessDatabase(async (database) => {
+        await database.withExclusiveTransactionAsync(async (transaction) => {
+          const conflictRow = await transaction.getFirstAsync<ConflictRow>(
+            `/* conflicts:get */
+             SELECT conflict.mutation_id, outbox.kind AS mutation_kind,
+                    conflict.entity, conflict.entity_id, conflict.local_payload_json,
+                    conflict.cloud_payload_json, conflict.cloud_version
+             FROM conflicts AS conflict
+             INNER JOIN outbox AS outbox
+               ON outbox.owner_id = conflict.owner_id
+              AND outbox.mutation_id = conflict.mutation_id
+             WHERE conflict.owner_id = ? AND conflict.mutation_id = ?`,
+            [snapshot.ownerId, originalMutationId],
+          )
+          if (!conflictRow) throw new Error('The conflict is no longer available')
+          const conflict = this.parseConflictRow(conflictRow, snapshot.ownerId)
+          if (
+            replacement.entity !== conflict.entity ||
+            replacement.entityId !== conflict.entityId ||
+            replacement.baseVersion !== conflict.cloudVersion ||
+            replacement.kind !== (conflict.mutationKind ?? 'update')
+          ) {
+            throw new Error('Conflict replacement must target the current cloud version')
+          }
+          const duplicate = await transaction.getFirstAsync<ExistingMutationRow>(
+            `/* outbox:duplicate */
+             SELECT payload_hash FROM outbox WHERE owner_id = ? AND mutation_id = ?`,
+            [replacement.ownerId, replacement.id],
+          )
+          if (duplicate) throw new DataCorruptionError('Conflict replacement mutation ID already exists')
+
+          const payload = replacement.payload as Record<string, unknown> | null
           await transaction.runAsync(
             `/* records:upsert */
              INSERT INTO records
@@ -475,70 +892,56 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
                version = excluded.version,
                deleted = excluded.deleted,
                updated_at = excluded.updated_at`,
-            [row.ownerId, row.entity, row.entityId, payloadJson, row.version, row.deleted ? 1 : 0, row.updatedAt],
+            [
+              replacement.ownerId,
+              replacement.entity,
+              replacement.entityId,
+              payloadJson,
+              replacement.kind === 'delete' ? replacement.baseVersion ?? 0 : Number(payload?.version),
+              replacement.kind === 'delete' ? 1 : 0,
+              replacement.kind === 'delete' ? replacement.createdAt : String(payload?.updatedAt),
+            ],
           )
-        }
-        if (!this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
-          throw new Error('Owner changed while applying cloud rows')
-        }
-        })
-      }, true)
-    })
-    if (prepared.length > 0 && this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
-      this.ownerBoundary.markDataChanged()
-    }
-  }
-
-  async markConflict(input: ConflictRecord): Promise<void> {
-    const conflict = ConflictRecordSchema.parse(input) as ConflictRecord
-    const snapshot = this.requireOwnerSnapshot()
-    const localPayload = validateEntityPayload(
-      conflict.entity,
-      conflict.localPayload,
-      snapshot.ownerId,
-      conflict.entityId,
-    )
-    const cloudPayload = validateEntityPayload(
-      conflict.entity,
-      conflict.cloudPayload,
-      snapshot.ownerId,
-      conflict.entityId,
-    )
-    if (cloudPayload.version !== conflict.cloudVersion) {
-      throw new Error('Conflict cloud payload version must match the conflict record')
-    }
-    const localPayloadJson = canonicalStringify(localPayload)
-    const cloudPayloadJson = canonicalStringify(cloudPayload)
-
-    await this.serializeWrite(async () => {
-      this.assertSharedOwnerAvailable(snapshot.ownerId)
-      await this.accessDatabase(async (database) => {
-        await database.withExclusiveTransactionAsync(async (transaction) => {
-        await transaction.runAsync(
-          `/* conflicts:upsert */
-           INSERT INTO conflicts
-             (owner_id, mutation_id, entity, entity_id, local_payload_json,
-              cloud_payload_json, cloud_version)
-           VALUES (?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(owner_id, mutation_id) DO UPDATE SET
-             entity = excluded.entity,
-             entity_id = excluded.entity_id,
-             local_payload_json = excluded.local_payload_json,
-             cloud_payload_json = excluded.cloud_payload_json,
-             cloud_version = excluded.cloud_version`,
-          [
-            snapshot.ownerId,
-            conflict.mutationId,
-            conflict.entity,
-            conflict.entityId,
-            localPayloadJson,
-            cloudPayloadJson,
-            conflict.cloudVersion,
-          ],
-        )
-        if (!this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
-          throw new Error('Owner changed while recording a conflict')
-        }
+          const sequence = await transaction.getFirstAsync<NextSequenceRow>(
+            `/* outbox:next-sequence */
+             SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence
+             FROM outbox WHERE owner_id = ?`,
+            [replacement.ownerId],
+          )
+          await transaction.runAsync(
+            `/* outbox:insert */
+             INSERT INTO outbox
+               (owner_id, mutation_id, sequence, entity, entity_id, kind, base_version,
+                payload_json, payload_hash, created_at, attempts)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              replacement.ownerId,
+              replacement.id,
+              sequence?.next_sequence ?? 1,
+              replacement.entity,
+              replacement.entityId,
+              replacement.kind,
+              replacement.baseVersion,
+              payloadJson,
+              hash,
+              replacement.createdAt,
+              replacement.attempts,
+            ],
+          )
+          const completed = await transaction.runAsync(
+            `/* outbox:resolve */
+             UPDATE outbox SET state = 'complete', last_error = NULL
+             WHERE owner_id = ? AND mutation_id = ? AND state = 'conflict'`,
+            [snapshot.ownerId, originalMutationId],
+          )
+          if (completed.changes !== 1) throw new Error('Conflict resolution did not match its outbox record')
+          await transaction.runAsync(
+            `/* conflicts:delete */ DELETE FROM conflicts WHERE owner_id = ? AND mutation_id = ?`,
+            [snapshot.ownerId, originalMutationId],
+          )
+          if (!this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
+            throw new Error('Owner changed while replacing a conflict mutation')
+          }
         })
       }, true)
     })
@@ -654,6 +1057,25 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
     this.attached = false
     this.control.attachments.delete(this.attachmentToken)
     return this.control.attachments.size === 0
+  }
+
+  private parseConflictRow(row: ConflictRow, ownerId: string): ConflictRecord {
+    try {
+      return prepareConflict({
+        mutationId: row.mutation_id,
+        mutationKind: row.mutation_kind,
+        entity: row.entity,
+        entityId: row.entity_id,
+        localPayload: JSON.parse(row.local_payload_json),
+        cloudPayload: JSON.parse(row.cloud_payload_json),
+        cloudVersion: row.cloud_version,
+      }, ownerId).conflict
+    } catch (cause) {
+      throw new DataCorruptionError(
+        `Corrupt conflict record for owner ${ownerId} mutation ${row.mutation_id}`,
+        { cause },
+      )
+    }
   }
 
   private parsePersistedPayload<T>(

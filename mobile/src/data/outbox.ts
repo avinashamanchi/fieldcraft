@@ -103,7 +103,10 @@ export class SQLiteMutationOutbox implements MutationOutbox {
          SELECT owner_id, mutation_id, entity, entity_id, kind, base_version,
                 payload_json, payload_hash, created_at, attempts
          FROM outbox
-         WHERE owner_id = ? AND state IN ('pending', 'failed')
+         WHERE owner_id = ? AND (
+           state = 'pending'
+           OR (state = 'failed' AND last_error IN ('transient', 'reauthentication'))
+         )
          ORDER BY sequence ASC`,
         [ownerId],
       )

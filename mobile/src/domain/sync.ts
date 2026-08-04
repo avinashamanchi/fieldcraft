@@ -22,6 +22,7 @@ export type MutationEnvelope = {
 
 export type ConflictRecord = {
   mutationId: string
+  mutationKind?: MutationKind
   entity: EntityName
   entityId: string
   localPayload: unknown

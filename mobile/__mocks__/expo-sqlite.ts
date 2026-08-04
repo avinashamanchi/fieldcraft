@@ -22,6 +22,24 @@ type OutboxRow = {
   payload_hash: string
   created_at: string
   attempts: number
+  state: 'pending' | 'syncing' | 'failed' | 'conflict' | 'complete'
+  last_error: string | null
+}
+
+type ConflictRow = {
+  owner_id: string
+  mutation_id: string
+  entity: string
+  entity_id: string
+  local_payload_json: string
+  cloud_payload_json: string
+  cloud_version: number
+}
+
+type SyncCursorRow = {
+  owner_id: string
+  entity: string
+  cursor: string
 }
 
 export type MockDatabaseState = {
@@ -33,6 +51,7 @@ export type MockDatabaseState = {
   syncCursors: Record<string, unknown>[]
   metadata: Record<string, unknown>[]
   failNextOutboxInsert: boolean
+  failNextOutboxAcknowledge: boolean
   failNextMigration: boolean
   failNextOwnerClear: boolean
   closeCount: number
@@ -62,6 +81,7 @@ const createState = (): MockDatabaseState => ({
   syncCursors: [],
   metadata: [],
   failNextOutboxInsert: false,
+  failNextOutboxAcknowledge: false,
   failNextMigration: false,
   failNextOwnerClear: false,
   closeCount: 0,
@@ -82,6 +102,7 @@ const copyState = (state: MockDatabaseState): MockDatabaseState => ({
   syncCursors: state.syncCursors.map((row) => ({ ...row })),
   metadata: state.metadata.map((row) => ({ ...row })),
   failNextOutboxInsert: state.failNextOutboxInsert,
+  failNextOutboxAcknowledge: state.failNextOutboxAcknowledge,
   failNextMigration: state.failNextMigration,
   failNextOwnerClear: state.failNextOwnerClear,
   closeCount: state.closeCount,
@@ -138,6 +159,27 @@ const expectedSql = {
       local_payload_json = excluded.local_payload_json,
       cloud_payload_json = excluded.cloud_payload_json,
       cloud_version = excluded.cloud_version`),
+  cursorUpsert: normalizeSql(`/* sync-cursors:upsert */
+    INSERT INTO sync_cursors (owner_id, entity, cursor)
+    VALUES (?, ?, ?)
+    ON CONFLICT(owner_id, entity) DO UPDATE SET cursor = excluded.cursor`),
+  outboxAcknowledge: normalizeSql(`/* outbox:acknowledge */
+    UPDATE outbox SET state = 'complete', last_error = NULL
+    WHERE owner_id = ? AND mutation_id = ?
+      AND state IN ('pending', 'failed', 'syncing')`),
+  outboxFailure: normalizeSql(`/* outbox:failure */
+    UPDATE outbox
+    SET state = 'failed', attempts = attempts + 1, last_error = ?
+    WHERE owner_id = ? AND mutation_id = ?
+      AND state IN ('pending', 'failed', 'syncing')`),
+  outboxConflict: normalizeSql(`/* outbox:conflict */
+    UPDATE outbox SET state = 'conflict', last_error = NULL
+    WHERE owner_id = ? AND mutation_id = ?
+      AND state IN ('pending', 'failed', 'syncing')`),
+  outboxResolve: normalizeSql(`/* outbox:resolve */
+    UPDATE outbox SET state = 'complete', last_error = NULL
+    WHERE owner_id = ? AND mutation_id = ? AND state = 'conflict'`),
+  conflictDelete: '/* conflicts:delete */ delete from conflicts where owner_id = ? and mutation_id = ?',
   recordsClear: '/* owner:clear:records */ delete from records where owner_id = ?',
   outboxClear: '/* owner:clear:outbox */ delete from outbox where owner_id = ?',
   conflictsClear: '/* owner:clear:conflicts */ delete from conflicts where owner_id = ?',
@@ -159,8 +201,24 @@ const expectedSql = {
     SELECT owner_id, mutation_id, entity, entity_id, kind, base_version,
            payload_json, payload_hash, created_at, attempts
     FROM outbox
-    WHERE owner_id = ? AND state IN ('pending', 'failed')
+    WHERE owner_id = ? AND (
+      state = 'pending'
+      OR (state = 'failed' AND last_error IN ('transient', 'reauthentication'))
+    )
     ORDER BY sequence ASC`),
+  cursorGet: normalizeSql(`/* sync-cursors:get */
+    SELECT cursor FROM sync_cursors WHERE owner_id = ? AND entity = ?`),
+  conflictGet: normalizeSql(`/* conflicts:get */
+    SELECT conflict.mutation_id, outbox.kind AS mutation_kind,
+           conflict.entity, conflict.entity_id, conflict.local_payload_json,
+           conflict.cloud_payload_json, conflict.cloud_version
+    FROM conflicts AS conflict
+    INNER JOIN outbox AS outbox
+      ON outbox.owner_id = conflict.owner_id
+     AND outbox.mutation_id = conflict.mutation_id
+    WHERE conflict.owner_id = ? AND conflict.mutation_id = ?`),
+  conflictCount: normalizeSql(`/* conflicts:count */
+    SELECT COUNT(*) AS count FROM conflicts WHERE owner_id = ?`),
 } as const
 
 const assertSql = (condition: boolean, message: string): void => {
@@ -295,6 +353,8 @@ class MockSQLiteDatabase {
         payload_hash: String(params[8]),
         created_at: String(params[9]),
         attempts: Number(params[10]),
+        state: 'pending',
+        last_error: null,
       }
       if (
         this.state.outbox.some(
@@ -323,8 +383,107 @@ class MockSQLiteDatabase {
         'conflict upsert key must be owner scoped',
       )
       assertSql(String(params[0]).length > 0, 'conflict owner parameter')
-      this.state.conflicts.push({ owner_id: params[0], params })
+      const row: ConflictRow = {
+        owner_id: String(params[0]),
+        mutation_id: String(params[1]),
+        entity: String(params[2]),
+        entity_id: String(params[3]),
+        local_payload_json: String(params[4]),
+        cloud_payload_json: String(params[5]),
+        cloud_version: Number(params[6]),
+      }
+      const conflicts = this.state.conflicts as unknown as ConflictRow[]
+      const index = conflicts.findIndex(
+        (candidate) => candidate.owner_id === row.owner_id && candidate.mutation_id === row.mutation_id,
+      )
+      if (index === -1) conflicts.push(row)
+      else conflicts[index] = row
       return { changes: 1, lastInsertRowId: 0 }
+    }
+    if (source.includes('sync-cursors:upsert')) {
+      requireExactSql(sql, expectedSql.cursorUpsert, 'sync cursor upsert')
+      const row: SyncCursorRow = {
+        owner_id: String(params[0]),
+        entity: String(params[1]),
+        cursor: String(params[2]),
+      }
+      const syncCursors = this.state.syncCursors as unknown as SyncCursorRow[]
+      const index = syncCursors.findIndex(
+        (candidate) => candidate.owner_id === row.owner_id && candidate.entity === row.entity,
+      )
+      if (index === -1) syncCursors.push(row)
+      else syncCursors[index] = row
+      return { changes: 1, lastInsertRowId: 0 }
+    }
+    if (source.includes('outbox:acknowledge')) {
+      requireExactSql(sql, expectedSql.outboxAcknowledge, 'outbox acknowledgement')
+      requireOwnerPredicate(sql)
+      if (this.control.failNextOutboxAcknowledge) {
+        this.control.failNextOutboxAcknowledge = false
+        throw new Error('simulated acknowledgement failure')
+      }
+      const row = this.state.outbox.find(
+        (candidate) =>
+          candidate.owner_id === params[0] &&
+          candidate.mutation_id === params[1] &&
+          ['pending', 'failed', 'syncing'].includes(candidate.state),
+      )
+      if (!row) return { changes: 0, lastInsertRowId: 0 }
+      row.state = 'complete'
+      row.last_error = null
+      return { changes: 1, lastInsertRowId: 0 }
+    }
+    if (source.includes('outbox:failure')) {
+      requireExactSql(sql, expectedSql.outboxFailure, 'outbox failure')
+      requireOwnerPredicate(sql)
+      const row = this.state.outbox.find(
+        (candidate) =>
+          candidate.owner_id === params[1] &&
+          candidate.mutation_id === params[2] &&
+          ['pending', 'failed', 'syncing'].includes(candidate.state),
+      )
+      if (!row) return { changes: 0, lastInsertRowId: 0 }
+      row.state = 'failed'
+      row.attempts += 1
+      row.last_error = String(params[0])
+      return { changes: 1, lastInsertRowId: 0 }
+    }
+    if (source.includes('outbox:conflict')) {
+      requireExactSql(sql, expectedSql.outboxConflict, 'outbox conflict')
+      requireOwnerPredicate(sql)
+      const row = this.state.outbox.find(
+        (candidate) =>
+          candidate.owner_id === params[0] &&
+          candidate.mutation_id === params[1] &&
+          ['pending', 'failed', 'syncing'].includes(candidate.state),
+      )
+      if (!row) return { changes: 0, lastInsertRowId: 0 }
+      row.state = 'conflict'
+      row.last_error = null
+      return { changes: 1, lastInsertRowId: 0 }
+    }
+    if (source.includes('outbox:resolve')) {
+      requireExactSql(sql, expectedSql.outboxResolve, 'outbox conflict resolution')
+      requireOwnerPredicate(sql)
+      const row = this.state.outbox.find(
+        (candidate) =>
+          candidate.owner_id === params[0] &&
+          candidate.mutation_id === params[1] &&
+          candidate.state === 'conflict',
+      )
+      if (!row) return { changes: 0, lastInsertRowId: 0 }
+      row.state = 'complete'
+      row.last_error = null
+      return { changes: 1, lastInsertRowId: 0 }
+    }
+    if (source.includes('conflicts:delete')) {
+      requireExactSql(sql, expectedSql.conflictDelete, 'conflict delete')
+      requireOwnerPredicate(sql)
+      const before = this.state.conflicts.length
+      this.state.conflicts = (this.state.conflicts as unknown as ConflictRow[]).filter(
+        (row) => row.owner_id !== params[0] || row.mutation_id !== params[1],
+      )
+      return { changes: before - this.state.conflicts.length, lastInsertRowId: 0 }
     }
     if (source.includes('owner:clear:records')) {
       requireExactSql(sql, expectedSql.recordsClear, 'records clear')
@@ -436,6 +595,32 @@ class MockSQLiteDatabase {
         .reduce((largest, row) => Math.max(largest, row.sequence), 0)
       return { next_sequence: sequence + 1 } as T
     }
+    if (source.includes('sync-cursors:get')) {
+      requireExactSql(sql, expectedSql.cursorGet, 'sync cursor get')
+      requireOwnerPredicate(sql)
+      const row = (this.state.syncCursors as unknown as SyncCursorRow[]).find(
+        (candidate) => candidate.owner_id === params[0] && candidate.entity === params[1],
+      )
+      return (row ? { cursor: row.cursor } : null) as T | null
+    }
+    if (source.includes('conflicts:get')) {
+      requireExactSql(sql, expectedSql.conflictGet, 'conflict get')
+      assertSql(sql.includes('conflict.owner_id = ?'), 'conflict get owner predicate')
+      const row = (this.state.conflicts as unknown as ConflictRow[]).find(
+        (candidate) => candidate.owner_id === params[0] && candidate.mutation_id === params[1],
+      )
+      const outbox = this.state.outbox.find(
+        (candidate) => candidate.owner_id === params[0] && candidate.mutation_id === params[1],
+      )
+      return (row && outbox ? { ...row, mutation_kind: outbox.kind } : null) as T | null
+    }
+    if (source.includes('conflicts:count')) {
+      requireExactSql(sql, expectedSql.conflictCount, 'conflict count')
+      requireOwnerPredicate(sql)
+      return {
+        count: this.state.conflicts.filter((row) => row.owner_id === params[0]).length,
+      } as T
+    }
     throw new Error(`Unsupported mock getFirstAsync SQL: ${source}`)
   }
 
@@ -468,17 +653,21 @@ class MockSQLiteDatabase {
     }
     if (source.includes('outbox:list')) {
       requireExactSql(sql, expectedSql.outboxList, 'outbox list')
-      requireOwnerPredicate(sql)
+      assertSql(/\bowner_id\s*=\s*\?/.test(sql), 'outbox list must include owner_id = ?')
       assertSql(
-        /where owner_id = \? and state in \('pending', 'failed'\) order by sequence asc$/.test(sql),
+        /where owner_id = \? and \( state = 'pending' or \(state = 'failed' and last_error in \('transient', 'reauthentication'\)\) \) order by sequence asc$/.test(sql),
         'outbox list WHERE clause and parameter order',
       )
       assertSql(sql.includes('from outbox'), 'outbox list must query outbox')
-      assertSql(sql.includes("state in ('pending', 'failed')"), 'outbox list must filter sendable states')
+      assertSql(sql.includes("last_error in ('transient', 'reauthentication')"), 'outbox list must filter sendable states')
       assertSql(sql.includes('payload_hash'), 'outbox list must select payload hash')
       assertSql(sql.includes('order by sequence asc'), 'outbox list must use FIFO sequence')
       const result = this.state.outbox
-        .filter((row) => row.owner_id === params[0])
+        .filter((row) =>
+          row.owner_id === params[0] &&
+          (row.state === 'pending' ||
+            (row.state === 'failed' && ['transient', 'reauthentication'].includes(row.last_error ?? ''))),
+        )
         .sort((left, right) => left.sequence - right.sequence)
         .map((row) => ({ ...row }))
       const pause = this.control.nextOutboxReadPause
@@ -511,6 +700,10 @@ export const __getRawDatabase = (name: string): MockDatabaseState => {
 
 export const __failNextOutboxInsert = (name: string): void => {
   __getRawDatabase(name).failNextOutboxInsert = true
+}
+
+export const __failNextOutboxAcknowledge = (name: string): void => {
+  __getRawDatabase(name).failNextOutboxAcknowledge = true
 }
 
 export const __failNextMigration = (name: string): void => {
@@ -579,6 +772,7 @@ declare module 'expo-sqlite' {
   export const __resetSQLiteMock: () => void
   export const __getRawDatabase: (name: string) => MockDatabaseState
   export const __failNextOutboxInsert: (name: string) => void
+  export const __failNextOutboxAcknowledge: (name: string) => void
   export const __failNextMigration: (name: string) => void
   export const __failNextOwnerClear: (name: string) => void
   export const __pauseNextRecordsRead: (
