@@ -305,6 +305,275 @@ $$;
 revoke execute on function public.fieldcraft_owned_entity(uuid, text, uuid)
   from public, anon, authenticated;
 
+create or replace function public.fieldcraft_enrich_receipt_entity(
+  p_user_id uuid,
+  p_entity text,
+  p_payload jsonb
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+declare
+  v_client jsonb;
+  v_job jsonb;
+begin
+  if p_payload is null then return null; end if;
+  if jsonb_typeof(p_payload) <> 'object' then
+    raise exception 'receipt cloud payload must be an object' using errcode = '22023';
+  end if;
+  if p_entity <> 'invoice' then return p_payload; end if;
+
+  select jsonb_build_object('name', client.name) into v_client
+  from public.clients as client
+  where client.user_id = p_user_id
+    and client.id = (p_payload ->> 'client_id')::uuid;
+  if v_client is null then
+    raise exception 'receipt invoice client relationship is unavailable' using errcode = '22023';
+  end if;
+  if nullif(p_payload ->> 'job_id', '') is not null then
+    select jsonb_build_object(
+      'title', job.title,
+      'address', job.address,
+      'description', job.description,
+      'trade_type', job.trade_type
+    ) into v_job
+    from public.jobs as job
+    where job.user_id = p_user_id
+      and job.id = (p_payload ->> 'job_id')::uuid;
+    if v_job is null then
+      raise exception 'receipt invoice job relationship is unavailable' using errcode = '22023';
+    end if;
+  end if;
+  return p_payload || jsonb_build_object('clients', v_client, 'jobs', v_job);
+end;
+$$;
+
+revoke execute on function public.fieldcraft_enrich_receipt_entity(uuid, text, jsonb)
+  from public, anon, authenticated;
+
+create or replace function public.fieldcraft_bind_generic_receipt(
+  p_user_id uuid,
+  p_response jsonb,
+  p_receipt_updated_at timestamptz,
+  p_mutation_id uuid,
+  p_entity text,
+  p_kind text,
+  p_entity_id uuid
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+declare
+  v_status text;
+  v_cloud jsonb;
+begin
+  if p_response is null or jsonb_typeof(p_response) <> 'object' then
+    raise exception 'stored mutation receipt is invalid' using errcode = '22023';
+  end if;
+  v_status := p_response ->> 'status';
+  if v_status is null or v_status not in ('applied', 'conflict') then
+    raise exception 'stored mutation receipt status is invalid' using errcode = '22023';
+  end if;
+  if (p_response ? 'mutation_id' and p_response ->> 'mutation_id' <> p_mutation_id::text)
+    or (p_response ? 'entity' and p_response ->> 'entity' <> p_entity)
+    or (p_response ? 'kind' and p_response ->> 'kind' <> p_kind)
+    or (p_response ? 'entity_id' and p_response ->> 'entity_id' <> p_entity_id::text)
+  then
+    raise exception 'mutation receipt identity does not match the replay contract'
+      using errcode = '22023';
+  end if;
+
+  p_response := p_response || jsonb_build_object(
+    'mutation_id', p_mutation_id,
+    'entity', p_entity,
+    'kind', p_kind,
+    'entity_id', p_entity_id
+  );
+  if v_status = 'conflict' then
+    if not (p_response ? 'cloud_payload' or p_response ? 'cloud') then
+      raise exception 'conflict receipt cloud payload is missing' using errcode = '22023';
+    end if;
+    v_cloud := coalesce(p_response -> 'cloud_payload', p_response -> 'cloud');
+    if v_cloud is not null and v_cloud <> 'null'::jsonb then
+      if v_cloud ->> 'id' <> p_entity_id::text then
+        raise exception 'conflict receipt cloud identity does not match the entity'
+          using errcode = '22023';
+      end if;
+      v_cloud := public.fieldcraft_enrich_receipt_entity(p_user_id, p_entity, v_cloud);
+    else
+      v_cloud := null;
+    end if;
+    p_response := p_response || jsonb_build_object(
+      'cloud', v_cloud,
+      'cloud_payload', v_cloud,
+      'cloud_version', coalesce((v_cloud ->> 'version')::bigint, 0)
+    );
+  elsif p_kind = 'delete' then
+    p_response := p_response || jsonb_build_object(
+      'deleted_at', coalesce(
+        nullif(p_response ->> 'deleted_at', '')::timestamptz,
+        p_receipt_updated_at
+      )
+    );
+  else
+    v_cloud := p_response -> 'cloud';
+    if v_cloud is null or jsonb_typeof(v_cloud) <> 'object'
+      or v_cloud ->> 'id' <> p_entity_id::text
+    then
+      raise exception 'applied receipt cloud identity does not match the entity'
+        using errcode = '22023';
+    end if;
+    p_response := p_response || jsonb_build_object(
+      'cloud', public.fieldcraft_enrich_receipt_entity(p_user_id, p_entity, v_cloud)
+    );
+  end if;
+  return p_response;
+end;
+$$;
+
+revoke execute on function public.fieldcraft_bind_generic_receipt(
+  uuid, jsonb, timestamptz, uuid, text, text, uuid
+) from public, anon, authenticated;
+
+create or replace function public.fieldcraft_bind_bundle_receipt(
+  p_response jsonb,
+  p_mutation_id uuid,
+  p_payload jsonb
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+declare
+  v_status text;
+  v_client_id uuid := public.require_jsonb_uuid(p_payload #> '{client,id}', 'client.id');
+  v_job_id uuid := public.require_jsonb_uuid(p_payload #> '{job,id}', 'job.id');
+  v_invoice_id uuid := public.require_jsonb_uuid(p_payload #> '{invoice,id}', 'invoice.id');
+  v_cloud jsonb;
+  v_client jsonb;
+  v_job jsonb;
+  v_invoice jsonb;
+begin
+  if public.require_jsonb_uuid(p_payload #> '{job,clientId}', 'job.clientId') <> v_client_id
+    or public.require_jsonb_uuid(p_payload #> '{invoice,clientId}', 'invoice.clientId') <> v_client_id
+    or public.require_jsonb_uuid(p_payload #> '{invoice,jobId}', 'invoice.jobId') <> v_job_id
+  then
+    raise exception 'bundle relationships do not match the supplied IDs'
+      using errcode = '22023';
+  end if;
+  if p_response is null or jsonb_typeof(p_response) <> 'object' then
+    raise exception 'stored bundle receipt is invalid' using errcode = '22023';
+  end if;
+  v_status := p_response ->> 'status';
+  if v_status is null or v_status not in ('applied', 'conflict') then
+    raise exception 'stored bundle receipt status is invalid' using errcode = '22023';
+  end if;
+  if (p_response ? 'mutation_id' and p_response ->> 'mutation_id' <> p_mutation_id::text)
+    or (p_response ? 'entity' and p_response ->> 'entity' <> 'invoice_bundle')
+    or (p_response #>> '{entity_ids,client}' is not null and p_response #>> '{entity_ids,client}' <> v_client_id::text)
+    or (p_response #>> '{entity_ids,job}' is not null and p_response #>> '{entity_ids,job}' <> v_job_id::text)
+    or (p_response #>> '{entity_ids,invoice}' is not null and p_response #>> '{entity_ids,invoice}' <> v_invoice_id::text)
+  then
+    raise exception 'bundle receipt identity does not match the replay contract'
+      using errcode = '22023';
+  end if;
+
+  if v_status = 'applied' then
+    v_client := p_response -> 'client';
+    v_job := p_response -> 'job';
+    v_invoice := p_response -> 'invoice';
+    if v_client is null or jsonb_typeof(v_client) <> 'object'
+      or v_job is null or jsonb_typeof(v_job) <> 'object'
+      or v_invoice is null or jsonb_typeof(v_invoice) <> 'object'
+    then
+      raise exception 'applied bundle receipt must contain every cloud member'
+        using errcode = '22023';
+    end if;
+  else
+    v_cloud := p_response -> 'cloud_payload';
+    if v_cloud is null or jsonb_typeof(v_cloud) <> 'object'
+      or not (v_cloud ? 'client' and v_cloud ? 'job' and v_cloud ? 'invoice')
+    then
+      raise exception 'bundle conflict receipt cloud payload is invalid' using errcode = '22023';
+    end if;
+    v_client := v_cloud -> 'client';
+    v_job := v_cloud -> 'job';
+    v_invoice := v_cloud -> 'invoice';
+  end if;
+  if (v_client is not null and v_client <> 'null'::jsonb and v_client ->> 'id' <> v_client_id::text)
+    or (v_job is not null and v_job <> 'null'::jsonb and (
+      v_job ->> 'id' <> v_job_id::text or v_job ->> 'client_id' <> v_client_id::text
+    ))
+    or (v_invoice is not null and v_invoice <> 'null'::jsonb and (
+      v_invoice ->> 'id' <> v_invoice_id::text
+      or v_invoice ->> 'client_id' <> v_client_id::text
+      or v_invoice ->> 'job_id' <> v_job_id::text
+    ))
+    or (v_job is not null and v_job <> 'null'::jsonb and (v_client is null or v_client = 'null'::jsonb))
+    or (v_invoice is not null and v_invoice <> 'null'::jsonb and (
+      v_client is null or v_client = 'null'::jsonb or v_job is null or v_job = 'null'::jsonb
+    ))
+  then
+    raise exception 'bundle receipt relationships do not match the replay contract'
+      using errcode = '22023';
+  end if;
+
+  return p_response || jsonb_build_object(
+    'mutation_id', p_mutation_id,
+    'entity', 'invoice_bundle',
+    'entity_ids', jsonb_build_object(
+      'client', v_client_id,
+      'job', v_job_id,
+      'invoice', v_invoice_id
+    ),
+    'cloud_versions', jsonb_build_object(
+      'client', coalesce((v_client ->> 'version')::bigint, 0),
+      'job', coalesce((v_job ->> 'version')::bigint, 0),
+      'invoice', coalesce((v_invoice ->> 'version')::bigint, 0)
+    )
+  );
+end;
+$$;
+
+revoke execute on function public.fieldcraft_bind_bundle_receipt(jsonb, uuid, jsonb)
+  from public, anon, authenticated;
+
+create or replace function public.fieldcraft_bundle_conflict_receipt(
+  p_mutation_id uuid,
+  p_payload jsonb,
+  p_client jsonb,
+  p_job jsonb,
+  p_invoice jsonb
+)
+returns jsonb
+language sql
+security definer
+set search_path = pg_catalog, public
+as $$
+  select public.fieldcraft_bind_bundle_receipt(
+    jsonb_build_object(
+      'status', 'conflict',
+      'local_payload', p_payload,
+      'cloud_payload', jsonb_build_object(
+        'client', p_client,
+        'job', p_job,
+        'invoice', p_invoice
+      )
+    ),
+    p_mutation_id,
+    p_payload
+  )
+$$;
+
+revoke execute on function public.fieldcraft_bundle_conflict_receipt(
+  uuid, jsonb, jsonb, jsonb, jsonb
+) from public, anon, authenticated;
+
 alter function public.apply_entity_mutation(uuid, text, text, uuid, bigint, jsonb)
   rename to apply_entity_mutation_v1_internal;
 
@@ -328,6 +597,7 @@ declare
   v_user_id uuid := auth.uid();
   v_response jsonb;
   v_cloud jsonb;
+  v_receipt_updated_at timestamptz;
 begin
   if v_user_id is null then
     raise exception 'authentication required' using errcode = '42501';
@@ -335,12 +605,37 @@ begin
   if p_mutation_id is null or p_entity_id is null then
     raise exception 'mutation and entity IDs are required' using errcode = '22023';
   end if;
+  if p_entity not in ('profile', 'client', 'job', 'invoice', 'expense', 'service', 'inventory') then
+    raise exception 'unsupported entity: %', p_entity using errcode = '22023';
+  end if;
+  if p_kind not in ('create', 'update', 'delete') then
+    raise exception 'unsupported mutation kind: %', p_kind using errcode = '22023';
+  end if;
+  if p_payload is null or jsonb_typeof(p_payload) <> 'object' then
+    raise exception 'p_payload must be an object' using errcode = '22023';
+  end if;
 
   perform pg_advisory_xact_lock(hashtextextended(v_user_id::text || ':' || p_mutation_id::text, 0));
-  select receipt.response into v_response
+  select receipt.response, receipt.updated_at into v_response, v_receipt_updated_at
   from public.mutation_receipts as receipt
   where receipt.user_id = v_user_id and receipt.mutation_id = p_mutation_id;
-  if found then return v_response; end if;
+  if found then
+    v_response := public.fieldcraft_bind_generic_receipt(
+      v_user_id,
+      v_response,
+      v_receipt_updated_at,
+      p_mutation_id,
+      p_entity,
+      p_kind,
+      p_entity_id
+    );
+    update public.mutation_receipts as receipt
+    set response = v_response
+    where receipt.user_id = v_user_id
+      and receipt.mutation_id = p_mutation_id
+      and receipt.response is distinct from v_response;
+    return v_response;
+  end if;
 
   v_cloud := public.fieldcraft_owned_entity(v_user_id, p_entity, p_entity_id);
   if (p_kind = 'create' and v_cloud is not null)
@@ -350,6 +645,7 @@ begin
       'status', 'conflict',
       'mutation_id', p_mutation_id,
       'entity', p_entity,
+      'kind', p_kind,
       'entity_id', p_entity_id,
       'base_version', p_base_version,
       'local_version', p_base_version,
@@ -374,6 +670,7 @@ begin
         'status', 'conflict',
         'mutation_id', p_mutation_id,
         'entity', p_entity,
+        'kind', p_kind,
         'entity_id', p_entity_id,
         'base_version', p_base_version,
         'local_version', p_base_version,
@@ -391,6 +688,7 @@ begin
         'status', 'conflict',
         'mutation_id', p_mutation_id,
         'entity', p_entity,
+        'kind', p_kind,
         'entity_id', p_entity_id,
         'base_version', p_base_version,
         'local_version', p_base_version,
@@ -455,6 +753,9 @@ declare
   v_client_id uuid;
   v_job_id uuid;
   v_invoice_id uuid;
+  v_client_base bigint;
+  v_job_base bigint;
+  v_invoice_base bigint;
   v_client jsonb;
   v_job jsonb;
   v_invoice jsonb;
@@ -465,38 +766,88 @@ begin
   if p_mutation_id is null or p_payload is null or jsonb_typeof(p_payload) <> 'object' then
     raise exception 'mutation ID and object payload are required' using errcode = '22023';
   end if;
+  if jsonb_typeof(p_payload -> 'client') <> 'object'
+    or jsonb_typeof(p_payload -> 'job') <> 'object'
+    or jsonb_typeof(p_payload -> 'invoice') <> 'object'
+  then
+    raise exception 'payload must contain client, job, and invoice objects'
+      using errcode = '22023';
+  end if;
+
+  v_client_id := public.require_jsonb_uuid(p_payload #> '{client,id}', 'client.id');
+  v_job_id := public.require_jsonb_uuid(p_payload #> '{job,id}', 'job.id');
+  v_invoice_id := public.require_jsonb_uuid(p_payload #> '{invoice,id}', 'invoice.id');
+  if public.require_jsonb_uuid(p_payload #> '{job,clientId}', 'job.clientId') <> v_client_id
+    or public.require_jsonb_uuid(p_payload #> '{invoice,clientId}', 'invoice.clientId') <> v_client_id
+    or public.require_jsonb_uuid(p_payload #> '{invoice,jobId}', 'invoice.jobId') <> v_job_id
+  then
+    raise exception 'bundle relationships do not match the supplied IDs'
+      using errcode = '22023';
+  end if;
 
   perform pg_advisory_xact_lock(hashtextextended(v_user_id::text || ':' || p_mutation_id::text, 0));
   select receipt.response into v_response
   from public.mutation_receipts as receipt
   where receipt.user_id = v_user_id and receipt.mutation_id = p_mutation_id;
-  if found then return v_response; end if;
+  if found then
+    v_response := public.fieldcraft_bind_bundle_receipt(v_response, p_mutation_id, p_payload);
+    update public.mutation_receipts as receipt
+    set response = v_response
+    where receipt.user_id = v_user_id
+      and receipt.mutation_id = p_mutation_id
+      and receipt.response is distinct from v_response;
+    return v_response;
+  end if;
 
-  v_client_id := public.require_jsonb_uuid(p_payload #> '{client,id}', 'client.id');
-  v_job_id := public.require_jsonb_uuid(p_payload #> '{job,id}', 'job.id');
-  v_invoice_id := public.require_jsonb_uuid(p_payload #> '{invoice,id}', 'invoice.id');
+  v_client_base := case when (p_payload -> 'client') ? 'baseVersion' then
+    public.require_jsonb_integer(
+      p_payload #> '{client,baseVersion}', 'client.baseVersion', 0, 9223372036854775807
+    ) else 0 end;
+  v_job_base := case when (p_payload -> 'job') ? 'baseVersion' then
+    public.require_jsonb_integer(
+      p_payload #> '{job,baseVersion}', 'job.baseVersion', 0, 9223372036854775807
+    ) else 0 end;
+  v_invoice_base := case when (p_payload -> 'invoice') ? 'baseVersion' then
+    public.require_jsonb_integer(
+      p_payload #> '{invoice,baseVersion}', 'invoice.baseVersion', 0, 9223372036854775807
+    ) else 0 end;
+
+  select to_jsonb(client) into v_client
+  from public.clients as client
+  where client.user_id = v_user_id and client.id = v_client_id
+  for update;
+  select to_jsonb(job) into v_job
+  from public.jobs as job
+  where job.user_id = v_user_id and job.id = v_job_id
+  for update;
+  select to_jsonb(invoice) into v_invoice
+  from public.invoices as invoice
+  where invoice.user_id = v_user_id and invoice.id = v_invoice_id
+  for update;
+
+  if (v_client is null and v_client_base > 0)
+    or (v_client is not null and (v_client_base = 0 or (v_client ->> 'version')::bigint <> v_client_base))
+    or (v_job is null and v_job_base > 0)
+    or (v_job is not null and (v_job_base = 0 or (v_job ->> 'version')::bigint <> v_job_base))
+    or (v_invoice is null and v_invoice_base > 0)
+    or (v_invoice is not null and (v_invoice_base = 0 or (v_invoice ->> 'version')::bigint <> v_invoice_base))
+  then
+    v_response := public.fieldcraft_bundle_conflict_receipt(
+      p_mutation_id, p_payload, v_client, v_job, v_invoice
+    );
+    insert into public.mutation_receipts (user_id, mutation_id, response)
+    values (v_user_id, p_mutation_id, v_response);
+    return v_response;
+  end if;
 
   begin
     v_response := public.save_invoice_bundle_v1_internal(p_mutation_id, p_payload);
-    v_response := v_response || jsonb_build_object(
-      'mutation_id', p_mutation_id,
-      'entity', 'invoice_bundle',
-      'entity_ids', jsonb_build_object(
-        'client', v_client_id,
-        'job', v_job_id,
-        'invoice', v_invoice_id
-      ),
-      'cloud_versions', jsonb_build_object(
-        'client', (v_response #>> '{client,version}')::bigint,
-        'job', (v_response #>> '{job,version}')::bigint,
-        'invoice', (v_response #>> '{invoice,version}')::bigint
-      )
-    );
+    v_response := public.fieldcraft_bind_bundle_receipt(v_response, p_mutation_id, p_payload);
     update public.mutation_receipts as receipt
     set response = v_response
     where receipt.user_id = v_user_id and receipt.mutation_id = p_mutation_id;
     return v_response;
-  exception when sqlstate '40001' then
+  exception when unique_violation or serialization_failure then
     select to_jsonb(client) into v_client
     from public.clients as client
     where client.user_id = v_user_id and client.id = v_client_id;
@@ -506,29 +857,8 @@ begin
     select to_jsonb(invoice) into v_invoice
     from public.invoices as invoice
     where invoice.user_id = v_user_id and invoice.id = v_invoice_id;
-    if v_client is null or v_job is null or v_invoice is null then
-      raise exception 'invoice bundle relationship is no longer available' using errcode = '22023';
-    end if;
-    v_response := jsonb_build_object(
-      'status', 'conflict',
-      'mutation_id', p_mutation_id,
-      'entity', 'invoice_bundle',
-      'entity_ids', jsonb_build_object(
-        'client', v_client_id,
-        'job', v_job_id,
-        'invoice', v_invoice_id
-      ),
-      'local_payload', p_payload,
-      'cloud_payload', jsonb_build_object(
-        'client', v_client,
-        'job', v_job,
-        'invoice', v_invoice
-      ),
-      'cloud_versions', jsonb_build_object(
-        'client', (v_client ->> 'version')::bigint,
-        'job', (v_job ->> 'version')::bigint,
-        'invoice', (v_invoice ->> 'version')::bigint
-      )
+    v_response := public.fieldcraft_bundle_conflict_receipt(
+      p_mutation_id, p_payload, v_client, v_job, v_invoice
     );
     insert into public.mutation_receipts (user_id, mutation_id, response)
     values (v_user_id, p_mutation_id, v_response);

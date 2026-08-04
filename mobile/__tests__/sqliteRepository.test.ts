@@ -103,18 +103,19 @@ beforeEach(() => {
   __resetSQLiteMock()
 })
 
-it('applies schema version 1 with every required table', async () => {
+it('applies schema version 2 with every required table', async () => {
   const repository = new SQLiteFieldCraftRepository({ databaseName: 'migration.db' })
 
   await repository.initialize(OWNER)
 
   const raw = __getRawDatabase('migration.db')
-  expect(raw.userVersion).toBe(1)
+  expect(raw.userVersion).toBe(2)
   expect([...raw.tables].sort()).toEqual([
     'conflicts',
     'metadata',
     'outbox',
     'records',
+    'sync_bootstrap_records',
     'sync_cursors',
   ])
 })
@@ -440,6 +441,95 @@ it('rebases a create collision as an update against the canonical SQLite cloud r
   await expect(repository.outbox.list(OWNER)).resolves.toEqual([
     expect.objectContaining({ id: MUTATION_TWO, kind: 'update', baseVersion: 4 }),
   ])
+})
+
+it('atomically replaces an update-versus-deletion conflict with an explicit create', async () => {
+  const repository = new SQLiteFieldCraftRepository({ databaseName: 'recreate-deleted.db' })
+  await repository.initialize(OWNER)
+  await repository.transactLocalMutation(mutation({
+    kind: 'update',
+    baseVersion: 1,
+    payload: client({ version: 1 }),
+  }))
+  await repository.recordMutationConflict(OWNER, {
+    mutationId: MUTATION_ONE,
+    mutationKind: 'update',
+    entity: 'client',
+    entityId: 'client-1',
+    localPayload: client({ version: 1, syncState: 'conflict', name: 'My edit' }),
+    cloudPayload: null,
+    cloudVersion: 0,
+  })
+
+  await repository.resolveConflictWithMutation(MUTATION_ONE, mutation({
+    id: MUTATION_TWO,
+    kind: 'create',
+    baseVersion: null,
+    payload: client({ version: 0, syncState: 'pending', name: 'My edit' }),
+  }))
+
+  await expect(repository.get('client', 'client-1')).resolves.toMatchObject({
+    name: 'My edit', version: 0, syncState: 'pending',
+  })
+  await expect(repository.outbox.list(OWNER)).resolves.toEqual([
+    expect.objectContaining({ id: MUTATION_TWO, kind: 'create', baseVersion: null }),
+  ])
+  expect(__getRawDatabase('recreate-deleted.db').outbox).toEqual([
+    expect.objectContaining({ mutation_id: MUTATION_ONE, state: 'complete' }),
+    expect.objectContaining({ mutation_id: MUTATION_TWO, state: 'pending' }),
+  ])
+})
+
+it('atomically rebases a compound edit with a remotely deleted invoice for explicit recreation', async () => {
+  const repository = new SQLiteFieldCraftRepository({ databaseName: 'recreate-bundle-member.db' })
+  await repository.initialize(OWNER)
+  const original = invoiceBundle()
+  original.client.version = 2
+  original.job.version = 2
+  original.invoice.version = 2
+  await repository.transactLocalMutation(bundleMutation({ payload: original }))
+  const cloudClient = client({ version: 4, syncState: 'current', name: 'Cloud client' })
+  const cloudJob = {
+    ...original.job,
+    version: 5,
+    updatedAt: '2026-08-03T10:00:05.000Z',
+    syncState: 'current' as const,
+    title: 'Cloud job',
+  }
+  await repository.recordMutationConflict(OWNER, {
+    mutationId: '00000000-0000-4000-8000-000000000020',
+    mutationKind: 'save_invoice_bundle',
+    entity: 'invoice',
+    entityId: 'invoice-1',
+    localPayload: original,
+    cloudPayload: { client: cloudClient, job: cloudJob, invoice: null },
+    cloudVersion: 0,
+  })
+  const replacement = invoiceBundle()
+  replacement.client = { ...replacement.client, version: 4, syncState: 'pending' }
+  replacement.job = { ...replacement.job, version: 5, syncState: 'pending' }
+  replacement.invoice = { ...replacement.invoice, version: 0, syncState: 'pending' }
+
+  await repository.resolveConflictWithMutation(
+    '00000000-0000-4000-8000-000000000020',
+    bundleMutation({
+      id: '00000000-0000-4000-8000-000000000021',
+      baseVersion: 0,
+      payload: replacement,
+    }),
+  )
+
+  await expect(repository.outbox.list(OWNER)).resolves.toEqual([
+    expect.objectContaining({
+      id: '00000000-0000-4000-8000-000000000021',
+      kind: 'save_invoice_bundle',
+      payload: replacement,
+    }),
+  ])
+  await expect(repository.get('invoice', 'invoice-1')).resolves.toMatchObject({
+    version: 0,
+    syncState: 'pending',
+  })
 })
 
 it('accepts a canonically equivalent duplicate mutation ID exactly once', async () => {

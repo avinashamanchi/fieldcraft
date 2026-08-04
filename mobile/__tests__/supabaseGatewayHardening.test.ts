@@ -255,6 +255,37 @@ it('preserves a null cloud tombstone in a conflict instead of fabricating local 
   })
 })
 
+it('sends an explicit recreation and preserves a concurrent remote recreation as a new conflict', async () => {
+  const client = new Client()
+  client.replies = [{
+    status: 200,
+    error: null,
+    data: {
+      status: 'conflict', mutation_id: MUTATION_ID,
+      entity: 'client', entity_id: 'client-1', cloud_version: 1,
+      cloud_payload: rawClient({ version: 1 }),
+    },
+  }]
+  const recreation = clientMutation({
+    kind: 'create',
+    baseVersion: null,
+    payload: localClient({ version: 0 }),
+  })
+
+  await expect(createSupabaseGateway(client).pushMutation(
+    OWNER,
+    recreation,
+    new AbortController().signal,
+  )).resolves.toMatchObject({
+    type: 'conflict',
+    conflict: { mutationKind: 'create', cloudVersion: 1 },
+  })
+  expect(client.calls[0]).toMatchObject({
+    name: 'apply_entity_mutation',
+    parameters: { p_kind: 'create', p_base_version: null },
+  })
+})
+
 it('validates and preserves a structured stale invoice bundle with all cloud versions', async () => {
   const client = new Client()
   client.replies = [{
@@ -291,6 +322,74 @@ it('validates and preserves a structured stale invoice bundle with all cloud ver
       },
     },
   })
+})
+
+it.each([
+  {
+    label: 'invoice',
+    cloudPayload: { client: rawClient(), job: rawJob(), invoice: null },
+    cloudVersions: { client: 4, job: 5, invoice: 0 },
+    expected: { client: { version: 4 }, job: { version: 5 }, invoice: null },
+  },
+  {
+    label: 'job and invoice',
+    cloudPayload: { client: rawClient(), job: null, invoice: null },
+    cloudVersions: { client: 4, job: 0, invoice: 0 },
+    expected: { client: { version: 4 }, job: null, invoice: null },
+  },
+  {
+    label: 'client, job, and invoice',
+    cloudPayload: { client: null, job: null, invoice: null },
+    cloudVersions: { client: 0, job: 0, invoice: 0 },
+    expected: { client: null, job: null, invoice: null },
+  },
+])('preserves a compound conflict when the remote $label member is deleted', async ({
+  cloudPayload,
+  cloudVersions,
+  expected,
+}) => {
+  const client = new Client()
+  client.replies = [{
+    status: 200,
+    error: null,
+    data: {
+      status: 'conflict', mutation_id: MUTATION_ID, entity: 'invoice_bundle',
+      entity_ids: { client: 'client-1', job: 'job-1', invoice: 'invoice-1' },
+      cloud_versions: cloudVersions,
+      local_payload: bundleMutation().payload,
+      cloud_payload: cloudPayload,
+    },
+  }]
+
+  await expect(createSupabaseGateway(client).pushMutation(
+    OWNER,
+    bundleMutation(),
+    new AbortController().signal,
+  )).resolves.toMatchObject({
+    type: 'conflict',
+    conflict: { cloudPayload: expected, cloudVersion: cloudVersions.invoice },
+  })
+})
+
+it('rejects a compound conflict whose remaining rows violate deletion relationships', async () => {
+  const client = new Client()
+  client.replies = [{
+    status: 200,
+    error: null,
+    data: {
+      status: 'conflict', mutation_id: MUTATION_ID, entity: 'invoice_bundle',
+      entity_ids: { client: 'client-1', job: 'job-1', invoice: 'invoice-1' },
+      cloud_versions: { client: 4, job: 0, invoice: 6 },
+      local_payload: bundleMutation().payload,
+      cloud_payload: { client: rawClient(), job: null, invoice: rawInvoice() },
+    },
+  }]
+
+  await expect(createSupabaseGateway(client).pushMutation(
+    OWNER,
+    bundleMutation(),
+    new AbortController().signal,
+  )).rejects.toMatchObject({ reason: 'invalid-response' })
 })
 
 it('rejects bundle rows whose canonical IDs do not match the bound entity IDs', async () => {

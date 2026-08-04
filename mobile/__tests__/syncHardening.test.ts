@@ -59,6 +59,7 @@ class FakeClock implements SyncClock {
 class Repository implements SyncRepository {
   pending: MutationEnvelope[] = []
   commits: { cursor: string; markInitialHydration: boolean }[] = []
+  conflictIds: string[] = []
   readonly outbox = { list: async () => [...this.pending] }
 
   async getSyncCursor(): Promise<string | null> { return null }
@@ -74,8 +75,14 @@ class Repository implements SyncRepository {
     this.pending = this.pending.filter((item) => item.id !== mutationId)
   }
   async recordMutationFailure(): Promise<void> {}
-  async recordMutationConflict(): Promise<void> {}
-  async countConflicts(): Promise<number> { return 0 }
+  async recordMutationConflict(
+    _ownerId: string,
+    conflict: Parameters<SyncRepository['recordMutationConflict']>[1],
+  ): Promise<void> {
+    this.conflictIds.push(conflict.mutationId)
+    this.pending = this.pending.filter((item) => item.id !== conflict.mutationId)
+  }
+  async countConflicts(): Promise<number> { return this.conflictIds.length }
 }
 
 class Gateway implements RemoteGateway {
@@ -83,6 +90,7 @@ class Gateway implements RemoteGateway {
   pushed: string[] = []
   pullResults: PullResult[] = [{ rows: [], cursor: 'cursor-1', hasMore: false }]
   pullErrors: unknown[] = []
+  pushResults: PushResult[] = []
   readonly subscriptions: {
     ownerId: string
     active: boolean
@@ -104,7 +112,7 @@ class Gateway implements RemoteGateway {
     item: MutationEnvelope,
   ): Promise<PushResult> {
     this.pushed.push(item.id)
-    return { type: 'applied', rows: [] }
+    return this.pushResults.shift() ?? { type: 'applied', rows: [] }
   }
   subscribeToOwner(
     ownerId: string,
@@ -182,6 +190,64 @@ it('leaves a permanent FIFO head visible and never uploads a later dependent mut
 
   expect(gateway.pushed).toEqual([])
   expect(coordinator.getStatus()).toMatchObject({ state: 'failed', pending: 2 })
+})
+
+it('rechecks permanent failure classification after every successful FIFO acknowledgement', async () => {
+  const { repository, gateway, coordinator } = setup()
+  repository.pending = [
+    mutation('00000000-0000-4000-8000-000000000011'),
+    mutation('00000000-0000-4000-8000-000000000012', 'invalid-response'),
+    mutation('00000000-0000-4000-8000-000000000013'),
+  ]
+
+  await coordinator.setLifecycle(active())
+
+  expect(gateway.pushed).toEqual(['00000000-0000-4000-8000-000000000011'])
+  expect(repository.pending.map((item) => item.id)).toEqual([
+    '00000000-0000-4000-8000-000000000012',
+    '00000000-0000-4000-8000-000000000013',
+  ])
+  expect(coordinator.getStatus()).toMatchObject({ state: 'failed', pending: 2 })
+})
+
+it('durably stops FIFO when an explicit recreation meets a concurrent cloud recreation', async () => {
+  const { repository, gateway, coordinator } = setup()
+  const recreate = {
+    ...mutation('00000000-0000-4000-8000-000000000014'),
+    kind: 'create' as const,
+    baseVersion: null,
+    payload: {
+      ...mutation('00000000-0000-4000-8000-000000000014').payload as Record<string, unknown>,
+      version: 0,
+    },
+  }
+  repository.pending = [
+    recreate,
+    mutation('00000000-0000-4000-8000-000000000015'),
+  ]
+  gateway.pushResults = [{
+    type: 'conflict',
+    conflict: {
+      mutationId: recreate.id,
+      ownerId: OWNER_A,
+      mutationKind: 'create',
+      entity: 'client',
+      entityId: recreate.entityId,
+      localPayload: recreate.payload,
+      cloudPayload: {
+        ...recreate.payload as Record<string, unknown>,
+        version: 1,
+        syncState: 'current',
+      },
+      cloudVersion: 1,
+    },
+  }]
+
+  await coordinator.setLifecycle(active())
+
+  expect(gateway.pushed).toEqual([recreate.id])
+  expect(repository.conflictIds).toEqual([recreate.id])
+  expect(coordinator.getStatus()).toEqual({ state: 'conflict', count: 1 })
 })
 
 it('updates the durable pending count after an offline local mutation without contacting cloud', async () => {

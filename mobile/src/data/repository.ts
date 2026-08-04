@@ -7,6 +7,12 @@ export type InvoiceBundlePayload = {
   invoice: Invoice
 }
 
+export type InvoiceBundleCloudPayload = {
+  client: Client | null
+  job: Job | null
+  invoice: Invoice | null
+}
+
 export type CloudRowEnvelope = {
   ownerId: string
   entity: EntityName

@@ -295,14 +295,12 @@ export class SyncCoordinator {
     if (!this.isRunCurrent(generation, ownerId, signal)) return
     this.setStatus({ state: 'syncing', pending: pending.length })
 
-    const blockedHead = pending[0]?.failureReason
-    if (blockedHead === 'validation' || blockedHead === 'invalid-response') {
-      this.failStatus(pending.length, blockedHead, generation, 'push')
-      return
-    }
-
-    for (const item of pending) {
+    for (const [index, item] of pending.entries()) {
       if (!this.isRunCurrent(generation, ownerId, signal)) return
+      if (item.failureReason === 'validation' || item.failureReason === 'invalid-response') {
+        this.failStatus(pending.length - index, item.failureReason, generation, 'push')
+        return
+      }
       let result
       try {
         result = await this.gateway.pushMutation(ownerId, item, signal)
@@ -509,6 +507,7 @@ export const createConflictResolutionCommands = (
     if (!conflict) throw new Error('The conflict is no longer available.')
     const isDelete = conflict.mutationKind === 'delete'
     const isBundle = conflict.mutationKind === 'save_invoice_bundle'
+    const isRemoteDeletion = !isDelete && !isBundle && conflict.cloudPayload === null
     if (!isDelete && (
       typeof conflict.localPayload !== 'object' ||
       conflict.localPayload === null ||
@@ -540,24 +539,28 @@ export const createConflictResolutionCommands = (
       entityId: conflict.entityId,
       kind: isBundle
         ? 'save_invoice_bundle'
-        : isDelete ? 'delete' : 'update',
-      baseVersion: conflict.cloudVersion,
+        : isDelete ? 'delete' : isRemoteDeletion ? 'create' : 'update',
+      baseVersion: isRemoteDeletion ? null : conflict.cloudVersion,
       payload: isDelete
         ? null
         : isBundle
           ? Object.fromEntries((['client', 'job', 'invoice'] as const).map((entity) => {
               const local = (conflict.localPayload as InvoiceBundlePayload)[entity]
-              const cloud = (conflict.cloudPayload as InvoiceBundlePayload)[entity]
+              const cloud = (conflict.cloudPayload as {
+                client: InvoiceBundlePayload['client'] | null
+                job: InvoiceBundlePayload['job'] | null
+                invoice: InvoiceBundlePayload['invoice'] | null
+              })[entity]
               return [entity, {
                 ...local,
-                version: cloud.version,
+                version: cloud?.version ?? 0,
                 updatedAt: now,
                 syncState: 'pending',
               }]
             }))
         : {
             ...localPayload,
-            version: conflict.cloudVersion,
+            version: isRemoteDeletion ? 0 : conflict.cloudVersion,
             updatedAt: now,
             syncState: 'pending',
           },

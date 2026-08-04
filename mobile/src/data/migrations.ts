@@ -1,6 +1,6 @@
 import type { SQLiteDatabase } from 'expo-sqlite'
 
-export const DATABASE_SCHEMA_VERSION = 1
+export const DATABASE_SCHEMA_VERSION = 2
 
 type UserVersionRow = { user_version: number }
 
@@ -63,10 +63,51 @@ const VERSION_ONE_SCHEMA = `
   PRAGMA user_version = 1;
 `
 
+const VERSION_TWO_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS sync_bootstrap_records (
+    owner_id TEXT NOT NULL,
+    entity TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    deleted INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0, 1)),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (owner_id, entity, entity_id)
+  );
+
+  INSERT INTO metadata (owner_id, key, value)
+  SELECT cursor.owner_id, 'sync-feed-v2-reconciliation-required', 'true'
+  FROM sync_cursors AS cursor
+  WHERE cursor.entity = '__all__'
+    AND CASE
+      WHEN json_valid(cursor.cursor) = 0 THEN 1
+      WHEN json_type(cursor.cursor, '$.updatedAt') IS NOT 'text' THEN 1
+      WHEN json_type(cursor.cursor, '$.changeId') IS NOT 'integer' THEN 1
+      ELSE 0
+    END = 1
+  ON CONFLICT(owner_id, key) DO UPDATE SET value = excluded.value;
+
+  DELETE FROM metadata
+  WHERE key = 'initial-cloud-pull-complete'
+    AND owner_id IN (
+      SELECT owner_id FROM metadata
+      WHERE key = 'sync-feed-v2-reconciliation-required'
+    );
+
+  DELETE FROM sync_cursors
+  WHERE entity = '__all__'
+    AND owner_id IN (
+      SELECT owner_id FROM metadata
+      WHERE key = 'sync-feed-v2-reconciliation-required'
+    );
+
+  PRAGMA user_version = 2;
+`
+
 export const applyMigrations = async (database: SQLiteDatabase): Promise<void> => {
   await database.withExclusiveTransactionAsync(async (transaction) => {
     const row = await transaction.getFirstAsync<UserVersionRow>('PRAGMA user_version')
-    const currentVersion = row?.user_version ?? 0
+    let currentVersion = row?.user_version ?? 0
 
     if (currentVersion > DATABASE_SCHEMA_VERSION) {
       throw new Error(
@@ -76,6 +117,11 @@ export const applyMigrations = async (database: SQLiteDatabase): Promise<void> =
 
     if (currentVersion === 0) {
       await transaction.execAsync(VERSION_ONE_SCHEMA)
+      currentVersion = 1
+    }
+
+    if (currentVersion === 1) {
+      await transaction.execAsync(VERSION_TWO_SCHEMA)
     }
   })
 }

@@ -46,6 +46,7 @@ export type MockDatabaseState = {
   userVersion: number
   tables: Set<string>
   records: RecordRow[]
+  bootstrapRecords: RecordRow[]
   outbox: OutboxRow[]
   conflicts: Record<string, unknown>[]
   syncCursors: Record<string, unknown>[]
@@ -76,6 +77,7 @@ const createState = (): MockDatabaseState => ({
   userVersion: 0,
   tables: new Set(),
   records: [],
+  bootstrapRecords: [],
   outbox: [],
   conflicts: [],
   syncCursors: [],
@@ -97,6 +99,7 @@ const copyState = (state: MockDatabaseState): MockDatabaseState => ({
   userVersion: state.userVersion,
   tables: new Set(state.tables),
   records: state.records.map((row) => ({ ...row })),
+  bootstrapRecords: state.bootstrapRecords.map((row) => ({ ...row })),
   outbox: state.outbox.map((row) => ({ ...row })),
   conflicts: state.conflicts.map((row) => ({ ...row })),
   syncCursors: state.syncCursors.map((row) => ({ ...row })),
@@ -118,6 +121,7 @@ const commitState = (target: MockDatabaseState, source: MockDatabaseState): void
   target.userVersion = source.userVersion
   target.tables = source.tables
   target.records = source.records
+  target.bootstrapRecords = source.bootstrapRecords
   target.outbox = source.outbox
   target.conflicts = source.conflicts
   target.syncCursors = source.syncCursors
@@ -136,6 +140,15 @@ const normalizeSql = (source: string): string => source.replace(/\s+/g, ' ').tri
 const expectedSql = {
   recordsUpsert: normalizeSql(`/* records:upsert */
     INSERT INTO records
+      (owner_id, entity, entity_id, payload_json, version, deleted, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(owner_id, entity, entity_id) DO UPDATE SET
+      payload_json = excluded.payload_json,
+      version = excluded.version,
+      deleted = excluded.deleted,
+      updated_at = excluded.updated_at`),
+  bootstrapUpsert: normalizeSql(`/* bootstrap:stage:upsert */
+    INSERT INTO sync_bootstrap_records
       (owner_id, entity, entity_id, payload_json, version, deleted, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(owner_id, entity, entity_id) DO UPDATE SET
@@ -185,6 +198,11 @@ const expectedSql = {
   conflictsClear: '/* owner:clear:conflicts */ delete from conflicts where owner_id = ?',
   cursorsClear: '/* owner:clear:sync_cursors */ delete from sync_cursors where owner_id = ?',
   metadataClear: '/* owner:clear:metadata */ delete from metadata where owner_id = ?',
+  bootstrapClear: '/* owner:clear:sync_bootstrap_records */ delete from sync_bootstrap_records where owner_id = ?',
+  bootstrapRecordDelete: normalizeSql(`/* bootstrap:records:delete */
+    DELETE FROM records WHERE owner_id = ? AND entity = ? AND entity_id = ?`),
+  bootstrapStageClear: '/* bootstrap:stage:clear */ delete from sync_bootstrap_records where owner_id = ?',
+  reconciliationDelete: '/* metadata:reconciliation:delete */ delete from metadata where owner_id = ? and key = ?',
   recordsGet: normalizeSql(`/* records:get */
     SELECT entity_id, payload_json FROM records
     WHERE owner_id = ? AND entity = ? AND entity_id = ? AND deleted = 0`),
@@ -222,6 +240,18 @@ const expectedSql = {
     ON CONFLICT(owner_id, key) DO UPDATE SET value = excluded.value`),
   initialPullGet: normalizeSql(`/* metadata:initial-pull:get */
     SELECT value FROM metadata WHERE owner_id = ? AND key = ?`),
+  reconciliationGet: normalizeSql(`/* metadata:reconciliation:get */
+    SELECT value FROM metadata WHERE owner_id = ? AND key = ?`),
+  bootstrapOutboxList: normalizeSql(`/* bootstrap:outbox:list */
+    SELECT entity, entity_id, kind, payload_json
+    FROM outbox
+    WHERE owner_id = ? AND state <> 'complete'`),
+  bootstrapRecordsList: normalizeSql(`/* bootstrap:records:list */
+    SELECT entity, entity_id, payload_json, version, deleted, updated_at
+    FROM sync_bootstrap_records
+    WHERE owner_id = ?`),
+  bootstrapCurrentList: normalizeSql(`/* bootstrap:current:list */
+    SELECT entity, entity_id FROM records WHERE owner_id = ?`),
 } as const
 
 const assertSql = (condition: boolean, message: string): void => {
@@ -265,6 +295,38 @@ class MockSQLiteDatabase {
       this.state.tables.add('records')
       throw new Error('simulated migration failure')
     }
+    if (source.includes('CREATE TABLE IF NOT EXISTS sync_bootstrap_records')) {
+      const legacyOwners = new Set<string>()
+      for (const cursor of this.state.syncCursors as unknown as SyncCursorRow[]) {
+        if (cursor.entity !== '__all__') continue
+        try {
+          const parsed = JSON.parse(cursor.cursor) as { updatedAt?: unknown; changeId?: unknown }
+          if (typeof parsed.updatedAt !== 'string' || !Number.isInteger(parsed.changeId)) {
+            legacyOwners.add(cursor.owner_id)
+          }
+        } catch {
+          legacyOwners.add(cursor.owner_id)
+        }
+      }
+      for (const ownerId of legacyOwners) {
+        const marker = {
+          owner_id: ownerId,
+          key: 'sync-feed-v2-reconciliation-required',
+          value: 'true',
+        }
+        const markerIndex = this.state.metadata.findIndex(
+          (row) => row.owner_id === ownerId && row.key === marker.key,
+        )
+        if (markerIndex === -1) this.state.metadata.push(marker)
+        else this.state.metadata[markerIndex] = marker
+      }
+      this.state.metadata = this.state.metadata.filter(
+        (row) => row.key !== 'initial-cloud-pull-complete' || !legacyOwners.has(String(row.owner_id)),
+      )
+      this.state.syncCursors = this.state.syncCursors.filter(
+        (row) => row.entity !== '__all__' || !legacyOwners.has(String(row.owner_id)),
+      )
+    }
     for (const match of source.matchAll(/CREATE TABLE IF NOT EXISTS\s+(\w+)/gi)) {
       this.state.tables.add(match[1])
     }
@@ -273,7 +335,9 @@ class MockSQLiteDatabase {
       this.state.userVersion = Number(version[1])
     }
     assertSql(
-      sql.includes('create table if not exists records') || /^pragma\s+user_version/.test(sql),
+      sql.includes('create table if not exists records') ||
+        sql.includes('create table if not exists sync_bootstrap_records') ||
+        /^pragma\s+user_version/.test(sql),
       'unsupported execAsync statement',
     )
   }
@@ -299,6 +363,25 @@ class MockSQLiteDatabase {
   async runAsync(source: string, ...rawParams: unknown[]): Promise<{ changes: number; lastInsertRowId: number }> {
     const params = asParams(rawParams)
     const sql = normalizeSql(source)
+    if (source.includes('bootstrap:stage:upsert')) {
+      requireExactSql(sql, expectedSql.bootstrapUpsert, 'bootstrap stage upsert')
+      const row: RecordRow = {
+        owner_id: String(params[0]),
+        entity: String(params[1]),
+        entity_id: String(params[2]),
+        payload_json: String(params[3]),
+        version: Number(params[4]),
+        deleted: Number(params[5]),
+        updated_at: String(params[6]),
+      }
+      const index = this.state.bootstrapRecords.findIndex(
+        (candidate) => candidate.owner_id === row.owner_id &&
+          candidate.entity === row.entity && candidate.entity_id === row.entity_id,
+      )
+      if (index === -1) this.state.bootstrapRecords.push(row)
+      else this.state.bootstrapRecords[index] = row
+      return { changes: 1, lastInsertRowId: 0 }
+    }
     if (source.includes('records:upsert')) {
       requireExactSql(sql, expectedSql.recordsUpsert, 'records upsert')
       assertSql(sql.includes('insert into records'), 'records upsert must insert into records')
@@ -543,6 +626,38 @@ class MockSQLiteDatabase {
       this.state.metadata = this.state.metadata.filter((row) => row.owner_id !== params[0])
       return { changes: 1, lastInsertRowId: 0 }
     }
+    if (source.includes('owner:clear:sync_bootstrap_records')) {
+      requireExactSql(sql, expectedSql.bootstrapClear, 'bootstrap owner clear')
+      requireOwnerPredicate(sql)
+      const before = this.state.bootstrapRecords.length
+      this.state.bootstrapRecords = this.state.bootstrapRecords.filter((row) => row.owner_id !== params[0])
+      return { changes: before - this.state.bootstrapRecords.length, lastInsertRowId: 0 }
+    }
+    if (source.includes('bootstrap:records:delete')) {
+      requireExactSql(sql, expectedSql.bootstrapRecordDelete, 'bootstrap record delete')
+      requireOwnerPredicate(sql)
+      const before = this.state.records.length
+      this.state.records = this.state.records.filter(
+        (row) => row.owner_id !== params[0] || row.entity !== params[1] || row.entity_id !== params[2],
+      )
+      return { changes: before - this.state.records.length, lastInsertRowId: 0 }
+    }
+    if (source.includes('bootstrap:stage:clear')) {
+      requireExactSql(sql, expectedSql.bootstrapStageClear, 'bootstrap stage clear')
+      requireOwnerPredicate(sql)
+      const before = this.state.bootstrapRecords.length
+      this.state.bootstrapRecords = this.state.bootstrapRecords.filter((row) => row.owner_id !== params[0])
+      return { changes: before - this.state.bootstrapRecords.length, lastInsertRowId: 0 }
+    }
+    if (source.includes('metadata:reconciliation:delete')) {
+      requireExactSql(sql, expectedSql.reconciliationDelete, 'reconciliation metadata delete')
+      requireOwnerPredicate(sql)
+      const before = this.state.metadata.length
+      this.state.metadata = this.state.metadata.filter(
+        (row) => row.owner_id !== params[0] || row.key !== params[1],
+      )
+      return { changes: before - this.state.metadata.length, lastInsertRowId: 0 }
+    }
     throw new Error(`Unsupported mock runAsync SQL: ${source}`)
   }
 
@@ -622,6 +737,12 @@ class MockSQLiteDatabase {
         (row) => row.owner_id === params[0] && row.key === params[1],
       ) as T | undefined ?? null
     }
+    if (source.includes('metadata:reconciliation:get')) {
+      requireExactSql(sql, expectedSql.reconciliationGet, 'reconciliation metadata get')
+      return this.state.metadata.find(
+        (row) => row.owner_id === params[0] && row.key === params[1],
+      ) as T | undefined ?? null
+    }
     if (source.includes('conflicts:get')) {
       requireExactSql(sql, expectedSql.conflictGet, 'conflict get')
       assertSql(sql.includes('conflict.owner_id = ?'), 'conflict get owner predicate')
@@ -646,6 +767,32 @@ class MockSQLiteDatabase {
   async getAllAsync<T>(source: string, ...rawParams: unknown[]): Promise<T[]> {
     const params = asParams(rawParams)
     const sql = normalizeSql(source)
+    if (source.includes('bootstrap:outbox:list')) {
+      requireExactSql(sql, expectedSql.bootstrapOutboxList, 'bootstrap outbox list')
+      requireOwnerPredicate(sql)
+      return this.state.outbox
+        .filter((row) => row.owner_id === params[0] && row.state !== 'complete')
+        .map((row) => ({
+          entity: row.entity,
+          entity_id: row.entity_id,
+          kind: row.kind,
+          payload_json: row.payload_json,
+        })) as T[]
+    }
+    if (source.includes('bootstrap:records:list')) {
+      requireExactSql(sql, expectedSql.bootstrapRecordsList, 'bootstrap records list')
+      requireOwnerPredicate(sql)
+      return this.state.bootstrapRecords
+        .filter((row) => row.owner_id === params[0])
+        .map((row) => ({ ...row })) as T[]
+    }
+    if (source.includes('bootstrap:current:list')) {
+      requireExactSql(sql, expectedSql.bootstrapCurrentList, 'bootstrap current list')
+      requireOwnerPredicate(sql)
+      return this.state.records
+        .filter((row) => row.owner_id === params[0])
+        .map((row) => ({ entity: row.entity, entity_id: row.entity_id })) as T[]
+    }
     if (source.includes('records:list')) {
       requireExactSql(sql, expectedSql.recordsList, 'records list')
       requireOwnerPredicate(sql)

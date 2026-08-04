@@ -365,6 +365,49 @@ const bundleRows = (
   return rows
 }
 
+const nullableBundleRows = (
+  rawBundle: RawRecord,
+  mutation: MutationEnvelope,
+  ownerId: string,
+): { client: CloudRowEnvelope | null; job: CloudRowEnvelope | null; invoice: CloudRowEnvelope | null } => {
+  const entityIds = asRecord(rawBundle.entity_ids)
+  const local = mutation.payload as InvoiceBundlePayload
+  if (
+    requireString(entityIds, 'client') !== local.client.id ||
+    requireString(entityIds, 'job') !== local.job.id ||
+    requireString(entityIds, 'invoice') !== local.invoice.id
+  ) {
+    throw new RemoteGatewayError('invalid-response')
+  }
+  const rawClient = rawBundle.client === null ? null : asRecord(rawBundle.client)
+  const rawJob = rawBundle.job === null ? null : asRecord(rawBundle.job)
+  const rawInvoice = rawBundle.invoice === null ? null : asRecord(rawBundle.invoice)
+  if ((rawJob && !rawClient) || (rawInvoice && (!rawClient || !rawJob))) {
+    throw new RemoteGatewayError('invalid-response')
+  }
+  const rowsByEntity = new Map<EntityName, Map<string, RawRecord>>()
+  if (rawClient) rowsByEntity.set('client', new Map([[local.client.id, rawClient]]))
+  if (rawJob) rowsByEntity.set('job', new Map([[local.job.id, rawJob]]))
+  const client = rawClient ? envelopeFromRaw('client', rawClient, ownerId, rowsByEntity) : null
+  const job = rawJob ? envelopeFromRaw('job', rawJob, ownerId, rowsByEntity) : null
+  const invoice = rawInvoice ? envelopeFromRaw('invoice', rawInvoice, ownerId, rowsByEntity) : null
+  if (
+    (client && client.entityId !== local.client.id) ||
+    (job && (
+      job.entityId !== local.job.id ||
+      (job.payload as Record<string, unknown>).clientId !== local.client.id
+    )) ||
+    (invoice && (
+      invoice.entityId !== local.invoice.id ||
+      (invoice.payload as Record<string, unknown>).clientId !== local.client.id ||
+      (invoice.payload as Record<string, unknown>).jobId !== local.job.id
+    ))
+  ) {
+    throw new RemoteGatewayError('invalid-response')
+  }
+  return { client, job, invoice }
+}
+
 const parseGenericConflict = (
   data: RawRecord,
   mutation: MutationEnvelope,
@@ -410,7 +453,7 @@ const parseBundleConflict = (
     throw new RemoteGatewayError('invalid-response')
   }
   const cloudRaw = asRecord(data.cloud_payload)
-  const rows = bundleRows({
+  const rows = nullableBundleRows({
     entity_ids: data.entity_ids,
     client: cloudRaw.client,
     job: cloudRaw.job,
@@ -418,9 +461,9 @@ const parseBundleConflict = (
   }, mutation, ownerId)
   const versions = asRecord(data.cloud_versions)
   if (
-    requireInteger(versions, 'client') !== rows[0].version ||
-    requireInteger(versions, 'job') !== rows[1].version ||
-    requireInteger(versions, 'invoice') !== rows[2].version
+    requireInteger(versions, 'client') !== (rows.client?.version ?? 0) ||
+    requireInteger(versions, 'job') !== (rows.job?.version ?? 0) ||
+    requireInteger(versions, 'invoice') !== (rows.invoice?.version ?? 0)
   ) {
     throw new RemoteGatewayError('invalid-response')
   }
@@ -443,11 +486,11 @@ const parseBundleConflict = (
       entityId: local.invoice.id,
       localPayload: mutation.payload,
       cloudPayload: {
-        client: rows[0].payload,
-        job: rows[1].payload,
-        invoice: rows[2].payload,
+        client: rows.client?.payload ?? null,
+        job: rows.job?.payload ?? null,
+        invoice: rows.invoice?.payload ?? null,
       },
-      cloudVersion: rows[2].version,
+      cloudVersion: rows.invoice?.version ?? 0,
     },
   }
 }

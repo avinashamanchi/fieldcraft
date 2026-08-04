@@ -180,6 +180,32 @@ it('resolves a create collision as an update against the row that now exists in 
   })
 })
 
+it('recreates an edited row explicitly when the remote update target was deleted', async () => {
+  const repository = new FakeConflictRepository()
+  repository.stored = {
+    ...conflict,
+    ownerId: 'owner-a',
+    mutationKind: 'update',
+    cloudPayload: null,
+    cloudVersion: 0,
+  }
+  const commands = createConflictResolutionCommands(repository, {
+    createMutationId: () => '00000000-0000-4000-8000-000000000078',
+    now: () => '2026-08-03T12:00:00.000Z',
+  })
+
+  await commands.applyMyEdit(conflict.mutationId)
+
+  expect(repository.replacements[0]).toMatchObject({
+    originalMutationId: conflict.mutationId,
+    replacement: {
+      kind: 'create',
+      baseVersion: null,
+      payload: expect.objectContaining({ version: 0, syncState: 'pending' }),
+    },
+  })
+})
+
 const bundleConflict: ConflictRecord = {
   mutationId: '00000000-0000-4000-8000-000000000076',
   mutationKind: 'save_invoice_bundle',
@@ -244,6 +270,36 @@ it('replays a compound conflict with each entity rebased to its own cloud versio
         client: { name: 'My client', version: 4, syncState: 'pending' },
         job: { title: 'My job', version: 5, syncState: 'pending' },
         invoice: { version: 6, syncState: 'pending' },
+      },
+    },
+  })
+})
+
+it('explicitly recreates deleted compound members while rebasing remaining members', async () => {
+  const repository = new FakeConflictRepository()
+  repository.stored = {
+    ...bundleConflict,
+    cloudPayload: {
+      ...(bundleConflict.cloudPayload as Record<string, unknown>),
+      invoice: null,
+    },
+    cloudVersion: 0,
+  }
+  const commands = createConflictResolutionCommands(repository, {
+    createMutationId: () => '00000000-0000-4000-8000-000000000079',
+    now: () => '2026-08-03T12:00:00.000Z',
+  })
+
+  await commands.applyMyEdit(bundleConflict.mutationId)
+
+  expect(repository.replacements[0]).toMatchObject({
+    replacement: {
+      kind: 'save_invoice_bundle',
+      baseVersion: 0,
+      payload: {
+        client: { version: 4, syncState: 'pending' },
+        job: { version: 5, syncState: 'pending' },
+        invoice: { version: 0, syncState: 'pending' },
       },
     },
   })
