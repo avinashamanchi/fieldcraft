@@ -4,6 +4,7 @@ import type { CloudRowEnvelope } from './repository'
 export type PullResult = {
   rows: CloudRowEnvelope[]
   cursor: string
+  hasMore: boolean
 }
 
 export type PushResult =

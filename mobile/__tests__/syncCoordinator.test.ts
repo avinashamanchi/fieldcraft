@@ -170,7 +170,7 @@ class FakeRepository implements SyncRepository {
 class FakeGateway implements RemoteGateway {
   readonly pushed: string[] = []
   pulls = 0
-  pullResult: PullResult = { rows: [], cursor: 'cursor-empty' }
+  pullResult: PullResult = { rows: [], cursor: 'cursor-empty', hasMore: false }
   pushResult: PushResult | null = null
   pushError: unknown = null
   pullGate: Promise<void> | null = null
@@ -372,6 +372,7 @@ it('discards a stale pull completion after the owner changes', async () => {
   gateway.pullResult = {
     rows: [canonicalRow(OWNER_A, 'stale-client')],
     cursor: 'stale-cursor',
+    hasMore: false,
   }
   gateway.pullGate = new Promise<void>((resolve) => {
     releasePull = resolve
@@ -518,6 +519,7 @@ it('calls the reviewed RPC boundary with the stable mutation UUID', async () => 
     error: null,
     data: {
       status: 'applied',
+      mutation_id: '00000000-0000-4000-8000-000000000080',
       entity: 'client',
       kind: 'create',
       entity_id: 'client-rpc',
@@ -553,10 +555,12 @@ it('sends the reviewed object payload for deletes and returns a canonical tombst
     error: null,
     data: {
       status: 'applied',
+      mutation_id: '00000000-0000-4000-8000-000000000084',
       entity: 'client',
       kind: 'delete',
       entity_id: 'client-delete',
       deleted_version: 4,
+      deleted_at: '2026-08-03T10:00:00.000Z',
     },
   }
   const gateway = createSupabaseGateway(client)
@@ -677,6 +681,7 @@ it('normalizes the reviewed version-conflict response and rejects unknown shapes
     type: 'conflict',
     conflict: {
       mutationId: item.id,
+      ownerId: OWNER_A,
       mutationKind: 'update',
       entity: 'client',
       entityId: item.entityId,
@@ -701,17 +706,22 @@ it('normalizes the reviewed version-conflict response and rejects unknown shapes
   ).rejects.toMatchObject({ reason: 'invalid-response' })
 })
 
-it('pulls owner-readable rows and returns them ordered by updated_at and id', async () => {
+it('pulls owner-readable rows from the globally ordered change feed', async () => {
   const client = new FakeSupabaseClient()
-  client.tableReplies.set('clients', {
+  client.rpcReply = {
     status: 200,
     error: null,
-    data: [
-      rawClient('client-z', '2026-08-03T10:00:03.000Z'),
-      rawClient('client-b', '2026-08-03T10:00:02.000Z'),
-      rawClient('client-a', '2026-08-03T10:00:02.000Z'),
-    ],
-  })
+    data: {
+      status: 'ok',
+      changes: [
+        { change_id: 1, owner_id: OWNER_A, entity: 'client', entity_id: 'client-a', version: 2, updated_at: '2026-08-03T10:00:02.000Z', deleted: false, payload: rawClient('client-a', '2026-08-03T10:00:02.000Z') },
+        { change_id: 2, owner_id: OWNER_A, entity: 'client', entity_id: 'client-b', version: 2, updated_at: '2026-08-03T10:00:02.000Z', deleted: false, payload: rawClient('client-b', '2026-08-03T10:00:02.000Z') },
+        { change_id: 3, owner_id: OWNER_A, entity: 'client', entity_id: 'client-z', version: 2, updated_at: '2026-08-03T10:00:03.000Z', deleted: false, payload: rawClient('client-z', '2026-08-03T10:00:03.000Z') },
+      ],
+      cursor: { updated_at: '2026-08-03T10:00:03.000Z', change_id: 3 },
+      has_more: false,
+    },
+  }
   const gateway = createSupabaseGateway(client)
 
   const result = await gateway.pullSince(OWNER_A, null, new AbortController().signal)
@@ -719,34 +729,50 @@ it('pulls owner-readable rows and returns them ordered by updated_at and id', as
   expect(result.rows.map((row) => row.entityId)).toEqual(['client-a', 'client-b', 'client-z'])
   expect(JSON.parse(result.cursor)).toEqual({
     updatedAt: '2026-08-03T10:00:03.000Z',
-    id: 'client-z',
+    changeId: 3,
   })
+  expect(result.hasMore).toBe(false)
 })
 
 it('normalizes a changed invoice from its bounded owner-readable relation projection', async () => {
   const client = new FakeSupabaseClient()
-  client.tableReplies.set('invoices', {
+  const invoice = {
+    id: 'invoice-pull',
+    user_id: OWNER_A,
+    client_id: 'client-old',
+    job_id: 'job-old',
+    number: 'INV-1',
+    line_items: [{ description: 'Labor', type: 'labor', quantity: 1000, unitPriceCents: 100 }],
+    subtotal_cents: 100,
+    tax_basis_points: 0,
+    tax_cents: 0,
+    total_cents: 100,
+    payment_terms: 'Due on receipt',
+    version: 2,
+    created_at: '2026-08-03T10:00:00.000Z',
+    updated_at: '2026-08-03T10:00:04.000Z',
+    clients: { name: 'Older client' },
+    jobs: { title: 'Older job', trade_type: 'Plumbing' },
+  }
+  client.rpcReply = {
     status: 200,
     error: null,
-    data: [{
-      id: 'invoice-pull',
-      user_id: OWNER_A,
-      client_id: 'client-old',
-      job_id: 'job-old',
-      number: 'INV-1',
-      line_items: [{ description: 'Labor', type: 'labor', quantity: 1000, unitPriceCents: 100 }],
-      subtotal_cents: 100,
-      tax_basis_points: 0,
-      tax_cents: 0,
-      total_cents: 100,
-      payment_terms: 'Due on receipt',
-      version: 2,
-      created_at: '2026-08-03T10:00:00.000Z',
-      updated_at: '2026-08-03T10:00:04.000Z',
-      clients: { name: 'Older client' },
-      jobs: { title: 'Older job', trade_type: 'Plumbing' },
-    }],
-  })
+    data: {
+      status: 'ok',
+      changes: [{
+        change_id: 4,
+        owner_id: OWNER_A,
+        entity: 'invoice',
+        entity_id: 'invoice-pull',
+        version: 2,
+        updated_at: '2026-08-03T10:00:04.000Z',
+        deleted: false,
+        payload: invoice,
+      }],
+      cursor: { updated_at: '2026-08-03T10:00:04.000Z', change_id: 4 },
+      has_more: false,
+    },
+  }
   const gateway = createSupabaseGateway(client)
 
   const result = await gateway.pullSince(OWNER_A, null, new AbortController().signal)

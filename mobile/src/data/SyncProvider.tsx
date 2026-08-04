@@ -103,7 +103,7 @@ const ConnectedSyncProvider = ({ children }: PropsWithChildren) => {
     }
   }, [])
 
-  const signedInOwner = auth.status === 'signedIn' && auth.hydrated
+  const signedInOwner = auth.status === 'signedIn'
     ? auth.userId
     : null
   const ownerId = signedInOwner !== null && owner.ownerId === signedInOwner
@@ -115,6 +115,10 @@ const ConnectedSyncProvider = ({ children }: PropsWithChildren) => {
     foreground,
     online,
   }), [foreground, online, ownerId])
+
+  useEffect(() => repository.subscribeToLocalMutations((mutationOwnerId) => {
+    if (mutationOwnerId === ownerId) void coordinator.notifyLocalMutation()
+  }), [coordinator, ownerId, repository])
 
   return (
     <ManagedSyncProvider

@@ -38,6 +38,29 @@ const displayValue = (value: unknown): string => {
   return JSON.stringify(value)
 }
 
+const flattenValues = (
+  value: unknown,
+  prefix = '',
+  output: Record<string, unknown> = {},
+): Record<string, unknown> => {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => flattenValues(item, `${prefix}[${index}]`, output))
+    if (value.length === 0 && prefix) output[prefix] = []
+    return output
+  }
+  if (typeof value === 'object' && value !== null) {
+    const entries = Object.entries(value as Record<string, unknown>)
+    if (entries.length === 0 && prefix) output[prefix] = {}
+    for (const [key, child] of entries) {
+      if (TECHNICAL_FIELDS.has(key)) continue
+      flattenValues(child, prefix ? `${prefix}.${key}` : key, output)
+    }
+    return output
+  }
+  if (prefix) output[prefix] = value
+  return output
+}
+
 export const ConflictResolutionView = ({
   conflict,
   onKeepCloud,
@@ -45,8 +68,8 @@ export const ConflictResolutionView = ({
 }: ConflictResolutionViewProps) => {
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const local = asRecord(conflict.localPayload)
-  const cloud = asRecord(conflict.cloudPayload)
+  const local = flattenValues(asRecord(conflict.localPayload))
+  const cloud = flattenValues(asRecord(conflict.cloudPayload))
   const fields = [...new Set([...Object.keys(local), ...Object.keys(cloud)])]
     .filter((field) => !TECHNICAL_FIELDS.has(field))
     .sort()

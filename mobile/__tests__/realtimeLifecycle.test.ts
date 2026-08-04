@@ -37,8 +37,8 @@ class LifecycleGateway implements RemoteGateway {
     this.maxActivePulls = Math.max(this.maxActivePulls, this.activePulls)
     try {
       await (this.pullGate ?? Promise.resolve())
-      if (signal.aborted) return { rows: [], cursor: 'aborted' }
-      return { rows: [], cursor: `cursor-${this.pulls}` }
+      if (signal.aborted) return { rows: [], cursor: 'aborted', hasMore: false }
+      return { rows: [], cursor: `cursor-${this.pulls}`, hasMore: false }
     } finally {
       this.activePulls -= 1
     }
@@ -125,7 +125,7 @@ it('treats Realtime payloads only as coalesced invalidation hints', async () => 
 
   releasePull()
   await coordinator.whenIdle()
-  expect(repository.pulls).toBe(2)
+  expect(repository.pulls).toBe(3)
 })
 
 it('cancels a pending pull when the app backgrounds and ignores its response', async () => {

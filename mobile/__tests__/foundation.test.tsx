@@ -1,8 +1,24 @@
 import { render, screen } from '@testing-library/react-native'
+import type { ReactNode } from 'react'
 import RootLayout from '../app/_layout'
 import appConfig from '../app.config'
 
+let mockAuthState: { status: string; userId?: string; hydrated?: boolean } = { status: 'signedOut' }
+
 jest.mock('expo-router', () => ({ Stack: () => null }))
+jest.mock('../src/auth/AuthProvider', () => ({
+  AuthProvider: ({ children }: { children: ReactNode }) => children,
+  useAuth: () => mockAuthState,
+}))
+jest.mock('../src/data/DataProvider', () => ({
+  DataProvider: ({ children }: { children: ReactNode }) => children,
+}))
+jest.mock('../src/data/SyncProvider', () => ({
+  SyncProvider: ({ children }: { children: ReactNode }) => children,
+}))
+jest.mock('../src/data/sqliteRepository', () => ({
+  SQLiteFieldCraftRepository: class SQLiteFieldCraftRepository {},
+}))
 
 it('uses the exact FieldCraft iOS identity', () => {
   const config = appConfig({ config: {} } as never)
@@ -13,6 +29,14 @@ it('uses the exact FieldCraft iOS identity', () => {
 })
 
 it('mounts the native root', () => {
+  mockAuthState = { status: 'signedOut' }
   render(<RootLayout />)
   expect(screen.queryByText(/vite/i)).toBeNull()
+})
+
+it('keeps the application tree hidden while first cloud hydration is incomplete', () => {
+  mockAuthState = { status: 'signedIn', userId: 'owner-a', hydrated: false }
+  render(<RootLayout />)
+
+  expect(screen.getByText('Preparing your secure workspace…')).toBeTruthy()
 })

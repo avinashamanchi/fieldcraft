@@ -28,6 +28,7 @@ export interface FieldCraftRepository {
   list<T>(entity: EntityName): Promise<T[]>
   get<T>(entity: EntityName, id: string): Promise<T | null>
   transactLocalMutation(mutation: MutationEnvelope): Promise<void>
+  subscribeToLocalMutations(listener: (ownerId: string) => void): () => void
   applyCloudRows(rows: CloudRowEnvelope[]): Promise<void>
   markConflict(conflict: ConflictRecord): Promise<void>
   getSyncCursor(ownerId: string): Promise<string | null>
@@ -35,8 +36,11 @@ export interface FieldCraftRepository {
     ownerId: string,
     rows: CloudRowEnvelope[],
     cursor: string,
+    markInitialHydration?: boolean,
     isCurrent?: () => boolean,
   ): Promise<void>
+  hasCompletedInitialPull(ownerId: string): Promise<boolean>
+  waitForInitialPull(ownerId: string): Promise<void>
   acknowledgeMutation(
     ownerId: string,
     mutationId: string,

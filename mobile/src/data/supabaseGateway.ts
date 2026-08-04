@@ -15,15 +15,6 @@ type ProviderReply = {
   status?: number
 }
 
-type QueryLike = {
-  select(columns?: string): QueryLike
-  eq(column: string, value: string): QueryLike
-  gte(column: string, value: string): QueryLike
-  order(column: string, options?: { ascending?: boolean }): QueryLike
-  limit(count: number): PromiseLike<ProviderReply>
-  abortSignal?(signal: AbortSignal): QueryLike
-}
-
 type ChannelLike = {
   on(
     event: 'postgres_changes',
@@ -36,27 +27,40 @@ type ChannelLike = {
 
 export type SupabaseGatewayClient = {
   rpc(name: string, parameters: Record<string, unknown>): PromiseLike<ProviderReply>
-  from(table: string): QueryLike
   channel(name: string): ChannelLike
+}
+
+export type SupabaseGatewayOptions = {
+  deadlineMs?: number
 }
 
 type RawRecord = Record<string, unknown>
 
 type CursorTuple = {
   updatedAt: string
-  id: string
+  changeId: number
 }
 
 const PULL_LIMIT = 500
-const TABLES: { entity: EntityName; table: string; ownerColumn: 'id' | 'user_id' }[] = [
-  { entity: 'profile', table: 'profiles', ownerColumn: 'id' },
-  { entity: 'client', table: 'clients', ownerColumn: 'user_id' },
-  { entity: 'job', table: 'jobs', ownerColumn: 'user_id' },
-  { entity: 'invoice', table: 'invoices', ownerColumn: 'user_id' },
-  { entity: 'expense', table: 'expenses', ownerColumn: 'user_id' },
-  { entity: 'service', table: 'services', ownerColumn: 'user_id' },
-  { entity: 'inventory', table: 'inventory_items', ownerColumn: 'user_id' },
+const DEFAULT_DEADLINE_MS = 20_000
+const TABLES: { table: string; ownerColumn: 'id' | 'user_id' }[] = [
+  { table: 'profiles', ownerColumn: 'id' },
+  { table: 'clients', ownerColumn: 'user_id' },
+  { table: 'jobs', ownerColumn: 'user_id' },
+  { table: 'invoices', ownerColumn: 'user_id' },
+  { table: 'expenses', ownerColumn: 'user_id' },
+  { table: 'services', ownerColumn: 'user_id' },
+  { table: 'inventory_items', ownerColumn: 'user_id' },
 ]
+const ENTITY_NAMES = new Set<EntityName>([
+  'profile',
+  'client',
+  'job',
+  'invoice',
+  'expense',
+  'service',
+  'inventory',
+])
 
 const asRecord = (value: unknown): RawRecord => {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -88,14 +92,32 @@ const requireInteger = (record: RawRecord, key: string): number => {
   return value
 }
 
+const requireBoolean = (record: RawRecord, key: string): boolean => {
+  const value = record[key]
+  if (typeof value !== 'boolean') throw new RemoteGatewayError('invalid-response')
+  return value
+}
+
+const requireEntity = (record: RawRecord, key: string): EntityName => {
+  const value = requireString(record, key) as EntityName
+  if (!ENTITY_NAMES.has(value)) throw new RemoteGatewayError('invalid-response')
+  return value
+}
+
+const requireTimestamp = (record: RawRecord, key: string): string => {
+  const value = requireString(record, key)
+  if (!Number.isFinite(Date.parse(value))) throw new RemoteGatewayError('invalid-response')
+  return value
+}
+
 const decodeCursor = (cursor: string | null): CursorTuple | null => {
   if (cursor === null) return null
   try {
     const parsed = asRecord(JSON.parse(cursor))
-    const updatedAt = requireString(parsed, 'updatedAt')
-    const id = requireString(parsed, 'id')
-    if (!Number.isFinite(Date.parse(updatedAt))) throw new RemoteGatewayError('invalid-response')
-    return { updatedAt, id }
+    return {
+      updatedAt: requireTimestamp(parsed, 'updatedAt'),
+      changeId: requireInteger(parsed, 'changeId'),
+    }
   } catch (error) {
     if (error instanceof RemoteGatewayError) throw error
     throw new RemoteGatewayError('invalid-response')
@@ -105,7 +127,7 @@ const decodeCursor = (cursor: string | null): CursorTuple | null => {
 const encodeCursor = (cursor: CursorTuple): string => JSON.stringify(cursor)
 
 const compareCursor = (left: CursorTuple, right: CursorTuple): number =>
-  left.updatedAt.localeCompare(right.updatedAt) || left.id.localeCompare(right.id)
+  left.updatedAt.localeCompare(right.updatedAt) || left.changeId - right.changeId
 
 const mapProviderFailure = (reply: ProviderReply): void => {
   if (!reply.error && (reply.status === undefined || (reply.status >= 200 && reply.status < 300))) {
@@ -120,16 +142,35 @@ const mapProviderFailure = (reply: ProviderReply): void => {
 
 const callProvider = async (
   operation: () => PromiseLike<ProviderReply>,
+  signal: AbortSignal,
+  deadlineMs: number,
   allowConflictBody = false,
 ): Promise<ProviderReply> => {
+  if (signal.aborted) throw new RemoteGatewayError('transient')
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  let abort: (() => void) | undefined
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => reject(new RemoteGatewayError('transient')), deadlineMs)
+  })
+  const cancellation = new Promise<never>((_resolve, reject) => {
+    abort = () => reject(new RemoteGatewayError('transient'))
+    signal.addEventListener('abort', abort, { once: true })
+  })
   try {
-    const reply = await operation()
+    const reply = await Promise.race([
+      Promise.resolve().then(operation),
+      deadline,
+      cancellation,
+    ])
     if (allowConflictBody && reply.status === 409 && reply.data !== null) return reply
     mapProviderFailure(reply)
     return reply
   } catch (error) {
     if (error instanceof RemoteGatewayError) throw error
     throw new RemoteGatewayError('transient')
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout)
+    if (abort) signal.removeEventListener('abort', abort)
   }
 }
 
@@ -148,17 +189,12 @@ const canonicalCommon = (
   const id = requireString(raw, 'id')
   const rawOwnerId = entity === 'profile' ? id : requireString(raw, 'user_id')
   if (rawOwnerId !== ownerId) throw new RemoteGatewayError('invalid-response')
-  const createdAt = requireString(raw, 'created_at')
-  const updatedAt = requireString(raw, 'updated_at')
-  if (!Number.isFinite(Date.parse(createdAt)) || !Number.isFinite(Date.parse(updatedAt))) {
-    throw new RemoteGatewayError('invalid-response')
-  }
   return {
     id,
     ownerId,
     version: requireInteger(raw, 'version'),
-    createdAt,
-    updatedAt,
+    createdAt: requireTimestamp(raw, 'created_at'),
+    updatedAt: requireTimestamp(raw, 'updated_at'),
     syncState: 'current',
   }
 }
@@ -179,11 +215,11 @@ const lineItemsFromCloud = (value: unknown): RawRecord[] => {
   })
 }
 
-const normalizePullPayload = (
+const normalizePayload = (
   entity: EntityName,
   raw: RawRecord,
   ownerId: string,
-  rowsByEntity: Map<EntityName, Map<string, RawRecord>>,
+  rowsByEntity: Map<EntityName, Map<string, RawRecord>> = new Map(),
 ): Record<string, unknown> => {
   const common = canonicalCommon(entity, raw, ownerId)
   switch (entity) {
@@ -247,22 +283,20 @@ const normalizePullPayload = (
   }
 }
 
-const normalizeWithLocalPayload = (
+const envelopeFromRaw = (
   entity: EntityName,
-  rawValue: unknown,
-  localValue: unknown,
+  raw: RawRecord,
   ownerId: string,
+  rowsByEntity?: Map<EntityName, Map<string, RawRecord>>,
 ): CloudRowEnvelope => {
-  const raw = asRecord(rawValue)
-  const local = asRecord(localValue)
-  const common = canonicalCommon(entity, raw, ownerId)
+  const payload = normalizePayload(entity, raw, ownerId, rowsByEntity)
   return {
     ownerId,
     entity,
-    entityId: common.id,
-    payload: { ...local, ...common },
-    version: common.version,
-    updatedAt: common.updatedAt,
+    entityId: String(payload.id),
+    payload,
+    version: Number(payload.version),
+    updatedAt: String(payload.updatedAt),
   }
 }
 
@@ -271,10 +305,11 @@ const mutationRpcPayload = (mutation: MutationEnvelope): unknown => {
   const bundle = mutation.payload as InvoiceBundlePayload
   const invoiceDraft = bundle.invoice.draft
   return {
-    client: { ...bundle.client },
-    job: { ...bundle.job, tradeType: invoiceDraft.tradeType },
+    client: { ...bundle.client, baseVersion: bundle.client.version },
+    job: { ...bundle.job, baseVersion: bundle.job.version, tradeType: invoiceDraft.tradeType },
     invoice: {
       ...bundle.invoice,
+      baseVersion: bundle.invoice.version,
       number: (bundle.invoice as unknown as RawRecord).number ?? bundle.invoice.id,
       lineItems: invoiceDraft.lineItems,
       taxBasisPoints: invoiceDraft.taxBasisPoints,
@@ -285,81 +320,135 @@ const mutationRpcPayload = (mutation: MutationEnvelope): unknown => {
   }
 }
 
-const parseConflict = (
+const requireMutationIdentity = (data: RawRecord, mutation: MutationEnvelope): void => {
+  if (requireString(data, 'mutation_id') !== mutation.id) {
+    throw new RemoteGatewayError('invalid-response')
+  }
+}
+
+const bundleRows = (
+  rawBundle: RawRecord,
+  mutation: MutationEnvelope,
+  ownerId: string,
+): CloudRowEnvelope[] => {
+  const entityIds = asRecord(rawBundle.entity_ids)
+  const local = mutation.payload as InvoiceBundlePayload
+  if (
+    requireString(entityIds, 'client') !== local.client.id ||
+    requireString(entityIds, 'job') !== local.job.id ||
+    requireString(entityIds, 'invoice') !== local.invoice.id
+  ) {
+    throw new RemoteGatewayError('invalid-response')
+  }
+  const client = asRecord(rawBundle.client)
+  const job = asRecord(rawBundle.job)
+  const invoice = asRecord(rawBundle.invoice)
+  const rowsByEntity = new Map<EntityName, Map<string, RawRecord>>([
+    ['client', new Map([[local.client.id, client]])],
+    ['job', new Map([[local.job.id, job]])],
+  ])
+  const rows = [
+    envelopeFromRaw('client', client, ownerId, rowsByEntity),
+    envelopeFromRaw('job', job, ownerId, rowsByEntity),
+    envelopeFromRaw('invoice', invoice, ownerId, rowsByEntity),
+  ]
+  if (
+    rows[0].entityId !== local.client.id ||
+    rows[1].entityId !== local.job.id ||
+    rows[2].entityId !== local.invoice.id ||
+    (rows[1].payload as Record<string, unknown>).clientId !== rows[0].entityId ||
+    (rows[2].payload as Record<string, unknown>).clientId !== rows[0].entityId ||
+    (rows[2].payload as Record<string, unknown>).jobId !== rows[1].entityId
+  ) {
+    throw new RemoteGatewayError('invalid-response')
+  }
+  return rows
+}
+
+const parseGenericConflict = (
   data: RawRecord,
   mutation: MutationEnvelope,
   ownerId: string,
 ): PushResult => {
   if (
-    requireString(data, 'mutation_id') !== mutation.id ||
     requireString(data, 'entity') !== mutation.entity ||
     requireString(data, 'entity_id') !== mutation.entityId
   ) {
     throw new RemoteGatewayError('invalid-response')
   }
   const cloudVersion = requireInteger(data, 'cloud_version')
-  const cloudRow = normalizeWithLocalPayload(
-    mutation.entity,
-    data.cloud_payload,
-    mutation.payload,
-    ownerId,
-  )
-  if (cloudRow.version !== cloudVersion) throw new RemoteGatewayError('invalid-response')
+  const cloudPayload = data.cloud_payload === null
+    ? null
+    : envelopeFromRaw(mutation.entity, asRecord(data.cloud_payload), ownerId).payload
+  if (
+    cloudPayload !== null &&
+    (cloudPayload as Record<string, unknown>).version !== cloudVersion
+  ) {
+    throw new RemoteGatewayError('invalid-response')
+  }
   return {
     type: 'conflict',
     conflict: {
       mutationId: mutation.id,
+      ownerId,
       mutationKind: mutation.kind,
       entity: mutation.entity,
       entityId: mutation.entityId,
       localPayload: mutation.payload,
-      cloudPayload: cloudRow.payload,
+      cloudPayload,
       cloudVersion,
     },
   }
 }
 
-const parseApplied = (
+const parseBundleConflict = (
   data: RawRecord,
   mutation: MutationEnvelope,
   ownerId: string,
 ): PushResult => {
-  if (mutation.kind === 'save_invoice_bundle') {
-    const bundle = mutation.payload as InvoiceBundlePayload
-    return {
-      type: 'applied',
-      rows: [
-        normalizeWithLocalPayload('client', data.client, bundle.client, ownerId),
-        normalizeWithLocalPayload('job', data.job, bundle.job, ownerId),
-        normalizeWithLocalPayload('invoice', data.invoice, bundle.invoice, ownerId),
-      ],
-    }
+  if (requireString(data, 'entity') !== 'invoice_bundle') {
+    throw new RemoteGatewayError('invalid-response')
   }
+  const cloudRaw = asRecord(data.cloud_payload)
+  const rows = bundleRows({
+    entity_ids: data.entity_ids,
+    client: cloudRaw.client,
+    job: cloudRaw.job,
+    invoice: cloudRaw.invoice,
+  }, mutation, ownerId)
+  const versions = asRecord(data.cloud_versions)
   if (
-    requireString(data, 'entity') !== mutation.entity ||
-    requireString(data, 'kind') !== mutation.kind ||
-    requireString(data, 'entity_id') !== mutation.entityId
+    requireInteger(versions, 'client') !== rows[0].version ||
+    requireInteger(versions, 'job') !== rows[1].version ||
+    requireInteger(versions, 'invoice') !== rows[2].version
   ) {
     throw new RemoteGatewayError('invalid-response')
   }
-  if (mutation.kind === 'delete') {
-    const version = requireInteger(data, 'deleted_version')
-    return {
-      type: 'applied',
-      rows: [{
-        ownerId,
-        entity: mutation.entity,
-        entityId: mutation.entityId,
-        payload: null,
-        version,
-        updatedAt: mutation.createdAt,
-        deleted: true,
-      }],
-    }
+  const localEcho = asRecord(data.local_payload)
+  const local = mutation.payload as InvoiceBundlePayload
+  if (
+    requireString(asRecord(localEcho.client), 'id') !== local.client.id ||
+    requireString(asRecord(localEcho.job), 'id') !== local.job.id ||
+    requireString(asRecord(localEcho.invoice), 'id') !== local.invoice.id
+  ) {
+    throw new RemoteGatewayError('invalid-response')
   }
   return {
-    type: 'applied',
-    rows: [normalizeWithLocalPayload(mutation.entity, data.cloud, mutation.payload, ownerId)],
+    type: 'conflict',
+    conflict: {
+      mutationId: mutation.id,
+      ownerId,
+      mutationKind: 'save_invoice_bundle',
+      entity: 'invoice',
+      entityId: local.invoice.id,
+      localPayload: mutation.payload,
+      cloudPayload: {
+        client: rows[0].payload,
+        job: rows[1].payload,
+        invoice: rows[2].payload,
+      },
+      cloudVersion: rows[2].version,
+    },
   }
 }
 
@@ -369,92 +458,165 @@ const parsePushResponse = (
   ownerId: string,
 ): PushResult => {
   const data = asRecord(value)
+  requireMutationIdentity(data, mutation)
   const status = requireString(data, 'status')
-  if (status === 'conflict') return parseConflict(data, mutation, ownerId)
-  if (status === 'applied') return parseApplied(data, mutation, ownerId)
-  throw new RemoteGatewayError('invalid-response')
+  if (status === 'conflict') {
+    return mutation.kind === 'save_invoice_bundle'
+      ? parseBundleConflict(data, mutation, ownerId)
+      : parseGenericConflict(data, mutation, ownerId)
+  }
+  if (status !== 'applied') throw new RemoteGatewayError('invalid-response')
+
+  if (mutation.kind === 'save_invoice_bundle') {
+    if (requireString(data, 'entity') !== 'invoice_bundle') {
+      throw new RemoteGatewayError('invalid-response')
+    }
+    return { type: 'applied', rows: bundleRows(data, mutation, ownerId) }
+  }
+  if (
+    requireString(data, 'entity') !== mutation.entity ||
+    requireString(data, 'kind') !== mutation.kind ||
+    requireString(data, 'entity_id') !== mutation.entityId
+  ) {
+    throw new RemoteGatewayError('invalid-response')
+  }
+  if (mutation.kind === 'delete') {
+    return {
+      type: 'applied',
+      rows: [{
+        ownerId,
+        entity: mutation.entity,
+        entityId: mutation.entityId,
+        payload: null,
+        version: requireInteger(data, 'deleted_version'),
+        updatedAt: requireTimestamp(data, 'deleted_at'),
+        deleted: true,
+      }],
+    }
+  }
+  const row = envelopeFromRaw(mutation.entity, asRecord(data.cloud), ownerId)
+  if (row.entityId !== mutation.entityId) throw new RemoteGatewayError('invalid-response')
+  return { type: 'applied', rows: [row] }
+}
+
+const parsePull = (
+  value: unknown,
+  ownerId: string,
+  previous: CursorTuple | null,
+): PullResult => {
+  const data = asRecord(value)
+  if (requireString(data, 'status') !== 'ok' || !Array.isArray(data.changes)) {
+    throw new RemoteGatewayError('invalid-response')
+  }
+  const cursorRaw = asRecord(data.cursor)
+  const cursor = {
+    updatedAt: requireTimestamp(cursorRaw, 'updated_at'),
+    changeId: requireInteger(cursorRaw, 'change_id'),
+  }
+  if (previous && compareCursor(cursor, previous) < 0) {
+    throw new RemoteGatewayError('invalid-response')
+  }
+  const parsed = data.changes.map((value) => {
+    const change = asRecord(value)
+    if (requireString(change, 'owner_id') !== ownerId) {
+      throw new RemoteGatewayError('invalid-response')
+    }
+    const position = {
+      updatedAt: requireTimestamp(change, 'updated_at'),
+      changeId: requireInteger(change, 'change_id'),
+    }
+    if (previous && compareCursor(position, previous) <= 0) {
+      throw new RemoteGatewayError('invalid-response')
+    }
+    return {
+      change,
+      position,
+      entity: requireEntity(change, 'entity'),
+      entityId: requireString(change, 'entity_id'),
+      version: requireInteger(change, 'version'),
+      deleted: requireBoolean(change, 'deleted'),
+    }
+  })
+  for (let index = 1; index < parsed.length; index += 1) {
+    if (compareCursor(parsed[index - 1].position, parsed[index].position) >= 0) {
+      throw new RemoteGatewayError('invalid-response')
+    }
+  }
+  if (parsed.length > 0 && compareCursor(parsed.at(-1)!.position, cursor) !== 0) {
+    throw new RemoteGatewayError('invalid-response')
+  }
+  const rowsByEntity = new Map<EntityName, Map<string, RawRecord>>()
+  for (const item of parsed) {
+    if (item.deleted) {
+      if (item.change.payload !== null) throw new RemoteGatewayError('invalid-response')
+      continue
+    }
+    const raw = asRecord(item.change.payload)
+    const entityRows = rowsByEntity.get(item.entity) ?? new Map<string, RawRecord>()
+    entityRows.set(item.entityId, raw)
+    rowsByEntity.set(item.entity, entityRows)
+  }
+  const rows = parsed.map((item): CloudRowEnvelope => {
+    if (item.deleted) {
+      return {
+        ownerId,
+        entity: item.entity,
+        entityId: item.entityId,
+        payload: null,
+        version: item.version,
+        updatedAt: item.position.updatedAt,
+        deleted: true,
+      }
+    }
+    const row = envelopeFromRaw(
+      item.entity,
+      asRecord(item.change.payload),
+      ownerId,
+      rowsByEntity,
+    )
+    if (
+      row.entityId !== item.entityId ||
+      row.version !== item.version ||
+      row.updatedAt !== item.position.updatedAt
+    ) {
+      throw new RemoteGatewayError('invalid-response')
+    }
+    return row
+  })
+  return { rows, cursor: encodeCursor(cursor), hasMore: requireBoolean(data, 'has_more') }
 }
 
 export const createSupabaseGateway = (
   suppliedClient?: SupabaseGatewayClient,
+  options: SupabaseGatewayOptions = {},
 ): RemoteGateway => {
   const client = suppliedClient ?? getSupabaseClient() as unknown as SupabaseGatewayClient
+  const deadlineMs = options.deadlineMs ?? DEFAULT_DEADLINE_MS
+  if (!Number.isFinite(deadlineMs) || deadlineMs <= 0) {
+    throw new Error('The synchronization deadline must be a positive number')
+  }
 
   return {
     async pullSince(ownerId, cursorValue, signal): Promise<PullResult> {
-      if (!ownerId || signal.aborted) throw new RemoteGatewayError('transient')
+      if (!ownerId) throw new RemoteGatewayError('invalid-response')
       const cursor = decodeCursor(cursorValue)
-      const rawRows = await Promise.all(TABLES.map(async ({ entity, table, ownerColumn }) => {
-        const selection = entity === 'invoice'
-          ? '*, clients!invoices_owned_client_fkey(name), jobs!invoices_owned_job_fkey(title,address,description,trade_type)'
-          : '*'
-        let query = client
-          .from(table)
-          .select(selection)
-          .eq(ownerColumn, ownerId)
-        if (cursor) query = query.gte('updated_at', cursor.updatedAt)
-        query = query.order('updated_at', { ascending: true }).order('id', { ascending: true })
-        if (query.abortSignal) query = query.abortSignal(signal)
-        const reply = await callProvider(() => query.limit(PULL_LIMIT))
-        if (!Array.isArray(reply.data)) throw new RemoteGatewayError('invalid-response')
-        return reply.data.map((value) => ({ entity, raw: asRecord(value) }))
-      }))
-      if (signal.aborted) throw new RemoteGatewayError('transient')
-
-      const flattened = rawRows.flat()
-      const rowsByEntity = new Map<EntityName, Map<string, RawRecord>>()
-      for (const { entity, raw } of flattened) {
-        const id = requireString(raw, 'id')
-        const rows = rowsByEntity.get(entity) ?? new Map<string, RawRecord>()
-        rows.set(id, raw)
-        rowsByEntity.set(entity, rows)
-      }
-
-      const normalized = flattened.map(({ entity, raw }) => {
-        if (raw.deleted === true) {
-          const common = canonicalCommon(entity, raw, ownerId)
-          return {
-            ownerId,
-            entity,
-            entityId: common.id,
-            payload: null,
-            version: common.version,
-            updatedAt: common.updatedAt,
-            deleted: true,
-          } satisfies CloudRowEnvelope
-        }
-        const payload = normalizePullPayload(entity, raw, ownerId, rowsByEntity)
-        return {
-          ownerId,
-          entity,
-          entityId: String(payload.id),
-          payload,
-          version: Number(payload.version),
-          updatedAt: String(payload.updatedAt),
-        } satisfies CloudRowEnvelope
-      }).filter((row) => {
-        if (!cursor) return true
-        return compareCursor({ updatedAt: row.updatedAt, id: row.entityId }, cursor) > 0
-      }).sort((left, right) => compareCursor(
-        { updatedAt: left.updatedAt, id: left.entityId },
-        { updatedAt: right.updatedAt, id: right.entityId },
-      )).slice(0, PULL_LIMIT)
-
-      const next = normalized.length > 0
-        ? { updatedAt: normalized.at(-1)!.updatedAt, id: normalized.at(-1)!.entityId }
-        : cursor ?? { updatedAt: '1970-01-01T00:00:00.000Z', id: '00000000-0000-0000-0000-000000000000' }
-      return { rows: normalized, cursor: encodeCursor(next) }
+      const reply = await callProvider(() => client.rpc('pull_sync_changes', {
+        p_cursor_updated_at: cursor?.updatedAt ?? null,
+        p_cursor_change_id: cursor?.changeId ?? null,
+        p_limit: PULL_LIMIT,
+      }), signal, deadlineMs)
+      return parsePull(reply.data, ownerId, cursor)
     },
 
     async pushMutation(ownerId, mutation, signal): Promise<PushResult> {
-      if (!ownerId || mutation.ownerId !== ownerId || signal.aborted) {
-        throw new RemoteGatewayError('transient')
+      if (!ownerId || mutation.ownerId !== ownerId) {
+        throw new RemoteGatewayError('invalid-response')
       }
       const reply = mutation.kind === 'save_invoice_bundle'
         ? await callProvider(() => client.rpc('save_invoice_bundle', {
             p_mutation_id: mutation.id,
             p_payload: mutationRpcPayload(mutation),
-          }), true)
+          }), signal, deadlineMs, true)
         : await callProvider(() => client.rpc('apply_entity_mutation', {
             p_mutation_id: mutation.id,
             p_entity: mutation.entity,
@@ -462,8 +624,7 @@ export const createSupabaseGateway = (
             p_entity_id: mutation.entityId,
             p_base_version: mutation.baseVersion,
             p_payload: mutation.kind === 'delete' ? {} : mutation.payload,
-          }), true)
-      if (signal.aborted) throw new RemoteGatewayError('transient')
+          }), signal, deadlineMs, true)
       return parsePushResponse(reply.data, mutation, ownerId)
     },
 
@@ -486,7 +647,9 @@ export const createSupabaseGateway = (
         )
       }
       channel.subscribe((status) => {
-        if (active && (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT')) onFailure?.()
+        if (active && (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED')) {
+          onFailure?.()
+        }
       })
       return {
         unsubscribe() {

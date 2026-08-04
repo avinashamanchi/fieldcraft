@@ -20,6 +20,7 @@ type OutboxRow = {
   created_at: string
   attempts: number
   payload_hash: string
+  last_error: MutationEnvelope['failureReason'] | null
 }
 
 type DatabaseAccess = <T>(work: (database: SQLiteDatabase) => Promise<T>) => Promise<T>
@@ -101,12 +102,9 @@ export class SQLiteMutationOutbox implements MutationOutbox {
       const rows = await database.getAllAsync<OutboxRow>(
         `/* outbox:list */
          SELECT owner_id, mutation_id, entity, entity_id, kind, base_version,
-                payload_json, payload_hash, created_at, attempts
+                payload_json, payload_hash, created_at, attempts, last_error
          FROM outbox
-         WHERE owner_id = ? AND (
-           state = 'pending'
-           OR (state = 'failed' AND last_error IN ('transient', 'reauthentication'))
-         )
+         WHERE owner_id = ? AND state IN ('pending', 'failed')
          ORDER BY sequence ASC`,
         [ownerId],
       )
@@ -140,7 +138,7 @@ export class SQLiteMutationOutbox implements MutationOutbox {
               `Corrupt outbox hash for owner ${ownerId} mutation ${row.mutation_id}`,
             )
           }
-          return mutation
+          return row.last_error ? { ...mutation, failureReason: row.last_error } : mutation
         } catch (cause) {
           throw new DataCorruptionError(
             `Corrupt outbox envelope for owner ${ownerId} mutation ${row.mutation_id}`,

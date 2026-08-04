@@ -143,6 +143,28 @@ class FakeDataLifecycle implements AuthDataLifecycle {
   }
 }
 
+class FirstPullDataLifecycle extends FakeDataLifecycle {
+  private readonly hydratedOwners = new Set<string>()
+  private readonly waiters = new Map<string, (() => void)[]>()
+
+  async hasCompletedInitialPull(ownerId: string): Promise<boolean> {
+    return this.hydratedOwners.has(ownerId)
+  }
+
+  waitForInitialPull(ownerId: string): Promise<void> {
+    if (this.hydratedOwners.has(ownerId)) return Promise.resolve()
+    return new Promise<void>((resolve) => {
+      this.waiters.set(ownerId, [...(this.waiters.get(ownerId) ?? []), resolve])
+    })
+  }
+
+  completeInitialPull(ownerId: string): void {
+    this.hydratedOwners.add(ownerId)
+    for (const resolve of this.waiters.get(ownerId) ?? []) resolve()
+    this.waiters.delete(ownerId)
+  }
+}
+
 class FakeAppState implements AppStateLifecycle {
   currentState: string | null = 'active'
   private readonly listeners = new Set<(state: string) => void>()
@@ -165,7 +187,9 @@ class FakeLinking implements LinkingLifecycle {
     return this.initialURL
   }
 
-  addEventListener(_event: 'url', _listener: (event: { url: string }) => void) {
+  addEventListener(event: 'url', listener: (event: { url: string }) => void) {
+    void event
+    void listener
     return { remove: () => {} }
   }
 }
@@ -190,6 +214,32 @@ const renderProvider = (
 }
 
 const readState = () => JSON.parse(screen.getByTestId('auth-state').props.children as string)
+
+it('keeps first-login cached app data unhydrated until a full cloud pull, then permits offline revisit', async () => {
+  const service = new FakeAuthService()
+  service.session = verifiedSession('owner-a')
+  const dataLifecycle = new FirstPullDataLifecycle()
+  const first = renderProvider(service, dataLifecycle)
+
+  await waitFor(() => expect(readState()).toMatchObject({
+    status: 'signedIn',
+    userId: 'owner-a',
+    hydrated: false,
+  }))
+  expect(dataLifecycle.activeOwnerId).toBe('owner-a')
+
+  act(() => dataLifecycle.completeInitialPull('owner-a'))
+  await waitFor(() => expect(readState()).toMatchObject({ hydrated: true }))
+  first.unmount()
+
+  const revisit = renderProvider(service, dataLifecycle)
+  await waitFor(() => expect(readState()).toMatchObject({
+    status: 'signedIn',
+    userId: 'owner-a',
+    hydrated: true,
+  }))
+  revisit.unmount()
+})
 
 it('starts refresh only while active, stops in background, and cleans up on unmount', async () => {
   const service = new FakeAuthService()

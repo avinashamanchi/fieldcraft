@@ -142,6 +142,128 @@ it('replays an offline delete conflict as a new delete against the current cloud
   })
 })
 
+it('treats an already-deleted null cloud row as keep-cloud instead of issuing an invalid delete', async () => {
+  const repository = new FakeConflictRepository()
+  repository.stored = {
+    ...conflict,
+    ownerId: 'owner-a',
+    mutationKind: 'delete',
+    localPayload: null,
+    cloudPayload: null,
+    cloudVersion: 0,
+  }
+  const commands = createConflictResolutionCommands(repository)
+
+  await commands.applyMyEdit(conflict.mutationId)
+
+  expect(repository.kept).toEqual([conflict.mutationId])
+  expect(repository.replacements).toEqual([])
+})
+
+it('resolves a create collision as an update against the row that now exists in SQLite', async () => {
+  const repository = new FakeConflictRepository()
+  repository.stored = { ...conflict, mutationKind: 'create' }
+  const commands = createConflictResolutionCommands(repository, {
+    createMutationId: () => '00000000-0000-4000-8000-000000000075',
+    now: () => '2026-08-03T12:00:00.000Z',
+  })
+
+  await commands.applyMyEdit(conflict.mutationId)
+
+  expect(repository.replacements[0]).toMatchObject({
+    originalMutationId: conflict.mutationId,
+    replacement: {
+      kind: 'update',
+      baseVersion: 4,
+      payload: expect.objectContaining({ version: 4, syncState: 'pending' }),
+    },
+  })
+})
+
+const bundleConflict: ConflictRecord = {
+  mutationId: '00000000-0000-4000-8000-000000000076',
+  mutationKind: 'save_invoice_bundle',
+  entity: 'invoice',
+  entityId: 'invoice-1',
+  cloudVersion: 6,
+  localPayload: {
+    client: { ...conflict.localPayload as object, id: 'client-1', name: 'My client', version: 2 },
+    job: {
+      id: 'job-1', ownerId: 'owner-a', clientId: 'client-1', title: 'My job', status: 'Invoiced',
+      version: 2, createdAt: '2026-08-03T10:00:00.000Z',
+      updatedAt: '2026-08-03T10:00:02.000Z', syncState: 'conflict',
+    },
+    invoice: {
+      id: 'invoice-1', ownerId: 'owner-a', clientId: 'client-1', jobId: 'job-1',
+      version: 2, createdAt: '2026-08-03T10:00:00.000Z',
+      updatedAt: '2026-08-03T10:00:02.000Z', syncState: 'conflict',
+      draft: {
+        clientName: 'My client', jobTitle: 'My job', tradeType: 'Plumbing',
+        taxBasisPoints: 0, paymentTerms: 'Due on receipt',
+        lineItems: [{ description: 'My labor', type: 'labor', quantity: 1000, unitPriceCents: 100 }],
+      },
+      subtotalCents: 100, taxCents: 0, totalCents: 100,
+    },
+  },
+  cloudPayload: {
+    client: { ...conflict.cloudPayload as object, id: 'client-1', name: 'Cloud client', version: 4 },
+    job: {
+      id: 'job-1', ownerId: 'owner-a', clientId: 'client-1', title: 'Cloud job', status: 'Invoiced',
+      version: 5, createdAt: '2026-08-03T10:00:00.000Z',
+      updatedAt: '2026-08-03T10:00:05.000Z', syncState: 'current',
+    },
+    invoice: {
+      id: 'invoice-1', ownerId: 'owner-a', clientId: 'client-1', jobId: 'job-1',
+      version: 6, createdAt: '2026-08-03T10:00:00.000Z',
+      updatedAt: '2026-08-03T10:00:06.000Z', syncState: 'current',
+      draft: {
+        clientName: 'Cloud client', jobTitle: 'Cloud job', tradeType: 'Plumbing',
+        taxBasisPoints: 0, paymentTerms: 'Net 30',
+        lineItems: [{ description: 'Cloud labor', type: 'labor', quantity: 1000, unitPriceCents: 200 }],
+      },
+      subtotalCents: 200, taxCents: 0, totalCents: 200,
+    },
+  },
+}
+
+it('replays a compound conflict with each entity rebased to its own cloud version', async () => {
+  const repository = new FakeConflictRepository()
+  repository.stored = bundleConflict
+  const commands = createConflictResolutionCommands(repository, {
+    createMutationId: () => '00000000-0000-4000-8000-000000000077',
+    now: () => '2026-08-03T12:00:00.000Z',
+  })
+
+  await commands.applyMyEdit(bundleConflict.mutationId)
+
+  expect(repository.replacements[0]).toMatchObject({
+    replacement: {
+      kind: 'save_invoice_bundle',
+      baseVersion: 6,
+      payload: {
+        client: { name: 'My client', version: 4, syncState: 'pending' },
+        job: { title: 'My job', version: 5, syncState: 'pending' },
+        invoice: { version: 6, syncState: 'pending' },
+      },
+    },
+  })
+})
+
+it('renders nested invoice and line-item fields as individual comparisons', () => {
+  render(
+    <ConflictResolutionView
+      conflict={bundleConflict}
+      onKeepCloud={async () => {}}
+      onApplyMyEdit={async () => {}}
+    />,
+  )
+
+  expect(screen.getByText('invoice.draft.paymentTerms')).toBeTruthy()
+  expect(screen.getByText('invoice.draft.lineItems[0].description')).toBeTruthy()
+  expect(screen.getByText('My labor')).toBeTruthy()
+  expect(screen.getByText('Cloud labor')).toBeTruthy()
+})
+
 it('renders field-level local/cloud values and exactly the two resolution actions', () => {
   const keepCloud = jest.fn(async () => {})
   const applyMyEdit = jest.fn(async () => {})

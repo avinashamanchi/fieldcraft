@@ -199,12 +199,9 @@ const expectedSql = {
     ORDER BY updated_at DESC, entity_id ASC`),
   outboxList: normalizeSql(`/* outbox:list */
     SELECT owner_id, mutation_id, entity, entity_id, kind, base_version,
-           payload_json, payload_hash, created_at, attempts
+           payload_json, payload_hash, created_at, attempts, last_error
     FROM outbox
-    WHERE owner_id = ? AND (
-      state = 'pending'
-      OR (state = 'failed' AND last_error IN ('transient', 'reauthentication'))
-    )
+    WHERE owner_id = ? AND state IN ('pending', 'failed')
     ORDER BY sequence ASC`),
   cursorGet: normalizeSql(`/* sync-cursors:get */
     SELECT cursor FROM sync_cursors WHERE owner_id = ? AND entity = ?`),
@@ -219,6 +216,12 @@ const expectedSql = {
     WHERE conflict.owner_id = ? AND conflict.mutation_id = ?`),
   conflictCount: normalizeSql(`/* conflicts:count */
     SELECT COUNT(*) AS count FROM conflicts WHERE owner_id = ?`),
+  initialPullUpsert: normalizeSql(`/* metadata:initial-pull:upsert */
+    INSERT INTO metadata (owner_id, key, value)
+    VALUES (?, ?, ?)
+    ON CONFLICT(owner_id, key) DO UPDATE SET value = excluded.value`),
+  initialPullGet: normalizeSql(`/* metadata:initial-pull:get */
+    SELECT value FROM metadata WHERE owner_id = ? AND key = ?`),
 } as const
 
 const assertSql = (condition: boolean, message: string): void => {
@@ -415,6 +418,16 @@ class MockSQLiteDatabase {
       else syncCursors[index] = row
       return { changes: 1, lastInsertRowId: 0 }
     }
+    if (source.includes('metadata:initial-pull:upsert')) {
+      requireExactSql(sql, expectedSql.initialPullUpsert, 'initial pull metadata upsert')
+      const row = { owner_id: params[0], key: params[1], value: params[2] }
+      const index = this.state.metadata.findIndex(
+        (item) => item.owner_id === params[0] && item.key === params[1],
+      )
+      if (index === -1) this.state.metadata.push(row)
+      else this.state.metadata[index] = row
+      return { changes: 1, lastInsertRowId: 0 }
+    }
     if (source.includes('outbox:acknowledge')) {
       requireExactSql(sql, expectedSql.outboxAcknowledge, 'outbox acknowledgement')
       requireOwnerPredicate(sql)
@@ -603,6 +616,12 @@ class MockSQLiteDatabase {
       )
       return (row ? { cursor: row.cursor } : null) as T | null
     }
+    if (source.includes('metadata:initial-pull:get')) {
+      requireExactSql(sql, expectedSql.initialPullGet, 'initial pull metadata get')
+      return this.state.metadata.find(
+        (row) => row.owner_id === params[0] && row.key === params[1],
+      ) as T | undefined ?? null
+    }
     if (source.includes('conflicts:get')) {
       requireExactSql(sql, expectedSql.conflictGet, 'conflict get')
       assertSql(sql.includes('conflict.owner_id = ?'), 'conflict get owner predicate')
@@ -655,18 +674,17 @@ class MockSQLiteDatabase {
       requireExactSql(sql, expectedSql.outboxList, 'outbox list')
       assertSql(/\bowner_id\s*=\s*\?/.test(sql), 'outbox list must include owner_id = ?')
       assertSql(
-        /where owner_id = \? and \( state = 'pending' or \(state = 'failed' and last_error in \('transient', 'reauthentication'\)\) \) order by sequence asc$/.test(sql),
+        /where owner_id = \? and state in \('pending', 'failed'\) order by sequence asc$/.test(sql),
         'outbox list WHERE clause and parameter order',
       )
       assertSql(sql.includes('from outbox'), 'outbox list must query outbox')
-      assertSql(sql.includes("last_error in ('transient', 'reauthentication')"), 'outbox list must filter sendable states')
+      assertSql(sql.includes("state in ('pending', 'failed')"), 'outbox list must retain failed FIFO heads')
       assertSql(sql.includes('payload_hash'), 'outbox list must select payload hash')
       assertSql(sql.includes('order by sequence asc'), 'outbox list must use FIFO sequence')
       const result = this.state.outbox
         .filter((row) =>
           row.owner_id === params[0] &&
-          (row.state === 'pending' ||
-            (row.state === 'failed' && ['transient', 'reauthentication'].includes(row.last_error ?? ''))),
+          (row.state === 'pending' || row.state === 'failed'),
         )
         .sort((left, right) => left.sequence - right.sequence)
         .map((row) => ({ ...row }))

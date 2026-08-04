@@ -212,7 +212,7 @@ it('commits pulled rows and the global cursor in one owner-scoped transaction', 
   await expect(repository.get('client', 'client-1')).resolves.toMatchObject({ version: 2 })
 })
 
-it('retains failed work while only transient and reauthentication failures remain sendable', async () => {
+it('retains every failed FIFO head visibly while only retryable failures can be sent', async () => {
   const repository = new SQLiteFieldCraftRepository({ databaseName: 'failure-state.db' })
   await repository.initialize(OWNER)
   await repository.transactLocalMutation(mutation())
@@ -223,7 +223,13 @@ it('retains failed work while only transient and reauthentication failures remai
   ])
 
   await repository.recordMutationFailure(OWNER, MUTATION_ONE, 'validation')
-  await expect(repository.outbox.list(OWNER)).resolves.toEqual([])
+  await expect(repository.outbox.list(OWNER)).resolves.toEqual([
+    expect.objectContaining({
+      id: MUTATION_ONE,
+      attempts: 2,
+      failureReason: 'validation',
+    }),
+  ])
   expect(__getRawDatabase('failure-state.db').outbox).toEqual([
     expect.objectContaining({
       mutation_id: MUTATION_ONE,
@@ -232,6 +238,65 @@ it('retains failed work while only transient and reauthentication failures remai
       last_error: 'validation',
     }),
   ])
+})
+
+it('keeps a permanent failed head ahead of later pending work in durable FIFO order', async () => {
+  const repository = new SQLiteFieldCraftRepository({ databaseName: 'permanent-fifo.db' })
+  await repository.initialize(OWNER)
+  await repository.transactLocalMutation(mutation())
+  await repository.transactLocalMutation(mutation({
+    id: MUTATION_TWO,
+    entityId: 'client-2',
+    payload: client({ id: 'client-2' }),
+  }))
+  await repository.recordMutationFailure(OWNER, MUTATION_ONE, 'invalid-response')
+
+  await expect(repository.outbox.list(OWNER)).resolves.toEqual([
+    expect.objectContaining({ id: MUTATION_ONE, failureReason: 'invalid-response' }),
+    expect.objectContaining({ id: MUTATION_TWO }),
+  ])
+  expect((await repository.outbox.list(OWNER))[1]).not.toHaveProperty('failureReason')
+})
+
+it('durably marks initial cloud hydration only on a complete pull and clears it with the owner', async () => {
+  const repository = new SQLiteFieldCraftRepository({ databaseName: 'cloud-hydration.db' })
+  await repository.initialize(OWNER)
+
+  await expect(repository.hasCompletedInitialPull(OWNER)).resolves.toBe(false)
+  await repository.commitPull(OWNER, [], 'cursor-page-one', false)
+  await expect(repository.hasCompletedInitialPull(OWNER)).resolves.toBe(false)
+
+  const completed = repository.waitForInitialPull(OWNER)
+  await repository.commitPull(OWNER, [], 'cursor-page-two', true)
+  await expect(completed).resolves.toBeUndefined()
+  await expect(repository.hasCompletedInitialPull(OWNER)).resolves.toBe(true)
+
+  await repository.clearOwner(OWNER)
+  await repository.initialize(OWNER)
+  await expect(repository.hasCompletedInitialPull(OWNER)).resolves.toBe(false)
+})
+
+it('emits sync wakeups only for committed local mutations, not pulls or retry bookkeeping', async () => {
+  const repository = new SQLiteFieldCraftRepository({ databaseName: 'local-mutation-events.db' })
+  await repository.initialize(OWNER)
+  const listener = jest.fn()
+  const unsubscribe = repository.subscribeToLocalMutations(listener)
+
+  await repository.transactLocalMutation(mutation())
+  expect(listener).toHaveBeenCalledTimes(1)
+  expect(listener).toHaveBeenLastCalledWith(OWNER)
+
+  await repository.commitPull(OWNER, [], 'cursor-current', true)
+  await repository.recordMutationFailure(OWNER, MUTATION_ONE, 'transient')
+  expect(listener).toHaveBeenCalledTimes(1)
+
+  unsubscribe()
+  await repository.transactLocalMutation(mutation({
+    id: MUTATION_TWO,
+    entityId: 'client-2',
+    payload: client({ id: 'client-2' }),
+  }))
+  expect(listener).toHaveBeenCalledTimes(1)
 })
 
 it('atomically records a conflict and removes it from the sendable FIFO', async () => {
@@ -261,7 +326,7 @@ it('atomically records a conflict and removes it from the sendable FIFO', async 
 
   await expect(repository.outbox.list(OWNER)).resolves.toEqual([])
   await expect(repository.countConflicts(OWNER)).resolves.toBe(1)
-  await expect(repository.getConflict(MUTATION_ONE)).resolves.toEqual(record)
+  await expect(repository.getConflict(MUTATION_ONE)).resolves.toEqual({ ...record, ownerId: OWNER })
   expect(__getRawDatabase('record-conflict.db').outbox[0]).toMatchObject({ state: 'conflict' })
 })
 
@@ -334,6 +399,47 @@ it('preserves the original outbox record while atomically creating a new current
     expect.objectContaining({ id: MUTATION_TWO, baseVersion: 3 }),
   ])
   await expect(repository.getConflict(MUTATION_ONE)).resolves.toBeNull()
+})
+
+it('rebases a create collision as an update against the canonical SQLite cloud row', async () => {
+  const repository = new SQLiteFieldCraftRepository({ databaseName: 'create-conflict.db' })
+  await repository.initialize(OWNER)
+  await repository.transactLocalMutation(mutation())
+  await repository.recordMutationConflict(OWNER, {
+    mutationId: MUTATION_ONE,
+    mutationKind: 'create',
+    entity: 'client',
+    entityId: 'client-1',
+    localPayload: client({ syncState: 'conflict', name: 'My create' }),
+    cloudPayload: client({
+      version: 4,
+      updatedAt: '2026-08-03T10:00:04.000Z',
+      syncState: 'current',
+      name: 'Cloud row',
+    }),
+    cloudVersion: 4,
+  })
+
+  await repository.resolveConflictWithMutation(MUTATION_ONE, mutation({
+    id: MUTATION_TWO,
+    kind: 'update',
+    baseVersion: 4,
+    payload: client({
+      version: 4,
+      updatedAt: '2026-08-03T10:00:05.000Z',
+      syncState: 'pending',
+      name: 'My create',
+    }),
+  }))
+
+  await expect(repository.get('client', 'client-1')).resolves.toMatchObject({
+    name: 'My create',
+    version: 4,
+    syncState: 'pending',
+  })
+  await expect(repository.outbox.list(OWNER)).resolves.toEqual([
+    expect.objectContaining({ id: MUTATION_TWO, kind: 'update', baseVersion: 4 }),
+  ])
 })
 
 it('accepts a canonically equivalent duplicate mutation ID exactly once', async () => {

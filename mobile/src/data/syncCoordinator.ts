@@ -2,7 +2,7 @@ import * as Crypto from 'expo-crypto'
 
 import type { ConflictRecord, MutationEnvelope } from '../domain/sync'
 import type { MutationOutbox } from './outbox'
-import type { CloudRowEnvelope, MutationFailureReason } from './repository'
+import type { CloudRowEnvelope, InvoiceBundlePayload, MutationFailureReason } from './repository'
 import {
   RemoteGatewayError,
   type RemoteFailureReason,
@@ -28,6 +28,7 @@ export interface SyncRepository {
     ownerId: string,
     rows: CloudRowEnvelope[],
     cursor: string,
+    markInitialHydration?: boolean,
     isCurrent?: () => boolean,
   ): Promise<void>
   acknowledgeMutation(
@@ -132,6 +133,9 @@ export class SyncCoordinator {
   private running: { generation: number; promise: Promise<void>; controller: AbortController } | null = null
   private realtime: RealtimeSubscription | null = null
   private retryTimer: unknown = null
+  private realtimeRetryTimer: unknown = null
+  private followUpRequested = false
+  private readonly retryAttempts = { authentication: 0, pull: 0, push: 0, realtime: 0 }
   private disposed = false
 
   constructor(options: SyncCoordinatorOptions) {
@@ -160,6 +164,7 @@ export class SyncCoordinator {
     this.generation += 1
     this.lifecycle = next
     this.cancelGenerationWork()
+    this.resetRetryAttempts()
 
     if (!isEligible(next)) {
       const pending = await this.readPendingCount(next.ownerId, this.generation)
@@ -173,19 +178,18 @@ export class SyncCoordinator {
     await this.trigger()
   }
 
-  trigger(): Promise<void> {
+  trigger(guaranteeFollowUp = false): Promise<void> {
     if (this.disposed || !isEligible(this.lifecycle)) return Promise.resolve()
     const requestedGeneration = this.generation
     const running = this.running
     if (running) {
-      if (running.generation === requestedGeneration) return running.promise
-      return running.promise.then(() => {
-        if (!this.isGenerationCurrent(requestedGeneration) || !isEligible(this.lifecycle)) return
-        return this.trigger()
-      })
+      if (running.generation === requestedGeneration) {
+        if (guaranteeFollowUp) this.followUpRequested = true
+        return running.promise
+      }
     }
 
-    this.clearRetry()
+    this.clearSyncRetry()
     const ownerId = this.lifecycle.ownerId
     const controller = new AbortController()
     const promise = this.runGeneration(requestedGeneration, ownerId, controller.signal)
@@ -195,14 +199,37 @@ export class SyncCoordinator {
         }
         const pending = await this.readPendingCount(ownerId, requestedGeneration)
         if (this.isRunCurrent(requestedGeneration, ownerId, controller.signal)) {
-          this.failStatus(pending, 'transient', requestedGeneration)
+          this.failStatus(pending, 'transient', requestedGeneration, 'pull')
         }
       })
       .finally(() => {
-        if (this.running?.promise === promise) this.running = null
+        if (this.running?.promise !== promise) return
+        this.running = null
+        if (
+          this.followUpRequested &&
+          this.isGenerationCurrent(requestedGeneration) &&
+          isEligible(this.lifecycle)
+        ) {
+          this.followUpRequested = false
+          void this.trigger()
+        }
       })
     this.running = { generation: requestedGeneration, promise, controller }
     return promise
+  }
+
+  async notifyLocalMutation(): Promise<void> {
+    if (this.disposed || this.lifecycle.ownerId === null) return
+    const generation = this.generation
+    const ownerId = this.lifecycle.ownerId
+    const pending = await this.readPendingCount(ownerId, generation)
+    if (!this.isGenerationCurrent(generation)) return
+    if (!isEligible(this.lifecycle)) {
+      this.setStatus({ state: 'offline', pending })
+      return
+    }
+    this.setStatus({ state: 'syncing', pending })
+    await this.trigger(true)
   }
 
   async whenIdle(): Promise<void> {
@@ -228,11 +255,12 @@ export class SyncCoordinator {
 
     try {
       await this.refreshAuthentication(ownerId, signal)
+      this.retryAttempts.authentication = 0
     } catch (error) {
       if (!this.isRunCurrent(generation, ownerId, signal)) return
       const reason = classifyFailure(error)
       if (reason === 'reauthentication') this.onReauthenticationRequired(ownerId)
-      this.failStatus(pending.length, reason, generation)
+      this.failStatus(pending.length, reason, generation, 'authentication')
       return
     }
     if (!this.isRunCurrent(generation, ownerId, signal)) return
@@ -246,11 +274,19 @@ export class SyncCoordinator {
         ownerId,
         pull.rows,
         pull.cursor,
+        !pull.hasMore,
         () => this.isRunCurrent(generation, ownerId, signal),
       )
+      this.retryAttempts.pull = 0
+      if (pull.hasMore) {
+        this.followUpRequested = true
+        return
+      }
     } catch (error) {
       if (!this.isRunCurrent(generation, ownerId, signal)) return
-      this.failStatus(pending.length, classifyFailure(error), generation)
+      const reason = classifyFailure(error)
+      if (reason === 'reauthentication') this.onReauthenticationRequired(ownerId)
+      this.failStatus(pending.length, reason, generation, 'pull')
       return
     }
     if (!this.isRunCurrent(generation, ownerId, signal)) return
@@ -258,6 +294,12 @@ export class SyncCoordinator {
     pending = await this.repository.outbox.list(ownerId)
     if (!this.isRunCurrent(generation, ownerId, signal)) return
     this.setStatus({ state: 'syncing', pending: pending.length })
+
+    const blockedHead = pending[0]?.failureReason
+    if (blockedHead === 'validation' || blockedHead === 'invalid-response') {
+      this.failStatus(pending.length, blockedHead, generation, 'push')
+      return
+    }
 
     for (const item of pending) {
       if (!this.isRunCurrent(generation, ownerId, signal)) return
@@ -275,7 +317,7 @@ export class SyncCoordinator {
         )
         if (!this.isRunCurrent(generation, ownerId, signal)) return
         if (reason === 'reauthentication') this.onReauthenticationRequired(ownerId)
-        this.failStatus(pending.length, reason, generation, item.attempts)
+        this.failStatus(pending.length, reason, generation, 'push')
         return
       }
       if (!this.isRunCurrent(generation, ownerId, signal)) return
@@ -287,6 +329,7 @@ export class SyncCoordinator {
           () => this.isRunCurrent(generation, ownerId, signal),
         )
         if (!this.isRunCurrent(generation, ownerId, signal)) return
+        this.retryAttempts.push = 0
         this.setStatus({ state: 'conflict', count: await this.repository.countConflicts(ownerId) })
         return
       }
@@ -298,6 +341,7 @@ export class SyncCoordinator {
           result.rows,
           () => this.isRunCurrent(generation, ownerId, signal),
         )
+        this.retryAttempts.push = 0
       } catch {
         if (!this.isRunCurrent(generation, ownerId, signal)) return
         try {
@@ -311,7 +355,7 @@ export class SyncCoordinator {
           // The original outbox row remains sendable when local failure recording also fails.
         }
         if (!this.isRunCurrent(generation, ownerId, signal)) return
-        this.failStatus(pending.length, 'transient', generation, item.attempts)
+        this.failStatus(pending.length, 'transient', generation, 'push')
         return
       }
     }
@@ -323,6 +367,10 @@ export class SyncCoordinator {
       this.setStatus({ state: 'conflict', count: conflicts })
       return
     }
+    if (this.followUpRequested) {
+      this.setStatus({ state: 'syncing', pending: 0 })
+      return
+    }
     this.setStatus({ state: 'current', lastSyncedAt: new Date(this.clock.now()).toISOString() })
   }
 
@@ -330,8 +378,10 @@ export class SyncCoordinator {
     pending: number,
     reason: RemoteFailureReason,
     generation: number,
-    attempts = 0,
+    operation: 'authentication' | 'pull' | 'push',
   ): void {
+    const attempts = this.retryAttempts[operation]
+    this.retryAttempts[operation] += 1
     const delay = reason === 'transient'
       ? computeRetryDelayMs(attempts, this.random())
       : 0
@@ -358,32 +408,66 @@ export class SyncCoordinator {
   }
 
   private ensureRealtime(ownerId: string, generation: number): void {
-    this.realtime = this.gateway.subscribeToOwner(
-      ownerId,
-      () => {
-        if (this.isGenerationCurrent(generation)) void this.trigger()
-      },
-      () => {
-        if (this.isGenerationCurrent(generation)) {
+    if (this.realtime || !this.isGenerationCurrent(generation)) return
+    try {
+      this.realtime = this.gateway.subscribeToOwner(
+        ownerId,
+        () => {
+          if (this.isGenerationCurrent(generation)) {
+            this.retryAttempts.realtime = 0
+            void this.trigger(true)
+          }
+        },
+        () => {
+          if (!this.isGenerationCurrent(generation)) return
           this.realtime?.unsubscribe()
           this.realtime = null
-          void this.trigger()
-        }
-      },
-    )
+          this.followUpRequested = true
+          void this.trigger(true)
+          this.scheduleRealtimeRetry(ownerId, generation)
+        },
+      )
+    } catch {
+      this.scheduleRealtimeRetry(ownerId, generation)
+    }
+  }
+
+  private scheduleRealtimeRetry(ownerId: string, generation: number): void {
+    if (this.realtimeRetryTimer !== null || !this.isGenerationCurrent(generation)) return
+    const delay = computeRetryDelayMs(this.retryAttempts.realtime, this.random())
+    this.retryAttempts.realtime += 1
+    this.realtimeRetryTimer = this.clock.setTimeout(() => {
+      this.realtimeRetryTimer = null
+      if (this.isGenerationCurrent(generation) && isEligible(this.lifecycle)) {
+        this.ensureRealtime(ownerId, generation)
+      }
+    }, delay)
   }
 
   private cancelGenerationWork(): void {
     this.running?.controller.abort()
+    this.running = null
+    this.followUpRequested = false
     this.realtime?.unsubscribe()
     this.realtime = null
-    this.clearRetry()
+    this.clearSyncRetry()
+    if (this.realtimeRetryTimer !== null) {
+      this.clock.clearTimeout(this.realtimeRetryTimer)
+      this.realtimeRetryTimer = null
+    }
   }
 
-  private clearRetry(): void {
+  private clearSyncRetry(): void {
     if (this.retryTimer === null) return
     this.clock.clearTimeout(this.retryTimer)
     this.retryTimer = null
+  }
+
+  private resetRetryAttempts(): void {
+    this.retryAttempts.authentication = 0
+    this.retryAttempts.pull = 0
+    this.retryAttempts.push = 0
+    this.retryAttempts.realtime = 0
   }
 
   private isGenerationCurrent(generation: number): boolean {
@@ -424,6 +508,7 @@ export const createConflictResolutionCommands = (
     const conflict = await repository.getConflict(mutationId)
     if (!conflict) throw new Error('The conflict is no longer available.')
     const isDelete = conflict.mutationKind === 'delete'
+    const isBundle = conflict.mutationKind === 'save_invoice_bundle'
     if (!isDelete && (
       typeof conflict.localPayload !== 'object' ||
       conflict.localPayload === null ||
@@ -433,7 +518,13 @@ export const createConflictResolutionCommands = (
     }
     const localPayload = isDelete ? null : conflict.localPayload as Record<string, unknown>
     const cloudPayload = conflict.cloudPayload as Record<string, unknown> | null
-    const ownerId = isDelete ? cloudPayload?.ownerId : localPayload?.ownerId
+    if (isDelete && cloudPayload === null) {
+      await repository.resolveConflictKeepCloud(mutationId)
+      return
+    }
+    const ownerId = isBundle
+      ? (conflict.localPayload as InvoiceBundlePayload).client.ownerId
+      : isDelete ? cloudPayload?.ownerId ?? conflict.ownerId : localPayload?.ownerId ?? conflict.ownerId
     if (typeof ownerId !== 'string' || ownerId.length === 0) {
       throw new Error('The conflict cannot be resolved safely.')
     }
@@ -447,10 +538,23 @@ export const createConflictResolutionCommands = (
       ownerId,
       entity: conflict.entity,
       entityId: conflict.entityId,
-      kind: isDelete ? 'delete' : 'update',
+      kind: isBundle
+        ? 'save_invoice_bundle'
+        : isDelete ? 'delete' : 'update',
       baseVersion: conflict.cloudVersion,
       payload: isDelete
         ? null
+        : isBundle
+          ? Object.fromEntries((['client', 'job', 'invoice'] as const).map((entity) => {
+              const local = (conflict.localPayload as InvoiceBundlePayload)[entity]
+              const cloud = (conflict.cloudPayload as InvoiceBundlePayload)[entity]
+              return [entity, {
+                ...local,
+                version: cloud.version,
+                updatedAt: now,
+                syncState: 'pending',
+              }]
+            }))
         : {
             ...localPayload,
             version: conflict.cloudVersion,

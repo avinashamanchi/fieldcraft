@@ -18,10 +18,12 @@ export type MutationEnvelope = {
   payload: unknown
   createdAt: string
   attempts: number
+  failureReason?: 'transient' | 'reauthentication' | 'validation' | 'invalid-response'
 }
 
 export type ConflictRecord = {
   mutationId: string
+  ownerId?: string
   mutationKind?: MutationKind
   entity: EntityName
   entityId: string

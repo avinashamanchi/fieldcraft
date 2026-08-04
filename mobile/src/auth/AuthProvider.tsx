@@ -25,6 +25,8 @@ export type AuthDataLifecycle = {
   initialize(ownerId: string): Promise<void>
   deactivateOwner(): void
   clearOwner(ownerId: string): Promise<void>
+  hasCompletedInitialPull?(ownerId: string): Promise<boolean>
+  waitForInitialPull?(ownerId: string): Promise<void>
   ownerBoundary?: { getSnapshot(): { ownerId: string | null } }
 }
 
@@ -377,6 +379,21 @@ export const AuthProvider = ({
         return
       }
       activeOwnerId = user.id
+      if (
+        dataLifecycle.hasCompletedInitialPull &&
+        dataLifecycle.waitForInitialPull &&
+        !(await dataLifecycle.hasCompletedInitialPull(user.id))
+      ) {
+        await dataLifecycle.waitForInitialPull(user.id)
+        if (
+          disposed ||
+          lifecycleBlocks.current.size > 0 ||
+          currentGeneration !== generation ||
+          targetOwnerId !== user.id
+        ) {
+          return
+        }
+      }
       setState({ status: 'signedIn', userId: user.id, email: user.email, hydrated: true })
     }
 
