@@ -4,6 +4,7 @@ import RootLayout from '../app/_layout'
 import appConfig from '../app.config'
 
 let mockAuthState: { status: string; userId?: string; hydrated?: boolean } = { status: 'signedOut' }
+const mockRepository = { list: jest.fn(async () => []), transactLocalMutation: jest.fn(async () => {}) }
 
 jest.mock('expo-router', () => ({ Stack: () => null }))
 jest.mock('../src/auth/AuthProvider', () => ({
@@ -12,6 +13,10 @@ jest.mock('../src/auth/AuthProvider', () => ({
 }))
 jest.mock('../src/data/DataProvider', () => ({
   DataProvider: ({ children }: { children: ReactNode }) => children,
+  useFieldCraftData: () => ({
+    owner: { ownerId: mockAuthState.userId ?? null },
+    repository: mockRepository,
+  }),
 }))
 jest.mock('../src/data/SyncProvider', () => ({
   SyncProvider: ({ children }: { children: ReactNode }) => children,

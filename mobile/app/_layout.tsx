@@ -5,9 +5,10 @@ import 'react-native-gesture-handler'
 import 'react-native-reanimated'
 
 import { AuthProvider, useAuth } from '../src/auth/AuthProvider'
-import { DataProvider } from '../src/data/DataProvider'
+import { DataProvider, useFieldCraftData } from '../src/data/DataProvider'
 import { SQLiteFieldCraftRepository } from '../src/data/sqliteRepository'
 import { SyncProvider } from '../src/data/SyncProvider'
+import { InvoiceSessionProvider } from '../src/features/invoices/invoiceSession'
 
 const HydrationGate = ({ children }: PropsWithChildren) => {
   const auth = useAuth()
@@ -38,10 +39,20 @@ const RepositoryProviders = ({
   return (
     <DataProvider ownerId={ownerId} repository={repository}>
       <SyncProvider>
-        <HydrationGate>{children}</HydrationGate>
+        <InvoiceSessionBoundary>
+          <HydrationGate>{children}</HydrationGate>
+        </InvoiceSessionBoundary>
       </SyncProvider>
     </DataProvider>
   )
+}
+
+const InvoiceSessionBoundary = ({ children }: PropsWithChildren) => {
+  const auth = useAuth()
+  const { owner, repository } = useFieldCraftData()
+  const signedInOwner = auth.status === 'signedIn' ? auth.userId : null
+  const ownerId = signedInOwner === owner.ownerId ? signedInOwner : null
+  return <InvoiceSessionProvider ownerId={ownerId} repository={repository}>{children}</InvoiceSessionProvider>
 }
 
 export default function RootLayout() {

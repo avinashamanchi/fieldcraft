@@ -200,7 +200,7 @@ const ConnectedDashboard = () => {
       <SyncStatusBanner status={syncStatus} />
       <DashboardView
         metrics={metrics}
-        onLogJob={() => router.push('/jobs/new' as never)}
+        onLogJob={() => router.push('/invoices/new' as never)}
         recentJobs={recentJobs}
       />
     </>
