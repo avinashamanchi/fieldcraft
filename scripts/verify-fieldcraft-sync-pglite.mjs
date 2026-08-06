@@ -13,6 +13,7 @@ const jobId = '72000000-0000-0000-0000-000000000071'
 const invoiceId = '73000000-0000-0000-0000-000000000071'
 const legacyMutationId = '74000000-0000-0000-0000-000000000071'
 const legacyConflictMutationId = '74000000-0000-0000-0000-000000000072'
+const unboundLegacyConflictMutationId = '74000000-0000-0000-0000-000000000079'
 const truncatedConflictMutationId = '74000000-0000-0000-0000-000000000077'
 const mismatchedConflictMutationId = '74000000-0000-0000-0000-000000000078'
 const nullNumberMutationId = '74000000-0000-0000-0000-000000000074'
@@ -137,6 +138,25 @@ try {
       ),
       '2026-08-03T10:00:01Z',
       '2026-08-03T10:00:01Z'
+    from public.invoices as invoice
+    where invoice.id = '${invoiceId}';
+
+    insert into public.mutation_receipts (user_id, mutation_id, response)
+    select
+      '${ownerId}',
+      '${unboundLegacyConflictMutationId}',
+      jsonb_build_object(
+        'status', 'conflict',
+        'mutation_id', '${unboundLegacyConflictMutationId}',
+        'entity', 'invoice',
+        'entity_id', invoice.id,
+        'base_version', 1,
+        'local_version', 1,
+        'local_payload', '{"number":"ambiguous legacy mutation"}'::jsonb,
+        'cloud_version', invoice.version,
+        'cloud', to_jsonb(invoice),
+        'cloud_payload', to_jsonb(invoice)
+      )
     from public.invoices as invoice
     where invoice.id = '${invoiceId}';
 
@@ -450,6 +470,24 @@ try {
       throw new Error('rebound legacy conflict changed after canonical deletion')
     }
   })
+
+  for (const replayKind of ['update', 'delete']) {
+    await verify(`an unbound migration-002 conflict fails closed for ${replayKind} replay`, async () => {
+      await expectSqlState(
+        () => db.query(`
+          select public.apply_entity_mutation(
+            '${unboundLegacyConflictMutationId}',
+            'invoice',
+            '${replayKind}',
+            '${invoiceId}',
+            1,
+            '{}'
+          )
+        `),
+        '22023',
+      )
+    })
+  }
 
   for (const [label, mutationId] of [
     ['a raw invoice receipt with a JSON-null number fails closed', nullNumberMutationId],

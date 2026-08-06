@@ -1,6 +1,7 @@
 import { getSupabaseClient } from '../auth/supabase'
 import type { EntityName, MutationEnvelope } from '../domain/sync'
 import type { CloudRowEnvelope, InvoiceBundlePayload } from './repository'
+import { parsePostgresTimestamp } from './postgresTimestamp'
 import {
   RemoteGatewayError,
   type PullResult,
@@ -107,7 +108,11 @@ const requireEntity = (record: RawRecord, key: string): EntityName => {
 
 const requireTimestamp = (record: RawRecord, key: string): string => {
   const value = requireString(record, key)
-  if (!Number.isFinite(Date.parse(value))) throw new RemoteGatewayError('invalid-response')
+  try {
+    parsePostgresTimestamp(value)
+  } catch {
+    throw new RemoteGatewayError('invalid-response')
+  }
   return value
 }
 

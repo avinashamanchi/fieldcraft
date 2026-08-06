@@ -21,6 +21,12 @@ type ServerAuthorityRow = RecordRow & {
   change_id: number
 }
 
+type SyncChangeEventRow = {
+  owner_id: string
+  change_seq: number
+  change_id: number
+}
+
 type OutboxRow = {
   owner_id: string
   mutation_id: string
@@ -60,6 +66,7 @@ export type MockDatabaseState = {
   records: RecordRow[]
   bootstrapRecords: BootstrapRecordRow[]
   serverAuthorities: ServerAuthorityRow[]
+  syncChangeEvents: SyncChangeEventRow[]
   outbox: OutboxRow[]
   conflicts: Record<string, unknown>[]
   syncCursors: Record<string, unknown>[]
@@ -92,6 +99,7 @@ const createState = (): MockDatabaseState => ({
   records: [],
   bootstrapRecords: [],
   serverAuthorities: [],
+  syncChangeEvents: [],
   outbox: [],
   conflicts: [],
   syncCursors: [],
@@ -115,6 +123,7 @@ const copyState = (state: MockDatabaseState): MockDatabaseState => ({
   records: state.records.map((row) => ({ ...row })),
   bootstrapRecords: state.bootstrapRecords.map((row) => ({ ...row })),
   serverAuthorities: state.serverAuthorities.map((row) => ({ ...row })),
+  syncChangeEvents: state.syncChangeEvents.map((row) => ({ ...row })),
   outbox: state.outbox.map((row) => ({ ...row })),
   conflicts: state.conflicts.map((row) => ({ ...row })),
   syncCursors: state.syncCursors.map((row) => ({ ...row })),
@@ -138,6 +147,7 @@ const commitState = (target: MockDatabaseState, source: MockDatabaseState): void
   target.records = source.records
   target.bootstrapRecords = source.bootstrapRecords
   target.serverAuthorities = source.serverAuthorities
+  target.syncChangeEvents = source.syncChangeEvents
   target.outbox = source.outbox
   target.conflicts = source.conflicts
   target.syncCursors = source.syncCursors
@@ -189,6 +199,9 @@ const expectedSql = {
       change_source = excluded.change_source,
       change_seq = excluded.change_seq,
       change_id = excluded.change_id`),
+  syncChangeEventInsert: normalizeSql(`/* sync-change-events:insert */
+    INSERT INTO sync_change_events (owner_id, change_seq, change_id)
+    VALUES (?, ?, ?)`),
   outboxInsert: normalizeSql(`/* outbox:insert */
     INSERT INTO outbox
       (owner_id, mutation_id, sequence, entity, entity_id, kind, base_version,
@@ -234,6 +247,7 @@ const expectedSql = {
   metadataClear: '/* owner:clear:metadata */ delete from metadata where owner_id = ?',
   bootstrapClear: '/* owner:clear:sync_bootstrap_records */ delete from sync_bootstrap_records where owner_id = ?',
   authorityClear: '/* owner:clear:sync_server_authority */ delete from sync_server_authority where owner_id = ?',
+  syncChangeEventsClear: '/* owner:clear:sync_change_events */ delete from sync_change_events where owner_id = ?',
   bootstrapRecordDelete: normalizeSql(`/* bootstrap:records:delete */
     DELETE FROM records WHERE owner_id = ? AND entity = ? AND entity_id = ?`),
   bootstrapStageClear: '/* bootstrap:stage:clear */ delete from sync_bootstrap_records where owner_id = ?',
@@ -318,6 +332,14 @@ const expectedSql = {
            updated_at, change_source, change_seq, change_id
     FROM sync_server_authority
     WHERE owner_id = ? AND entity = ? AND entity_id = ?`),
+  syncChangeEventGetBySequence: normalizeSql(`/* sync-change-events:get-by-sequence */
+    SELECT change_seq, change_id
+    FROM sync_change_events
+    WHERE owner_id = ? AND change_seq = ?`),
+  syncChangeEventGetById: normalizeSql(`/* sync-change-events:get-by-id */
+    SELECT change_seq, change_id
+    FROM sync_change_events
+    WHERE owner_id = ? AND change_id = ?`),
   authorityList: normalizeSql(`/* server-authority:list */
     SELECT owner_id, entity, entity_id, payload_json, version, deleted,
            updated_at, change_source, change_seq, change_id
@@ -472,6 +494,32 @@ class MockSQLiteDatabase {
       ))
       this.state.bootstrapRecords = []
     }
+    if (source.includes('CREATE TABLE IF NOT EXISTS sync_change_events')) {
+      const events: SyncChangeEventRow[] = []
+      for (const authority of this.state.serverAuthorities) {
+        if (authority.change_source !== 'sync_changes') continue
+        const sequenceConflict = events.find((row) => (
+          row.owner_id === authority.owner_id && row.change_seq === authority.change_seq
+        ))
+        const idConflict = events.find((row) => (
+          row.owner_id === authority.owner_id && row.change_id === authority.change_id
+        ))
+        if (
+          (sequenceConflict && sequenceConflict.change_id !== authority.change_id) ||
+          (idConflict && idConflict.change_seq !== authority.change_seq)
+        ) {
+          throw new Error('sync change event backfill violates immutable owner identity')
+        }
+        if (!sequenceConflict && !idConflict) {
+          events.push({
+            owner_id: authority.owner_id,
+            change_seq: authority.change_seq,
+            change_id: authority.change_id,
+          })
+        }
+      }
+      this.state.syncChangeEvents = events
+    }
     for (const match of source.matchAll(/CREATE TABLE IF NOT EXISTS\s+(\w+)/gi)) {
       this.state.tables.add(match[1])
     }
@@ -483,6 +531,7 @@ class MockSQLiteDatabase {
       sql.includes('create table if not exists records') ||
         sql.includes('create table if not exists sync_bootstrap_records') ||
         sql.includes('create table if not exists sync_server_authority') ||
+        sql.includes('create table if not exists sync_change_events') ||
         sql.includes('alter table sync_bootstrap_records add column change_id') ||
         sql.includes('alter table sync_bootstrap_records add column change_seq') ||
         /^pragma\s+user_version/.test(sql),
@@ -557,6 +606,21 @@ class MockSQLiteDatabase {
       )
       if (index === -1) this.state.serverAuthorities.push(row)
       else this.state.serverAuthorities[index] = row
+      return { changes: 1, lastInsertRowId: 0 }
+    }
+    if (source.includes('sync-change-events:insert')) {
+      requireExactSql(sql, expectedSql.syncChangeEventInsert, 'sync change event insert')
+      const row: SyncChangeEventRow = {
+        owner_id: String(params[0]),
+        change_seq: Number(params[1]),
+        change_id: Number(params[2]),
+      }
+      const conflict = this.state.syncChangeEvents.find((candidate) => (
+        candidate.owner_id === row.owner_id &&
+        (candidate.change_seq === row.change_seq || candidate.change_id === row.change_id)
+      ))
+      if (conflict) throw new Error('sync change event uniqueness violation')
+      this.state.syncChangeEvents.push(row)
       return { changes: 1, lastInsertRowId: 0 }
     }
     if (source.includes('records:upsert')) {
@@ -858,6 +922,15 @@ class MockSQLiteDatabase {
       )
       return { changes: before - this.state.serverAuthorities.length, lastInsertRowId: 0 }
     }
+    if (source.includes('owner:clear:sync_change_events')) {
+      requireExactSql(sql, expectedSql.syncChangeEventsClear, 'sync change events owner clear')
+      requireOwnerPredicate(sql)
+      const before = this.state.syncChangeEvents.length
+      this.state.syncChangeEvents = this.state.syncChangeEvents.filter(
+        (row) => row.owner_id !== params[0],
+      )
+      return { changes: before - this.state.syncChangeEvents.length, lastInsertRowId: 0 }
+    }
     if (source.includes('bootstrap:records:delete')) {
       requireExactSql(sql, expectedSql.bootstrapRecordDelete, 'bootstrap record delete')
       requireOwnerPredicate(sql)
@@ -945,6 +1018,22 @@ class MockSQLiteDatabase {
         (candidate) => candidate.owner_id === params[0] &&
           candidate.entity === params[1] && candidate.entity_id === params[2],
       )
+      return (row ? { ...row } : null) as T | null
+    }
+    if (source.includes('sync-change-events:get-by-sequence')) {
+      requireExactSql(sql, expectedSql.syncChangeEventGetBySequence, 'sync change event sequence lookup')
+      requireOwnerPredicate(sql)
+      const row = this.state.syncChangeEvents.find((candidate) => (
+        candidate.owner_id === params[0] && candidate.change_seq === params[1]
+      ))
+      return (row ? { ...row } : null) as T | null
+    }
+    if (source.includes('sync-change-events:get-by-id')) {
+      requireExactSql(sql, expectedSql.syncChangeEventGetById, 'sync change event ID lookup')
+      requireOwnerPredicate(sql)
+      const row = this.state.syncChangeEvents.find((candidate) => (
+        candidate.owner_id === params[0] && candidate.change_id === params[1]
+      ))
       return (row ? { ...row } : null) as T | null
     }
     if (source.includes('outbox:duplicate')) {

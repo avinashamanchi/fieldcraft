@@ -195,6 +195,41 @@ it('pulls one owner-filtered global change feed page with a committed owner sequ
 })
 
 it.each([
+  '2026-02-30T10:00:00.000Z',
+  '2026-08-03T24:00:00.000Z',
+  '2026-08-03T10:00:00.1234567Z',
+  '2026-08-03T10:00:00.000',
+])('rejects non-PostgreSQL-canonical pull timestamp %s', async (updatedAt) => {
+  const client = new Client()
+  client.replies = [{
+    status: 200,
+    error: null,
+    data: {
+      status: 'ok',
+      changes: [{
+        change_seq: 1,
+        change_id: 1,
+        owner_id: OWNER,
+        entity: 'client',
+        entity_id: 'client-1',
+        version: 4,
+        updated_at: updatedAt,
+        deleted: false,
+        payload: rawClient({ updated_at: updatedAt }),
+      }],
+      cursor: { updated_at: updatedAt, change_seq: 1, change_id: 1 },
+      has_more: false,
+    },
+  }]
+
+  await expect(createSupabaseGateway(client).pullSince(
+    OWNER,
+    null,
+    new AbortController().signal,
+  )).rejects.toMatchObject({ reason: 'invalid-response' })
+})
+
+it.each([
   {
     label: 'a first-page prefix gap',
     previous: null,

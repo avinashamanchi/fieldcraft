@@ -13,6 +13,7 @@ import {
   type MutationOutbox,
 } from './outbox'
 import { OwnerBoundary } from './ownerBoundary'
+import { parsePostgresTimestamp } from './postgresTimestamp'
 import {
   DataCorruptionError,
   OutboxCorruptionError,
@@ -201,6 +202,11 @@ type ServerAuthorityRow = {
   change_id: number
 }
 
+type SyncChangeEventRow = {
+  change_seq: number
+  change_id: number
+}
+
 type CountRow = {
   count: number
 }
@@ -221,26 +227,14 @@ type ImmutablePosition = {
   changeSource: NonNullable<CloudRowEnvelope['changeSource']>
 }
 
-type PreciseTimestamp = {
-  wholeSecondMilliseconds: number
-  microseconds: number
-}
-
-const POSTGRES_TIMESTAMP_PATTERN =
-  /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?(Z|[+-]\d{2}:\d{2})$/
-
-const parsePreciseTimestamp = (value: string): PreciseTimestamp => {
-  const match = POSTGRES_TIMESTAMP_PATTERN.exec(value)
-  if (!match || !Number.isFinite(Date.parse(value))) {
-    throw new DataCorruptionError('Synchronization position contains an invalid timestamp')
-  }
-  const wholeSecondMilliseconds = Date.parse(`${match[1]}${match[3]}`)
-  if (!Number.isFinite(wholeSecondMilliseconds)) {
-    throw new DataCorruptionError('Synchronization position contains an invalid timestamp')
-  }
-  return {
-    wholeSecondMilliseconds,
-    microseconds: Number((match[2] ?? '').padEnd(6, '0')),
+const parsePreciseTimestamp = (value: string) => {
+  try {
+    return parsePostgresTimestamp(value)
+  } catch (cause) {
+    throw new DataCorruptionError(
+      'Synchronization position contains an invalid timestamp',
+      { cause },
+    )
   }
 }
 
@@ -291,6 +285,8 @@ const validateEntityPayload = (
   if (parsed.ownerId !== ownerId || parsed.id !== entityId) {
     throw new Error('Entity payload owner and ID must match its mutation envelope')
   }
+  parsePreciseTimestamp(String(parsed.createdAt))
+  parsePreciseTimestamp(String(parsed.updatedAt))
   if (entity === 'invoice') {
     const invoice = parsed as Record<string, unknown> & {
       draft: Parameters<typeof calculateInvoice>[0]
@@ -388,6 +384,7 @@ const prepareCloudRows = (
       if (row.ownerId !== ownerId) {
         throw new Error('Cloud row owner does not match the active repository owner')
       }
+      parsePreciseTimestamp(row.updatedAt)
       if (row.deleted && row.payload !== null) {
         throw new Error('Deleted cloud rows require a null tombstone payload')
       }
@@ -514,6 +511,40 @@ const writeServerAuthorityRows = async (
     const { row, payloadJson } = candidate
     const key = recordKey(row.entity, row.entityId)
     affected.add(key)
+    if (row.changeSource === 'sync_changes') {
+      const bySequence = await database.getFirstAsync<SyncChangeEventRow>(
+        `/* sync-change-events:get-by-sequence */
+         SELECT change_seq, change_id
+         FROM sync_change_events
+         WHERE owner_id = ? AND change_seq = ?`,
+        [row.ownerId, row.changeSeq!],
+      )
+      if (bySequence && bySequence.change_id !== row.changeId) {
+        throw new DataCorruptionError(
+          'One owner sequence cannot identify different sync-change events',
+        )
+      }
+      const byChangeId = await database.getFirstAsync<SyncChangeEventRow>(
+        `/* sync-change-events:get-by-id */
+         SELECT change_seq, change_id
+         FROM sync_change_events
+         WHERE owner_id = ? AND change_id = ?`,
+        [row.ownerId, row.changeId!],
+      )
+      if (byChangeId && byChangeId.change_seq !== row.changeSeq) {
+        throw new DataCorruptionError(
+          'One change ID cannot identify different owner sequences',
+        )
+      }
+      if (!bySequence && !byChangeId) {
+        await database.runAsync(
+          `/* sync-change-events:insert */
+           INSERT INTO sync_change_events (owner_id, change_seq, change_id)
+           VALUES (?, ?, ?)`,
+          [row.ownerId, row.changeSeq!, row.changeId!],
+        )
+      }
+    }
     const existing = await database.getFirstAsync<ServerAuthorityRow>(
       `/* server-authority:get */
        SELECT owner_id, entity, entity_id, payload_json, version, deleted,
@@ -1989,6 +2020,7 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
           await transaction.runAsync('/* owner:clear:sync_cursors */ DELETE FROM sync_cursors WHERE owner_id = ?', [ownerId])
           await transaction.runAsync('/* owner:clear:sync_bootstrap_records */ DELETE FROM sync_bootstrap_records WHERE owner_id = ?', [ownerId])
           await transaction.runAsync('/* owner:clear:sync_server_authority */ DELETE FROM sync_server_authority WHERE owner_id = ?', [ownerId])
+          await transaction.runAsync('/* owner:clear:sync_change_events */ DELETE FROM sync_change_events WHERE owner_id = ?', [ownerId])
           await transaction.runAsync('/* owner:clear:metadata */ DELETE FROM metadata WHERE owner_id = ?', [ownerId])
         })
       }, true)

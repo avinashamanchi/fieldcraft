@@ -768,6 +768,10 @@ begin
   if v_status is null or v_status not in ('applied', 'conflict') then
     raise exception 'stored mutation receipt status is invalid' using errcode = '22023';
   end if;
+  if v_status = 'conflict' and not (p_response ? 'kind') then
+    raise exception 'legacy conflict receipt does not contain an immutable mutation kind'
+      using errcode = '22023';
+  end if;
   if (p_response ? 'mutation_id' and p_response ->> 'mutation_id' <> p_mutation_id::text)
     or (p_response ? 'entity' and p_response ->> 'entity' <> p_entity)
     or (p_response ? 'kind' and p_response ->> 'kind' <> p_kind)

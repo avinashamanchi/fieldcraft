@@ -124,19 +124,20 @@ beforeEach(() => {
   __resetSQLiteMock()
 })
 
-it('applies schema version 4 with every required table', async () => {
+it('applies schema version 5 with every required table', async () => {
   const repository = new SQLiteFieldCraftRepository({ databaseName: 'migration.db' })
 
   await repository.initialize(OWNER)
 
   const raw = __getRawDatabase('migration.db')
-  expect(raw.userVersion).toBe(4)
+  expect(raw.userVersion).toBe(5)
   expect([...raw.tables].sort()).toEqual([
     'conflicts',
     'metadata',
     'outbox',
     'records',
     'sync_bootstrap_records',
+    'sync_change_events',
     'sync_cursors',
     'sync_server_authority',
   ])

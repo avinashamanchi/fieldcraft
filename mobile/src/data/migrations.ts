@@ -1,6 +1,6 @@
 import type { SQLiteDatabase } from 'expo-sqlite'
 
-export const DATABASE_SCHEMA_VERSION = 4
+export const DATABASE_SCHEMA_VERSION = 5
 
 type UserVersionRow = { user_version: number }
 
@@ -187,6 +187,23 @@ const VERSION_FOUR_SCHEMA = `
   PRAGMA user_version = 4;
 `
 
+const VERSION_FIVE_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS sync_change_events (
+    owner_id TEXT NOT NULL,
+    change_seq INTEGER NOT NULL CHECK (change_seq > 0),
+    change_id INTEGER NOT NULL CHECK (change_id > 0),
+    PRIMARY KEY (owner_id, change_seq),
+    UNIQUE (owner_id, change_id)
+  );
+
+  INSERT INTO sync_change_events (owner_id, change_seq, change_id)
+  SELECT owner_id, change_seq, change_id
+  FROM sync_server_authority
+  WHERE change_source = 'sync_changes';
+
+  PRAGMA user_version = 5;
+`
+
 export const applyMigrations = async (database: SQLiteDatabase): Promise<void> => {
   await database.withExclusiveTransactionAsync(async (transaction) => {
     const row = await transaction.getFirstAsync<UserVersionRow>('PRAGMA user_version')
@@ -215,6 +232,11 @@ export const applyMigrations = async (database: SQLiteDatabase): Promise<void> =
 
     if (currentVersion === 3) {
       await transaction.execAsync(VERSION_FOUR_SCHEMA)
+      currentVersion = 4
+    }
+
+    if (currentVersion === 4) {
+      await transaction.execAsync(VERSION_FIVE_SCHEMA)
     }
   })
 }

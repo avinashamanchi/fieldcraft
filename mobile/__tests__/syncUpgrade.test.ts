@@ -553,7 +553,7 @@ it('upgrades a packaged legacy cursor through crash-resumable staged reconciliat
 
   const repository = new SQLiteFieldCraftRepository({ databaseName: DATABASE })
   await repository.initialize(OWNER)
-  expect(raw.userVersion).toBe(4)
+  expect(raw.userVersion).toBe(5)
   await expect(repository.getSyncCursor(OWNER)).resolves.toBeNull()
   await expect(repository.hasCompletedInitialPull(OWNER)).resolves.toBe(false)
 

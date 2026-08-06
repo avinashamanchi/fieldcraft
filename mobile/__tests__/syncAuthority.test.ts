@@ -235,11 +235,63 @@ it('rejects one owner sequence claiming two different sync-change events', async
   })
 })
 
+it('rejects one owner sequence claiming different events across entity keys', async () => {
+  const repository = new SQLiteFieldCraftRepository({ databaseName: 'owner-sequence-equivocation.db' })
+  await repository.initialize(OWNER)
+  const original = positionedClient('first-client', 'Original authority', 2, T0, 2, 102)
+  await repository.commitPull(OWNER, [original], cursor(2, T0, 102), true)
+
+  await expect(repository.commitPull(
+    OWNER,
+    [positionedClient('second-client', 'Forged other entity', 1, T1, 2, 999)],
+    cursor(2, T1, 999),
+    true,
+  )).rejects.toThrow(/owner sequence.*different sync-change events/i)
+
+  await expect(repository.get('client', 'first-client')).resolves.toMatchObject({
+    name: 'Original authority',
+  })
+  await expect(repository.get('client', 'second-client')).resolves.toBeNull()
+})
+
+it('rejects one change ID claiming different owner sequences across entity keys', async () => {
+  const repository = new SQLiteFieldCraftRepository({ databaseName: 'owner-change-id-equivocation.db' })
+  await repository.initialize(OWNER)
+  const original = positionedClient('first-client', 'Original authority', 2, T0, 2, 102)
+  await repository.commitPull(OWNER, [original], cursor(2, T0, 102), true)
+
+  await expect(repository.commitPull(
+    OWNER,
+    [positionedClient('second-client', 'Forged other sequence', 1, T1, 3, 102)],
+    cursor(3, T1, 102),
+    true,
+  )).rejects.toThrow(/change id.*different owner sequences/i)
+
+  await expect(repository.get('client', 'second-client')).resolves.toBeNull()
+})
+
 it('classifies deterministic cloud-envelope validation failures as data corruption', async () => {
   const repository = new SQLiteFieldCraftRepository({ databaseName: 'cloud-validation-corruption.db' })
   await repository.initialize(OWNER)
   const malformed = positionedClient('malformed-client', 'Malformed', 2, T0, 2, 102)
   malformed.payload = { ...(malformed.payload as Record<string, unknown>), version: 999 }
+
+  await expect(repository.commitPull(
+    OWNER,
+    [malformed],
+    cursor(2, T0, 102),
+    true,
+  )).rejects.toBeInstanceOf(DataCorruptionError)
+})
+
+it('rejects a malformed PostgreSQL timestamp inside a direct authority payload', async () => {
+  const repository = new SQLiteFieldCraftRepository({ databaseName: 'payload-timestamp-corruption.db' })
+  await repository.initialize(OWNER)
+  const malformed = positionedClient('malformed-time-client', 'Malformed time', 2, T0, 2, 102)
+  malformed.payload = {
+    ...(malformed.payload as Record<string, unknown>),
+    createdAt: '2026-02-30T09:00:00.000Z',
+  }
 
   await expect(repository.commitPull(
     OWNER,
