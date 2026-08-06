@@ -4,11 +4,11 @@ import { Pressable, StyleSheet, Text, View } from 'react-native'
 
 import { useAuth } from '../../src/auth/AuthProvider'
 import { aiConsentStore } from '../../src/ai/consentStore'
-import { FormField } from '../../src/components/FormField'
 import { PrimaryButton } from '../../src/components/PrimaryButton'
 import { Screen } from '../../src/components/Screen'
 import type { InvoiceDraft } from '../../src/domain/entities'
 import { InvoiceEditor } from '../../src/features/invoices/InvoiceEditor'
+import { VoiceTranscriptInput } from '../../src/features/invoices/VoiceTranscriptInput'
 import { useInvoiceSession } from '../../src/features/invoices/invoiceSession'
 import { colors, MIN_TOUCH_TARGET, radius, spacing, typography } from '../../src/theme/tokens'
 
@@ -64,16 +64,7 @@ export default function NewInvoiceScreen() {
         <InvoiceEditor draft={draft} onChange={setDraft} onContinue={() => session.reviewManual(draft)} />
       ) : (
         <View style={styles.aiPanel}>
-          <FormField
-            editable={session.state.step !== 'parsing'}
-            label="Job transcript"
-            maxLength={20_000}
-            multiline
-            onChangeText={session.setTranscript}
-            placeholder="Example: Replaced the kitchen shutoff valve for Mina…"
-            testID="invoice-transcript"
-            value={transcript}
-          />
+          <VoiceTranscriptInput onChangeText={session.setTranscript} value={transcript} />
           <Text style={styles.preview}>Preview only · {Array.from(transcript).length.toLocaleString()} / 20,000 characters</Text>
           {consentPrompt ? (
             <View accessibilityLabel="AI consent request" style={styles.consent}>

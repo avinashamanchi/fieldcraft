@@ -15,6 +15,10 @@ export default function appConfig(_context: ConfigContext): ExpoConfig {
       bundleIdentifier: 'com.avinashamanchi.fieldcraft',
       buildNumber: '1',
       supportsTablet: true,
+      infoPlist: {
+        NSMicrophoneUsageDescription: 'FieldCraft uses the microphone only while you record a job description for an editable invoice draft.',
+        NSSpeechRecognitionUsageDescription: 'FieldCraft converts your spoken job description into editable text on this device.',
+      },
     },
     plugins: [
       'expo-router',
