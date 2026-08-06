@@ -34,7 +34,7 @@ export default function Settings() {
   // Keep form in sync when userProfile loads from Supabase
   useEffect(() => {
     setForm({ ...userProfile })
-  }, [userProfile.name, userProfile.businessName, userProfile.tradeType, userProfile.hourlyRate, userProfile.taxRate])
+  }, [userProfile])
 
   const handleSave = () => {
     updateUserProfile({ ...form, onboardingComplete: true })
