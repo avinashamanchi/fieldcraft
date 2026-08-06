@@ -1,8 +1,9 @@
-import { useLocalSearchParams } from 'expo-router'
+import { router, useLocalSearchParams } from 'expo-router'
 import { useEffect, useState } from 'react'
 import { ActivityIndicator, StyleSheet, Text, View } from 'react-native'
 
 import { ErrorState } from '../../src/components/ErrorState'
+import { PrimaryButton } from '../../src/components/PrimaryButton'
 import { Screen } from '../../src/components/Screen'
 import { useFieldCraftData } from '../../src/data/DataProvider'
 import type { Client, Invoice, Job } from '../../src/domain/entities'
@@ -50,6 +51,7 @@ export default function InvoiceDetailScreen() {
         ))}
       </View>
       <InvoiceSummary invoice={calculated} />
+      <PrimaryButton label="Create PDF to share" onPress={() => router.push(`/invoices/${detail.invoice.id}/share` as never)} />
       <Text style={styles.copy}>{detail.invoice.draft.paymentTerms}</Text>
       {detail.invoice.draft.notes ? <Text style={styles.copy}>{detail.invoice.draft.notes}</Text> : null}
     </Screen>

@@ -11,6 +11,7 @@ export default function SettingsScreen() {
       <Text style={styles.section}>Catalog</Text>
       <Pressable accessibilityRole="button" onPress={() => router.push('/settings/services')} style={styles.row}><Text style={styles.label}>Services</Text></Pressable>
       <Pressable accessibilityRole="button" onPress={() => router.push('/settings/inventory')} style={styles.row}><Text style={styles.label}>Inventory</Text></Pressable>
+      <Pressable accessibilityRole="button" onPress={() => router.push('/settings/business-logo' as never)} style={styles.row}><Text style={styles.label}>Business logo</Text></Pressable>
       <Text style={styles.note}>Account and privacy controls are completed in the privacy task.</Text>
     </Screen>
   )

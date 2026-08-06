@@ -49,7 +49,7 @@ const VersionedEntitySchema = z
   .strict()
 
 const entityPayloadSchemas: Record<EntityName, z.ZodType> = {
-  profile: VersionedEntitySchema.extend({ businessName: z.string().min(1) }),
+  profile: VersionedEntitySchema.extend({ businessName: z.string().min(1), logoPath: z.string().max(500).optional() }),
   client: VersionedEntitySchema.extend({
     name: z.string().min(1).max(200),
     phone: z.string().max(64).optional(),

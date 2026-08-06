@@ -107,4 +107,5 @@ export type InventoryItem = VersionedEntity & {
 
 export type UserProfile = VersionedEntity & {
   businessName: string
+  logoPath?: string
 }

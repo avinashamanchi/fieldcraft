@@ -238,7 +238,11 @@ const normalizePayload = (
   const common = canonicalCommon(entity, raw, ownerId)
   switch (entity) {
     case 'profile':
-      return { ...common, businessName: requireString(raw, 'business_name') }
+      return {
+        ...common,
+        businessName: requireString(raw, 'business_name'),
+        ...(optionalString(raw, 'logo_path') ? { logoPath: optionalString(raw, 'logo_path') } : {}),
+      }
     case 'client':
       return {
         ...common,
