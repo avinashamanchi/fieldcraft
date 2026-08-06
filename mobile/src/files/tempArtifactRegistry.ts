@@ -4,7 +4,7 @@ export const OWNED_TEMP_DIRECTORIES = ['fieldcraft-imports', 'fieldcraft-pdf', '
 
 type Cleanup = () => Promise<void>
 
-class TempArtifactRegistry {
+export class TempArtifactRegistry {
   private readonly cleanups = new Map<string, Cleanup>()
 
   register(uri: string, cleanup: Cleanup): void {
@@ -16,21 +16,29 @@ class TempArtifactRegistry {
 
   async delete(uri: string): Promise<void> {
     const cleanup = this.cleanups.get(uri)
-    this.cleanups.delete(uri)
-    if (cleanup) await cleanup()
+    if (!cleanup) return
+    await cleanup()
+    if (this.cleanups.get(uri) === cleanup) this.cleanups.delete(uri)
   }
 
   async cleanupRegistered(): Promise<void> {
     const entries = [...this.cleanups.entries()]
-    this.cleanups.clear()
-    await Promise.allSettled(entries.map(([, cleanup]) => cleanup()))
+    const results = await Promise.allSettled(entries.map(([, cleanup]) => cleanup()))
+    results.forEach((result, index) => {
+      if (result.status === 'fulfilled') {
+        const [uri, cleanup] = entries[index]
+        if (this.cleanups.get(uri) === cleanup) this.cleanups.delete(uri)
+      }
+    })
+    if (results.some((result) => result.status === 'rejected')) throw new Error('Some temporary artifacts could not be deleted.')
   }
 
   async cleanupOwnedDirectories(fileSystem: Pick<typeof FileSystem, 'cacheDirectory' | 'deleteAsync'> = FileSystem): Promise<void> {
     if (!fileSystem.cacheDirectory) return
-    await Promise.allSettled(OWNED_TEMP_DIRECTORIES.map((directory) =>
+    const results = await Promise.allSettled(OWNED_TEMP_DIRECTORIES.map((directory) =>
       fileSystem.deleteAsync(`${fileSystem.cacheDirectory}${directory}`, { idempotent: true }),
     ))
+    if (results.some((result) => result.status === 'rejected')) throw new Error('Some FieldCraft temporary directories could not be deleted.')
   }
 }
 

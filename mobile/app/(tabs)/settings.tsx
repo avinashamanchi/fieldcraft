@@ -12,15 +12,20 @@ export default function SettingsScreen() {
       <Pressable accessibilityRole="button" onPress={() => router.push('/settings/services')} style={styles.row}><Text style={styles.label}>Services</Text></Pressable>
       <Pressable accessibilityRole="button" onPress={() => router.push('/settings/inventory')} style={styles.row}><Text style={styles.label}>Inventory</Text></Pressable>
       <Pressable accessibilityRole="button" onPress={() => router.push('/settings/business-logo' as never)} style={styles.row}><Text style={styles.label}>Business logo</Text></Pressable>
-      <Text style={styles.note}>Account and privacy controls are completed in the privacy task.</Text>
+      <Text style={styles.section}>Privacy & account</Text>
+      <Pressable accessibilityRole="button" onPress={() => router.push('/settings/ai' as never)} style={styles.row}><Text style={styles.label}>AI & consent</Text></Pressable>
+      <Pressable accessibilityRole="button" onPress={() => router.push('/settings/sync' as never)} style={styles.row}><Text style={styles.label}>Sync diagnostics</Text></Pressable>
+      <Pressable accessibilityRole="button" onPress={() => router.push('/privacy' as never)} style={styles.row}><Text style={styles.label}>Privacy policy & support</Text></Pressable>
+      <Pressable accessibilityRole="button" onPress={() => router.push('/settings/delete-data' as never)} style={styles.row}><Text style={styles.danger}>Delete local data</Text></Pressable>
+      <Pressable accessibilityRole="button" onPress={() => router.push('/settings/delete-account' as never)} style={styles.row}><Text style={styles.danger}>Delete account</Text></Pressable>
     </Screen>
   )
 }
 
 const styles = StyleSheet.create({
   heading: { color: colors.warmWhite, fontFamily: typography.display, fontSize: 34, fontWeight: '800' },
+  danger: { color: colors.danger, fontFamily: typography.body, fontSize: 17, fontWeight: '700' },
   label: { color: colors.warmWhite, fontFamily: typography.body, fontSize: 17, fontWeight: '700' },
-  note: { color: colors.muted, fontFamily: typography.body, fontSize: 15, lineHeight: 22 },
   row: { borderBottomColor: '#444', borderBottomWidth: StyleSheet.hairlineWidth, justifyContent: 'center', minHeight: MIN_TOUCH_TARGET },
   screen: { gap: spacing.md },
   section: { color: colors.orange, fontFamily: typography.utility, fontSize: 13, marginTop: spacing.xl },

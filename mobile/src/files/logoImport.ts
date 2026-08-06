@@ -68,10 +68,11 @@ export const importBusinessLogo = async (
   const sourceUri = `${directory}/${id}.${extension}`
   const outputUri = `${directory}/${id}.jpg`
   const removeAll = async () => {
-    await Promise.allSettled([
+    const results = await Promise.allSettled([
       fileSystem.deleteAsync(sourceUri, { idempotent: true }),
       fileSystem.deleteAsync(outputUri, { idempotent: true }),
     ])
+    if (results.some((result) => result.status === 'rejected')) throw new Error('Business logo temporary files could not be deleted.')
   }
   try {
     await fileSystem.makeDirectoryAsync(directory, { intermediates: true })
@@ -95,7 +96,7 @@ export const importBusinessLogo = async (
     tempArtifactRegistry.register(outputUri, removeAll)
     return { uri: outputUri, storagePath: logoStoragePath(ownerId), width: result.width, height: result.height, cleanup: () => tempArtifactRegistry.delete(outputUri) }
   } catch (cause) {
-    await removeAll()
+    await removeAll().catch(() => undefined)
     if (cause instanceof LogoImportError) throw cause
     throw new LogoImportError('DECODE_FAILED')
   }
