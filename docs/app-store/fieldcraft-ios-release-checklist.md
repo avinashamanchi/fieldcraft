@@ -4,14 +4,29 @@ Last updated: 2026-08-06. `PASS` means directly observed evidence. `BLOCKED` mea
 
 ## Local implementation and CI
 
-- [ ] Exact committed SHA recorded after Task 15.
-- [ ] Fresh no-hardlink clone is clean before and after verification.
-- [ ] Root clean install, tests, typecheck, lint, web build, and redacted secret scan pass.
-- [ ] Mobile clean install, Jest, typecheck, lint, Expo Doctor, and iOS export pass.
-- [ ] Supabase migration boundary, PGlite, Deno format/lint/tests pass.
-- [ ] Workflow YAML parses and release-readiness workflow is manual-only.
-- [ ] Root and mobile audit totals recorded without hiding advisories.
-- [ ] 1024×1024 opaque RGB icon validated and configured.
+- [x] Verified implementation SHA: `2b51a4eff9814f91612159788e478ce3cd0da35c`.
+- [x] Fresh no-hardlink clone was clean before and after verification, including native prebuild.
+- [x] Root clean install, tests, typecheck, lint, web build, and redacted secret scan passed.
+- [x] Mobile clean install, Jest, typecheck, lint, Expo Doctor, and iOS export passed.
+- [x] Supabase migration boundary, PGlite, Deno format/lint/tests/check passed.
+- [x] CI, deploy, release-readiness, and Maestro YAML parsed; release readiness is manual-only and has no deploy/submit command.
+- [x] Root and mobile audits reported zero vulnerabilities at the verified SHA.
+- [x] 1024×1024 opaque RGB icon validated and configured.
+
+### Observed clean-clone evidence
+
+| Gate | Observed result |
+|---|---|
+| Runtime | Node `v22.23.2`; workflows pin Node `22.22.0` |
+| Root tests | 3 files, 19 tests passed |
+| Mobile tests | 43 suites, 364 tests passed |
+| Database | 27 PGlite checks passed |
+| Edge | 9 files formatted/linted; 11 tests passed; both production entry points passed `deno check` |
+| Expo | Doctor 18/18; iOS bundle exported from 1,699 modules; native iOS project prebuild passed without tracked changes |
+| Security | Root and mobile npm audit: 0; tracked/bundle secret scan passed; exact icon: 1024×1024 PNG, RGB, no alpha |
+| Workflows | Four YAML files parsed successfully; final clone had no tracked diff |
+
+Observed non-fatal warnings: Vite reported a web chunk above 500 kB after minification; npm reported deprecated transitive test/build packages and install-script approval notices. These did not create audit findings. Full Xcode and CocoaPods are not installed on this Mac, so a Swift/Pods compile and signed archive were not run.
 
 ## iPhone and accessibility
 
@@ -19,7 +34,7 @@ Last updated: 2026-08-06. `PASS` means directly observed evidence. `BLOCKED` mea
 - [ ] 200% Dynamic Type observed on a physical iPhone without lost controls or clipped required text.
 - [ ] VoiceOver reading order, names, values, alerts, modal behavior, and focus restoration observed.
 - [ ] Reduce Motion behavior observed.
-- [ ] Small-screen 320×568 test matrix passes.
+- [x] Automated small-screen 320×568 and 200% font-scale release tests pass.
 - [ ] Apple Speech and Vision pass in a signed FieldCraft development client. `BLOCKED: not available in Expo Go.`
 - [ ] Microphone, speech, camera, photo picker, SecureStore, deep links, PDF/share, offline/reconnect, icon, splash, and cleanup pass on hardware.
 
