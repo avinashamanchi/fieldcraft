@@ -15,7 +15,7 @@ export const JobRow = ({ job, onPress }: JobRowProps) => (
   >
     <View style={styles.copy}>
       <Text style={styles.title}>{job.title}</Text>
-      <Text style={styles.meta}>{job.status}</Text>
+      <Text style={styles.meta}>{job.status} · {job.syncState === 'current' ? 'Cloud' : 'Pending'}</Text>
     </View>
     <View accessibilityLabel={`Sync status ${job.syncState}`} style={styles.syncDot} />
   </Pressable>

@@ -44,12 +44,27 @@ export type VersionedEntity = {
 
 export type Client = VersionedEntity & {
   name: string
+  phone?: string
+  email?: string
+  address?: string
+  city?: string
+  state?: string
+  postalCode?: string
+  notes?: string
 }
 
 export type Job = VersionedEntity & {
   clientId: string
   title: string
   status: JobStatus
+  tradeType?: TradeType
+  address?: string
+  description?: string
+  laborHoursThousandths?: number
+  laborRateCents?: MoneyCents
+  notes?: string
+  scheduledAt?: string
+  completedAt?: string
 }
 
 export type Invoice = VersionedEntity & {
@@ -68,11 +83,18 @@ export type Expense = VersionedEntity & {
 export type Service = VersionedEntity & {
   name: string
   unitPriceCents: MoneyCents
+  description?: string
+  estimatedHoursThousandths?: number
+  category?: string
 }
 
 export type InventoryItem = VersionedEntity & {
   name: string
   unitPriceCents: MoneyCents
+  quantityThousandths?: number
+  unit?: string
+  minStockThousandths?: number
+  lastUsedAt?: string
 }
 
 export type UserProfile = VersionedEntity & {

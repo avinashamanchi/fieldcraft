@@ -94,6 +94,11 @@ const requireInteger = (record: RawRecord, key: string): number => {
   return value
 }
 
+const optionalInteger = (record: RawRecord, key: string, fallback = 0): number => {
+  if (record[key] === undefined || record[key] === null) return fallback
+  return requireInteger(record, key)
+}
+
 const requireBoolean = (record: RawRecord, key: string): boolean => {
   const value = record[key]
   if (typeof value !== 'boolean') throw new RemoteGatewayError('invalid-response')
@@ -235,13 +240,31 @@ const normalizePayload = (
     case 'profile':
       return { ...common, businessName: requireString(raw, 'business_name') }
     case 'client':
-      return { ...common, name: requireString(raw, 'name') }
+      return {
+        ...common,
+        name: requireString(raw, 'name'),
+        ...(optionalString(raw, 'phone') ? { phone: optionalString(raw, 'phone') } : {}),
+        ...(optionalString(raw, 'email') ? { email: optionalString(raw, 'email') } : {}),
+        ...(optionalString(raw, 'address') ? { address: optionalString(raw, 'address') } : {}),
+        ...(optionalString(raw, 'city') ? { city: optionalString(raw, 'city') } : {}),
+        ...(optionalString(raw, 'state') ? { state: optionalString(raw, 'state') } : {}),
+        ...(optionalString(raw, 'postal_code') ? { postalCode: optionalString(raw, 'postal_code') } : {}),
+        ...(optionalString(raw, 'notes') ? { notes: optionalString(raw, 'notes') } : {}),
+      }
     case 'job':
       return {
         ...common,
         clientId: requireString(raw, 'client_id'),
         title: requireString(raw, 'title'),
         status: requireString(raw, 'status'),
+        tradeType: requireString(raw, 'trade_type'),
+        ...(optionalString(raw, 'address') ? { address: optionalString(raw, 'address') } : {}),
+        ...(optionalString(raw, 'description') ? { description: optionalString(raw, 'description') } : {}),
+        laborHoursThousandths: optionalInteger(raw, 'labor_hours_thousandths'),
+        laborRateCents: optionalInteger(raw, 'labor_rate_cents'),
+        ...(optionalString(raw, 'notes') ? { notes: optionalString(raw, 'notes') } : {}),
+        ...(optionalString(raw, 'scheduled_at') ? { scheduledAt: requireTimestamp(raw, 'scheduled_at') } : {}),
+        ...(optionalString(raw, 'completed_at') ? { completedAt: requireTimestamp(raw, 'completed_at') } : {}),
       }
     case 'invoice': {
       const clientId = requireString(raw, 'client_id')
@@ -282,12 +305,19 @@ const normalizePayload = (
         ...common,
         name: requireString(raw, 'name'),
         unitPriceCents: requireInteger(raw, 'unit_price_cents'),
+        ...(optionalString(raw, 'description') ? { description: optionalString(raw, 'description') } : {}),
+        estimatedHoursThousandths: optionalInteger(raw, 'estimated_hours_thousandths'),
+        ...(optionalString(raw, 'category') ? { category: optionalString(raw, 'category') } : {}),
       }
     case 'inventory':
       return {
         ...common,
         name: requireString(raw, 'name'),
         unitPriceCents: requireInteger(raw, 'unit_price_cents'),
+        quantityThousandths: optionalInteger(raw, 'quantity_thousandths'),
+        unit: optionalString(raw, 'unit') ?? 'each',
+        minStockThousandths: optionalInteger(raw, 'min_stock_thousandths'),
+        ...(optionalString(raw, 'last_used_at') ? { lastUsedAt: requireTimestamp(raw, 'last_used_at') } : {}),
       }
   }
 }

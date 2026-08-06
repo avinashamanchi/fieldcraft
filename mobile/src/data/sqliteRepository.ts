@@ -50,11 +50,30 @@ const VersionedEntitySchema = z
 
 const entityPayloadSchemas: Record<EntityName, z.ZodType> = {
   profile: VersionedEntitySchema.extend({ businessName: z.string().min(1) }),
-  client: VersionedEntitySchema.extend({ name: z.string().min(1) }),
+  client: VersionedEntitySchema.extend({
+    name: z.string().min(1).max(200),
+    phone: z.string().max(64).optional(),
+    email: z.string().max(320).optional(),
+    address: z.string().max(500).optional(),
+    city: z.string().max(100).optional(),
+    state: z.string().max(100).optional(),
+    postalCode: z.string().max(32).optional(),
+    notes: z.string().max(4000).optional(),
+  }),
   job: VersionedEntitySchema.extend({
     clientId: z.string().min(1),
-    title: z.string().min(1),
+    title: z.string().min(1).max(200),
     status: z.enum(['Scheduled', 'In Progress', 'Invoiced', 'Paid']),
+    tradeType: z.enum([
+      'Plumbing', 'Electrical', 'HVAC', 'Carpentry', 'General', 'Roofing', 'Flooring', 'Painting',
+    ]).optional(),
+    address: z.string().max(500).optional(),
+    description: z.string().max(4000).optional(),
+    laborHoursThousandths: z.number().finite().int().min(0).max(10_000).optional(),
+    laborRateCents: MoneySchema.optional(),
+    notes: z.string().max(4000).optional(),
+    scheduledAt: z.string().optional(),
+    completedAt: z.string().optional(),
   }),
   invoice: VersionedEntitySchema.extend({
     clientId: z.string().min(1),
@@ -65,10 +84,20 @@ const entityPayloadSchemas: Record<EntityName, z.ZodType> = {
     totalCents: MoneySchema,
   }),
   expense: VersionedEntitySchema.extend({ amountCents: MoneySchema }),
-  service: VersionedEntitySchema.extend({ name: z.string().min(1), unitPriceCents: MoneySchema }),
-  inventory: VersionedEntitySchema.extend({
-    name: z.string().min(1),
+  service: VersionedEntitySchema.extend({
+    name: z.string().min(1).max(200),
     unitPriceCents: MoneySchema,
+    description: z.string().max(4000).optional(),
+    estimatedHoursThousandths: z.number().finite().int().min(0).max(10_000).optional(),
+    category: z.string().max(100).optional(),
+  }),
+  inventory: VersionedEntitySchema.extend({
+    name: z.string().min(1).max(200),
+    unitPriceCents: MoneySchema,
+    quantityThousandths: z.number().finite().int().min(0).max(10_000).optional(),
+    unit: z.string().min(1).max(32).optional(),
+    minStockThousandths: z.number().finite().int().min(0).max(10_000).optional(),
+    lastUsedAt: z.string().optional(),
   }),
 }
 
