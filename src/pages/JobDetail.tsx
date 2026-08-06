@@ -7,7 +7,7 @@ import StatusBadge from '../components/ui/StatusBadge'
 import TradeIcon from '../components/ui/TradeIcon'
 import Button from '../components/ui/Button'
 import { generateInvoicePDF, printInvoice } from '../lib/pdf'
-import { draftMessage } from '../lib/groq'
+import { draftMessage } from '../lib/fieldcraftAi'
 import type { JobStatus, MessageTone } from '../types'
 
 const STATUS_NEXT: Record<JobStatus, JobStatus | null> = {

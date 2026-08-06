@@ -256,9 +256,33 @@ try {
   `)
 
   await db.exec(await readMigration('202608030003_fieldcraft_sync_changes.sql'))
+  await db.exec(await readMigration('202608060004_fieldcraft_ai_rate_limits.sql'))
   await db.exec(
     `select set_config('request.jwt.claim.sub', '${ownerId}', false)`,
   )
+
+  await verify('AI rate limits are atomic and independently scoped', async () => {
+    const userDigest = 'a'.repeat(64)
+    const networkDigest = 'b'.repeat(64)
+    const first = await db.query(
+      'select * from public.consume_fieldcraft_ai_rate_limit($1, $2, $3)',
+      [userDigest, 'invoice.parse.v1', 1],
+    )
+    const second = await db.query(
+      'select * from public.consume_fieldcraft_ai_rate_limit($1, $2, $3)',
+      [userDigest, 'invoice.parse.v1', 1],
+    )
+    const independent = await db.query(
+      'select * from public.consume_fieldcraft_ai_rate_limit($1, $2, $3)',
+      [networkDigest, 'invoice.parse.v1', 1],
+    )
+    if (
+      first.rows[0]?.allowed !== true || second.rows[0]?.allowed !== false ||
+      independent.rows[0]?.allowed !== true || Number(second.rows[0]?.retry_after_seconds) < 1
+    ) {
+      throw new Error(`unexpected limits: ${JSON.stringify({ first: first.rows[0], second: second.rows[0], independent: independent.rows[0] })}`)
+    }
+  })
 
   await verify('migration 003 installs an owner-committed synchronization sequence', async () => {
     const result = await db.query(`

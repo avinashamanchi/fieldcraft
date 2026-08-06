@@ -4,7 +4,7 @@ import { Plus, Trash2, FileText, Printer, ChevronDown, Clock, DollarSign } from 
 import { v4 as uuid } from 'uuid'
 import Button from '../ui/Button'
 import { useStore } from '../../store/useStore'
-import type { ParsedInvoice } from '../../lib/groq'
+import type { ParsedInvoice } from '../../lib/fieldcraftAi'
 import type { LineItem, TradeType } from '../../types'
 
 interface InvoiceReviewProps {

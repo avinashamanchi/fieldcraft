@@ -99,7 +99,9 @@ After it completes, the app is fully live and accounts can be created.
 | `GH_PAT` | You (manually) | Classic GitHub PAT with `repo` scope — lets the setup workflow write other secrets |
 | `VITE_SUPABASE_URL` | Setup workflow | Your Supabase project URL |
 | `VITE_SUPABASE_ANON_KEY` | Setup workflow | Supabase anon public key |
-| `VITE_GROQ_API_KEY` | You (manually) | Groq API key for all AI features |
+
+The AI provider key is configured only as `AI_PROVIDER_API_KEY` in Supabase Edge
+Function secrets. It must never use the `VITE_` or `EXPO_PUBLIC_` prefixes.
 
 ### Setting `GH_PAT`
 
@@ -107,11 +109,12 @@ After it completes, the app is fully live and accounts can be created.
 2. Generate new token → select `repo` scope → copy
 3. Repo → Settings → Secrets and variables → Actions → **New repository secret** → name: `GH_PAT`
 
-### Setting `VITE_GROQ_API_KEY`
+### Setting the server-only AI provider key
 
-1. Get a free key at [console.groq.com](https://console.groq.com)
-2. Repo → Settings → Secrets and variables → Actions → **New repository secret** → name: `VITE_GROQ_API_KEY`
-3. Re-run the deploy workflow after adding it
+1. Create a key with your configured AI provider.
+2. Add it to Supabase Edge Function secrets as `AI_PROVIDER_API_KEY`.
+3. Set `AI_RATE_LIMIT_HMAC_SECRET` to an independent, high-entropy secret.
+4. Deploy the `fieldcraft-ai` function and migration before enabling AI features.
 
 ---
 
@@ -122,12 +125,9 @@ After it completes, the app is fully live and accounts can be created.
 npm install
 
 # 2. Create .env with your real values
-#    (copy from Supabase dashboard and Groq console)
-cat > .env << 'EOF'
+#    (copy the two public values from your Supabase dashboard)
 VITE_SUPABASE_URL=https://your-project-id.supabase.co
 VITE_SUPABASE_ANON_KEY=your-anon-key-here
-VITE_GROQ_API_KEY=your-groq-key-here
-EOF
 
 # 3. Start dev server
 npm run dev
@@ -145,8 +145,7 @@ Any push to `main` triggers `deploy.yml` → builds → deploys to GitHub Pages.
 ### Manual deploy
 
 ```bash
-npm run build          # outputs to docs/ (served by GitHub Pages)
-git add docs/
+npm run build          # outputs to dist/ (served by GitHub Pages)
 git commit -m "Build"
 git push origin main   # triggers auto-deploy anyway
 ```
