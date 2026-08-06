@@ -15,24 +15,66 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
+  web-gates:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
-        with:
-          node-version: 22.22.0
+        with: { node-version: 22.22.0, cache: npm }
+      - run: npm ci
+      - run: npm test
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run build
+      - run: npm run scan:secrets
 
-      - name: Install dependencies
-        run: npm ci
+  mobile-gates:
+    runs-on: ubuntu-latest
+    defaults:
+      run: { working-directory: mobile }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22.22.0, cache: npm, cache-dependency-path: mobile/package-lock.json }
+      - run: npm ci
+      - run: npm test
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run expo:doctor
+      - run: npm run export:ios
+      - name: Scan exported bundle
+        working-directory: .
+        run: npm run scan:secrets
 
+  backend-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22.22.0, cache: npm }
+      - uses: denoland/setup-deno@v2
+        with: { deno-version: v2.x }
+      - run: npm ci
+      - run: npm run check:supabase-boundary
+      - run: npm run test:supabase-pglite
+      - run: deno fmt --check supabase/functions
+      - run: deno lint supabase/functions
+      - run: deno test supabase/functions/fieldcraft-ai/index_test.ts supabase/functions/delete-account/index_test.ts
+
+  build:
+    needs: [web-gates, mobile-gates, backend-gates]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22.22.0, cache: npm }
+      - run: npm ci
       - name: Build
         env:
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
           VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
         run: npm run build
-
+      - run: npm run scan:secrets
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist

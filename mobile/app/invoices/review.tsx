@@ -21,7 +21,7 @@ export default function InvoiceReviewScreen() {
   if (state.step === 'complete') {
     return (
       <Screen contentContainerStyle={styles.screen}>
-        <Text accessibilityRole="header" style={styles.heading}>Saved on this phone.</Text>
+        <Text accessibilityRole="header" style={styles.heading}>Saved on this device</Text>
         <Text style={styles.copy}>The invoice is queued for secure sync. You can keep working offline.</Text>
         <PrimaryButton label="View invoice" onPress={() => router.replace(`/invoices/${state.ids.invoiceId}` as never)} />
         <PrimaryButton label="Back to dashboard" onPress={() => { session.reset(); router.replace('/(tabs)' as never) }} />
@@ -41,10 +41,12 @@ export default function InvoiceReviewScreen() {
   return (
     <Screen contentContainerStyle={styles.screen} scroll>
       <Text style={styles.eyebrow}>REVIEW BEFORE SAVE</Text>
-      <Text accessibilityRole="header" style={styles.heading}>Every field stays editable.</Text>
+      <Text accessibilityRole="header" style={styles.heading}>Review invoice</Text>
+      <Text style={styles.copy}>Every field stays editable. Check the client, work, prices, tax, and terms.</Text>
       {state.step === 'error' ? <Text accessibilityRole="alert" style={styles.error}>{errorCopy[state.code]}</Text> : null}
       <InvoiceEditor
         continueLabel="Save invoice on this phone"
+        continueTestID="save-invoice"
         draft={draft}
         onChange={session.editDraft}
         onContinue={() => { void session.save() }}

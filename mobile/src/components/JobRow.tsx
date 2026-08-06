@@ -3,15 +3,16 @@ import { Pressable, StyleSheet, Text, View } from 'react-native'
 import type { Job } from '../domain/entities'
 import { colors, MIN_TOUCH_TARGET, spacing, typography } from '../theme/tokens'
 
-type JobRowProps = { job: Job; onPress?: () => void }
+type JobRowProps = { job: Job; onPress?: () => void; testID?: string }
 
-export const JobRow = ({ job, onPress }: JobRowProps) => (
+export const JobRow = ({ job, onPress, testID }: JobRowProps) => (
   <Pressable
     accessibilityLabel={`${job.title}, ${job.status}`}
     accessibilityRole={onPress ? 'button' : 'text'}
     disabled={!onPress}
     onPress={onPress}
     style={styles.row}
+    testID={testID}
   >
     <View style={styles.copy}>
       <Text style={styles.title}>{job.title}</Text>

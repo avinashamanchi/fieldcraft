@@ -16,13 +16,14 @@ export const canAddInvoiceLine = (lines: unknown[]): boolean => lines.length < M
 
 type InvoiceEditorProps = {
   continueLabel?: string
+  continueTestID?: string
   draft: InvoiceDraft
   onChange(draft: InvoiceDraft): void
   onContinue(): void
   saving?: boolean
 }
 
-export const InvoiceEditor = ({ continueLabel = 'Review invoice', draft, onChange, onContinue, saving = false }: InvoiceEditorProps) => {
+export const InvoiceEditor = ({ continueLabel = 'Review invoice', continueTestID = 'continue-invoice', draft, onChange, onContinue, saving = false }: InvoiceEditorProps) => {
   const update = <K extends keyof InvoiceDraft>(key: K, value: InvoiceDraft[K]) => onChange({ ...draft, [key]: value })
   const updateLine = (index: number, patch: Partial<LineItemDraft>) => update('lineItems', draft.lineItems.map((line, lineIndex) => lineIndex === index ? { ...line, ...patch } : line))
   const validation = InvoiceDraftSchema.safeParse(draft)
@@ -64,7 +65,7 @@ export const InvoiceEditor = ({ continueLabel = 'Review invoice', draft, onChang
       ))}</View>
       <FormField label="Notes" maxLength={4000} multiline onChangeText={(value) => update('notes', value)} value={draft.notes ?? ''} />
       {calculated ? <InvoiceSummary invoice={calculated} /> : <Text accessibilityRole="alert" style={styles.error}>Complete the required fields with valid amounts to continue.</Text>}
-      <PrimaryButton disabled={!calculated || saving} label={saving ? 'Saving…' : continueLabel} onPress={onContinue} testID="continue-invoice" />
+      <PrimaryButton disabled={!calculated || saving} label={saving ? 'Saving…' : continueLabel} onPress={onContinue} testID={continueTestID} />
     </View>
   )
 }

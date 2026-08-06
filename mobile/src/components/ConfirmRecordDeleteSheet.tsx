@@ -1,3 +1,4 @@
+import { useEffect, useRef, type RefObject } from 'react'
 import { Modal, Pressable, StyleSheet, Text, View } from 'react-native'
 
 import { colors, MIN_TOUCH_TARGET, radius, spacing, typography } from '../theme/tokens'
@@ -8,6 +9,7 @@ type ConfirmRecordDeleteSheetProps = {
   onCancel: () => void
   onConfirm: () => void
   recordLabel: string
+  returnFocusRef?: RefObject<{ focus?: () => void } | null>
   visible: boolean
 }
 
@@ -17,11 +19,18 @@ export const ConfirmRecordDeleteSheet = ({
   onCancel,
   onConfirm,
   recordLabel,
+  returnFocusRef,
   visible,
-}: ConfirmRecordDeleteSheetProps) => (
+}: ConfirmRecordDeleteSheetProps) => {
+  const wasVisible = useRef(visible)
+  useEffect(() => {
+    if (wasVisible.current && !visible) returnFocusRef?.current?.focus?.()
+    wasVisible.current = visible
+  }, [returnFocusRef, visible])
+  return (
   <Modal animationType="slide" onRequestClose={onCancel} transparent visible={visible}>
     <View style={styles.backdrop}>
-      <View accessibilityViewIsModal style={styles.sheet}>
+      <View accessibilityViewIsModal onAccessibilityEscape={onCancel} style={styles.sheet}>
         <Text accessibilityRole="header" style={styles.title}>Delete {recordLabel}?</Text>
         <Text style={styles.body}>
           {linkedCount === 0
@@ -45,7 +54,8 @@ export const ConfirmRecordDeleteSheet = ({
       </View>
     </View>
   </Modal>
-)
+  )
+}
 
 const styles = StyleSheet.create({
   actions: { gap: spacing.md },

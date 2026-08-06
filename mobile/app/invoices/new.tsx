@@ -5,6 +5,7 @@ import { Pressable, StyleSheet, Text, View } from 'react-native'
 import { useAuth } from '../../src/auth/AuthProvider'
 import { aiConsentStore } from '../../src/ai/consentStore'
 import { PrimaryButton } from '../../src/components/PrimaryButton'
+import { FormField } from '../../src/components/FormField'
 import { Screen } from '../../src/components/Screen'
 import type { InvoiceDraft } from '../../src/domain/entities'
 import { InvoiceEditor } from '../../src/features/invoices/InvoiceEditor'
@@ -18,11 +19,36 @@ const initialDraft = (): InvoiceDraft => ({
   lineItems: [{ description: '', type: 'labor', quantity: 1000, unitPriceCents: 0 }],
 })
 
+const numberWords: Record<string, number> = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8 }
+
+export const draftFromLocalJobNote = (value: string): InvoiceDraft => {
+  const note = Array.from(value.trim()).slice(0, 4_000).join('')
+  const client = note.match(/\bfor\s+([\p{L}\p{N} .'-]{1,80}?)(?:,|$)/iu)?.[1]?.trim() || 'Review client'
+  const title = (note.split(/\bfor\b/iu)[0]?.trim() || 'Field job').slice(0, 200)
+  const hoursMatch = note.match(/\b(one|two|three|four|five|six|seven|eight|\d+(?:\.\d+)?)\s+hours?\s+labor\b/iu)
+  const hours = hoursMatch ? (numberWords[hoursMatch[1].toLocaleLowerCase()] ?? Number(hoursMatch[1])) : null
+  const pricedItem = note.match(/(?:one|1)\s+\$(\d+(?:\.\d{1,2})?)\s+([\p{L}\p{N} .'-]{1,80})/iu)
+  const lineItems = [
+    ...(hours && Number.isFinite(hours) ? [{ description: 'Labor', type: 'labor' as const, quantity: Math.round(hours * 1000), unitPriceCents: 0 }] : []),
+    ...(pricedItem ? [{ description: pricedItem[2].trim(), type: 'material' as const, quantity: 1000, unitPriceCents: Math.round(Number(pricedItem[1]) * 100) }] : []),
+  ]
+  return {
+    clientName: client,
+    jobTitle: title || 'Field job',
+    jobDescription: note,
+    tradeType: 'General',
+    taxBasisPoints: 0,
+    paymentTerms: 'Due on receipt',
+    lineItems: lineItems.length > 0 ? lineItems : [{ description: note || 'Review job details', type: 'labor', quantity: 1000, unitPriceCents: 0 }],
+  }
+}
+
 export default function NewInvoiceScreen() {
   const auth = useAuth()
   const session = useInvoiceSession()
   const [mode, setMode] = useState<'manual' | 'voice'>('manual')
   const [draft, setDraft] = useState(initialDraft)
+  const [localNote, setLocalNote] = useState('')
   const [consentPrompt, setConsentPrompt] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
   const ownerId = auth.status === 'signedIn' ? auth.userId : null
@@ -61,7 +87,18 @@ export default function NewInvoiceScreen() {
         ))}
       </View>
       {mode === 'manual' ? (
-        <InvoiceEditor draft={draft} onChange={setDraft} onContinue={() => session.reviewManual(draft)} />
+        <View style={styles.manualPanel}>
+          <Text style={styles.copy}>Quick local entry fills an editable draft without network or AI. Review the client, prices, and every field before saving.</Text>
+          <FormField
+            label="Quick local job note"
+            maxLength={4_000}
+            multiline
+            onChangeText={(value) => { setLocalNote(value); setDraft(draftFromLocalJobNote(value)) }}
+            testID="manual-job-entry"
+            value={localNote}
+          />
+          <InvoiceEditor continueTestID="review-invoice" draft={draft} onChange={setDraft} onContinue={() => session.reviewManual(draft)} />
+        </View>
       ) : (
         <View style={styles.aiPanel}>
           <VoiceTranscriptInput onChangeText={session.setTranscript} value={transcript} />
@@ -92,6 +129,7 @@ const styles = StyleSheet.create({
   error: { color: colors.danger, fontFamily: typography.body, fontSize: 14 },
   eyebrow: { color: colors.orange, fontFamily: typography.utility, fontSize: 12, fontWeight: '700', letterSpacing: 1.2 },
   heading: { color: colors.warmWhite, fontFamily: typography.display, fontSize: 34, fontWeight: '800' },
+  manualPanel: { gap: spacing.lg },
   mode: { alignItems: 'center', borderColor: '#444', borderRadius: radius.md, borderWidth: 1, flex: 1, justifyContent: 'center', minHeight: MIN_TOUCH_TARGET, padding: spacing.md },
   modeSelected: { borderColor: colors.orange },
   modeText: { color: colors.warmWhite, fontFamily: typography.body, fontWeight: '700' },

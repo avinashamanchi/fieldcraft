@@ -37,7 +37,7 @@ export default function JobsScreen() {
       <VirtualizedEntityList
         data={filtered}
         emptyMessage={jobs.length === 0 ? 'No jobs yet. Add the first job to this device.' : 'No jobs match this search and filter.'}
-        renderItem={({ item }) => <JobRow job={item} onPress={() => router.push(`/jobs/${item.id}`)} />}
+        renderItem={({ index, item }) => <JobRow job={item} onPress={() => router.push(`/jobs/${item.id}`)} testID={`job-row-${index}`} />}
       />
     </Screen>
   )

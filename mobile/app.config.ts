@@ -7,6 +7,7 @@ export default function appConfig(_context: ConfigContext): ExpoConfig {
     name: 'FieldCraft',
     slug: 'fieldcraft',
     version: '1.0.0',
+    icon: './assets/icon.png',
     orientation: 'portrait',
     scheme: 'fieldcraft',
     userInterfaceStyle: 'automatic',
@@ -14,6 +15,7 @@ export default function appConfig(_context: ConfigContext): ExpoConfig {
     ios: {
       bundleIdentifier: 'com.avinashamanchi.fieldcraft',
       buildNumber: '1',
+      icon: './assets/icon.png',
       supportsTablet: true,
       infoPlist: {
         NSMicrophoneUsageDescription: 'FieldCraft uses the microphone only while you record a job description for an editable invoice draft.',
@@ -26,6 +28,7 @@ export default function appConfig(_context: ConfigContext): ExpoConfig {
       'expo-router',
       'expo-sqlite',
       'expo-secure-store',
+      ['expo-splash-screen', { backgroundColor: '#1A1A1A', image: './assets/icon.png', imageWidth: 160, resizeMode: 'contain' }],
       ['expo-build-properties', { ios: { deploymentTarget: '15.1' } }],
     ],
     experiments: {

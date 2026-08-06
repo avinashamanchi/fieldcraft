@@ -10,7 +10,7 @@
     "test": "jest --runInBand",
     "typecheck": "tsc --noEmit",
     "lint": "expo lint",
-    "expo:doctor": "expo-doctor",
+    "expo:doctor": "npx --yes expo-doctor",
     "export:ios": "expo export --platform ios"
   },
   "dependencies": {
@@ -66,6 +66,10 @@
     "jest-expo": "~54.0.17",
     "react-test-renderer": "^19.1.0",
     "typescript": "~5.9.2"
+  },
+  "overrides": {
+    "postcss": "8.5.26",
+    "uuid": "11.1.1"
   },
   "jest": {
     "preset": "jest-expo"
