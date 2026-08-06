@@ -83,7 +83,16 @@ const entityPayloadSchemas: Record<EntityName, z.ZodType> = {
     taxCents: MoneySchema,
     totalCents: MoneySchema,
   }),
-  expense: VersionedEntitySchema.extend({ amountCents: MoneySchema }),
+  expense: VersionedEntitySchema.extend({
+    vendor: z.string().min(1).max(200),
+    amountCents: MoneySchema,
+    category: z.enum(['Materials', 'Fuel', 'Equipment', 'Subcontractor', 'Other']),
+    expenseDate: z.iso.date(),
+    jobId: z.string().min(1).optional(),
+    clientId: z.string().min(1).optional(),
+    notes: z.string().max(4000).optional(),
+    receiptPath: z.string().max(500).optional(),
+  }),
   service: VersionedEntitySchema.extend({
     name: z.string().min(1).max(200),
     unitPriceCents: MoneySchema,

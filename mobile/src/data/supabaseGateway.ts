@@ -299,7 +299,17 @@ const normalizePayload = (
       }
     }
     case 'expense':
-      return { ...common, amountCents: requireInteger(raw, 'amount_cents') }
+      return {
+        ...common,
+        vendor: requireString(raw, 'vendor'),
+        amountCents: requireInteger(raw, 'amount_cents'),
+        category: requireString(raw, 'category'),
+        expenseDate: requireString(raw, 'expense_date'),
+        ...(optionalString(raw, 'job_id') ? { jobId: optionalString(raw, 'job_id') } : {}),
+        ...(optionalString(raw, 'client_id') ? { clientId: optionalString(raw, 'client_id') } : {}),
+        ...(optionalString(raw, 'notes') ? { notes: optionalString(raw, 'notes') } : {}),
+        ...(optionalString(raw, 'receipt_path') ? { receiptPath: optionalString(raw, 'receipt_path') } : {}),
+      }
     case 'service':
       return {
         ...common,

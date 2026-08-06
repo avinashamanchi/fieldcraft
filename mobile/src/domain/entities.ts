@@ -12,6 +12,7 @@ export type TradeType =
   | 'Flooring'
   | 'Painting'
 export type PaymentTerms = 'Due on receipt' | 'Net 14' | 'Net 30'
+export type ExpenseCategory = 'Materials' | 'Fuel' | 'Equipment' | 'Subcontractor' | 'Other'
 
 export type LineItemDraft = {
   id?: string
@@ -77,7 +78,14 @@ export type Invoice = VersionedEntity & {
 }
 
 export type Expense = VersionedEntity & {
+  vendor: string
   amountCents: MoneyCents
+  category: ExpenseCategory
+  expenseDate: string
+  jobId?: string
+  clientId?: string
+  notes?: string
+  receiptPath?: string
 }
 
 export type Service = VersionedEntity & {
