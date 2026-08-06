@@ -1,21 +1,10 @@
-import { StyleSheet, Text, View } from 'react-native'
+import { Redirect } from 'expo-router'
+
+import { useAuth } from '../src/auth/AuthProvider'
 
 export default function IndexScreen() {
-  return (
-    <View style={styles.container}>
-      <Text style={styles.title}>FieldCraft</Text>
-    </View>
-  )
+  const auth = useAuth()
+  return auth.status === 'signedIn'
+    ? <Redirect href="/(tabs)" />
+    : <Redirect href="/(auth)/login" />
 }
-
-const styles = StyleSheet.create({
-  container: {
-    alignItems: 'center',
-    flex: 1,
-    justifyContent: 'center',
-  },
-  title: {
-    fontSize: 24,
-    fontWeight: '700',
-  },
-})
