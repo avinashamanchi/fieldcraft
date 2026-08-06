@@ -41,6 +41,15 @@ describe('release workflow contracts', () => {
     for (const command of requiredCommands) expect(workflow).toContain(command)
   })
 
+  it('keeps release readiness manual-only and unable to deploy or submit', () => {
+    const workflow = read('.github/workflows/release-readiness.yml')
+    expect(workflow).toMatch(/on:\s*\n\s*workflow_dispatch:/)
+    expect(workflow).not.toMatch(/\bpush:|pull_request:|deploy-pages|\beas(?:-cli)?\b[^\n]*submit|\bsupabase\b[^\n]*deploy/i)
+    for (const command of [...requiredCommands, 'npm run expo:doctor', 'npm run export:ios', 'deno check']) expect(workflow).toContain(command)
+    expect(workflow).toContain('deployed=false')
+    expect(workflow).toContain('submitted=false')
+  })
+
   it('keeps the app icon exact, opaque RGB, and configured without project credentials', () => {
     const icon = readFileSync(resolve(process.cwd(), 'mobile/assets/icon.png'))
     expect(icon.subarray(1, 4).toString('ascii')).toBe('PNG')

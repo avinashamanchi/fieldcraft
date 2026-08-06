@@ -1,0 +1,66 @@
+name: Release Readiness (No Deploy)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.0
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            mobile/package-lock.json
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Web and repository gates
+        run: |
+          npm ci
+          npm test
+          npm run typecheck
+          npm run lint
+          npm run build
+          npm run scan:secrets
+          npm audit --audit-level=high
+
+      - name: Mobile gates
+        working-directory: mobile
+        run: |
+          npm ci
+          npm test
+          npm run typecheck
+          npm run lint
+          npm run expo:doctor
+          npm run export:ios
+          npm audit --audit-level=high
+
+      - name: Backend and Edge dry-run gates
+        run: |
+          npm run check:supabase-boundary
+          npm run test:supabase-pglite
+          deno fmt --check supabase/functions
+          deno lint supabase/functions
+          deno test supabase/functions/fieldcraft-ai/index_test.ts supabase/functions/delete-account/index_test.ts
+          deno check supabase/functions/fieldcraft-ai/index.ts supabase/functions/delete-account/index.ts
+          npm run scan:secrets
+
+      - name: Create content-free evidence
+        run: |
+          mkdir -p release-evidence
+          node -e 'require("node:fs").writeFileSync("release-evidence/result.txt", `sha=${process.env.GITHUB_SHA}\nstatus=local-gates-passed\ndeployed=false\nsubmitted=false\n`)'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fieldcraft-release-readiness-${{ github.sha }}
+          path: release-evidence/result.txt
+          if-no-files-found: error
+          retention-days: 14
