@@ -63,6 +63,16 @@ const expectSqlState = async (operation, expectedCode) => {
   throw new Error(`expected SQLSTATE ${expectedCode}`)
 }
 
+const expectSqlStateIn = async (operation, expectedCodes) => {
+  try {
+    await operation()
+  } catch (error) {
+    if (error && typeof error === 'object' && expectedCodes.includes(error.code)) return
+    throw error
+  }
+  throw new Error(`expected one of SQLSTATE ${expectedCodes.join(', ')}`)
+}
+
 const withRole = async (role, operation) => {
   await db.exec(`set role ${role}`)
   try {
@@ -1162,6 +1172,61 @@ try {
         JSON.stringify(durableState.rows[0]?.profile) !== JSON.stringify(profileBefore.rows[0]?.profile)
       ) {
         throw new Error(`rejected payload ${index} wrote ${JSON.stringify(durableState.rows[0])}`)
+      }
+    }
+  })
+
+  await verify('PostgreSQL transport rejects unsyncable onboarding JSON without durable state', async () => {
+    const completedAt = '2026-08-07T18:00:00.000Z'
+    const validPayload = {
+      id: ownerId,
+      ownerId,
+      displayName: 'Avi Builder',
+      businessName: 'FieldCraft Plumbing',
+      tradeType: 'Plumbing',
+      hourlyRateCents: 12550,
+      taxBasisPoints: 875,
+      paymentTerms: 'Net 30',
+      countryCode: 'US',
+      currency: 'USD',
+      timeZone: 'America/Los_Angeles',
+      onboardingVersion: 1,
+      onboardingCompletedAt: completedAt,
+      version: 0,
+      createdAt: completedAt,
+      updatedAt: completedAt,
+      syncState: 'pending',
+    }
+    const transportCases = [
+      { ...validPayload, displayName: '😀\u0000😀' },
+      { ...validPayload, businessName: 'FieldCraft\uD800' },
+      { ...validPayload, timeZone: '\uDC00America/Los_Angeles' },
+    ]
+    const profileBefore = await db.query(
+      'select to_jsonb(profile) as profile from public.profiles as profile where id = $1',
+      [ownerId],
+    )
+    await db.exec(`select set_config('request.jwt.claim.sub', '${ownerId}', false)`)
+    for (const [index, payload] of transportCases.entries()) {
+      const mutationId = `7e000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`
+      await withRole('authenticated', () => expectSqlStateIn(
+        () => db.query(
+          'select public.save_fieldcraft_onboarding($1, $2::jsonb)',
+          [mutationId, JSON.stringify(payload)],
+        ),
+        ['22P02', '22P05'],
+      ))
+      const durableState = await db.query(`
+        select
+          (select count(*) from public.mutation_receipts
+            where user_id = $1 and mutation_id = $2)::int as receipts,
+          (select to_jsonb(profile) from public.profiles as profile where id = $1) as profile
+      `, [ownerId, mutationId])
+      if (
+        durableState.rows[0]?.receipts !== 0 ||
+        JSON.stringify(durableState.rows[0]?.profile) !== JSON.stringify(profileBefore.rows[0]?.profile)
+      ) {
+        throw new Error(`transport-rejected payload ${index} wrote ${JSON.stringify(durableState.rows[0])}`)
       }
     }
   })

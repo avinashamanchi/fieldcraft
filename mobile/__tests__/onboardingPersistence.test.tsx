@@ -50,10 +50,29 @@ const persistedProfile = (overrides: Partial<UserProfile> = {}): UserProfile => 
   ...overrides,
 })
 
+const unsyncableOnboardingCases: ReadonlyArray<readonly [
+  string,
+  (value: Record<string, unknown>) => Record<string, unknown>,
+]> = [
+  ['NUL between valid astral pairs', (value) => ({
+    ...value,
+    displayName: '😀\u0000😀',
+  })],
+  ['lone high surrogate at a text boundary', (value) => ({
+    ...value,
+    businessName: 'FieldCraft Plumbing\uD800',
+  })],
+  ['lone low surrogate at a text boundary', (value) => ({
+    ...value,
+    timeZone: '\uDC00America/Los_Angeles',
+  })],
+]
+
 const corruptOnboardingCases: ReadonlyArray<readonly [
   string,
   (value: Record<string, unknown>) => Record<string, unknown>,
 ]> = [
+  ...unsyncableOnboardingCases,
   ['leading display-name whitespace', (value) => ({ ...value, displayName: ' Avi Builder' })],
   ['leading display-name tab', (value) => ({ ...value, displayName: '\tAvi Builder' })],
   ['leading display-name next-line whitespace', (value) => ({ ...value, displayName: '\u0085Avi Builder' })],
@@ -172,6 +191,21 @@ it.each(corruptOnboardingCases)(
   },
 )
 
+it.each(unsyncableOnboardingCases)(
+  'rejects %s before onboarding can persist a local profile or outbox mutation',
+  (_label, corrupt) => {
+    const repository = { transactLocalMutation: jest.fn(async () => undefined) }
+    const saver = createOnboardingSaver({
+      lease,
+      repository,
+      createMutationId: () => MUTATION,
+    })
+
+    expect(() => saver.save(corrupt({ ...profile }) as OnboardingProfileV1)).toThrow()
+    expect(repository.transactLocalMutation).not.toHaveBeenCalled()
+  },
+)
+
 it.each([
   ['minimum supported year', '0001-01-01T00:00:00.000Z'],
   ['maximum supported year', '9999-12-31T23:59:59.999Z'],
@@ -200,6 +234,26 @@ it.each([
     )).not.toThrow()
   },
 )
+
+it('preserves valid paired astral text through onboarding persistence', async () => {
+  const repository = { transactLocalMutation: jest.fn(async () => undefined) }
+  const saver = createOnboardingSaver({
+    lease,
+    repository,
+    createMutationId: () => MUTATION,
+  })
+  const astralProfile: OnboardingProfileV1 = {
+    ...profile,
+    displayName: `😀${'A'.repeat(98)}😀`,
+    businessName: `😀${'B'.repeat(118)}😀`,
+    timeZone: `😀${'T'.repeat(98)}😀`,
+  }
+
+  await expect(saver.save(astralProfile)).resolves.toBeUndefined()
+  expect(repository.transactLocalMutation).toHaveBeenCalledWith(
+    expect.objectContaining({ payload: expect.objectContaining(astralProfile) }),
+  )
+})
 
 it('uses the reviewed completion timestamp instead of rereading a drifting clock during save', async () => {
   const repository = { transactLocalMutation: jest.fn(async () => undefined) }

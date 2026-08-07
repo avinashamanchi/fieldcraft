@@ -114,7 +114,31 @@ export type InventoryItem = VersionedEntity & {
 // not UTF-16 code units.
 const BOUNDARY_WHITESPACE = /^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]|[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]$/u
 
+const hasUnpairedUtf16Surrogate = (value: string): boolean => {
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index)
+    if (codeUnit >= 0xD800 && codeUnit <= 0xDBFF) {
+      const nextCodeUnit = value.charCodeAt(index + 1)
+      if (
+        index + 1 >= value.length ||
+        nextCodeUnit < 0xDC00 ||
+        nextCodeUnit > 0xDFFF
+      ) return true
+      index += 1
+    } else if (codeUnit >= 0xDC00 && codeUnit <= 0xDFFF) {
+      return true
+    }
+  }
+  return false
+}
+
 const strictBoundaryText = (maximum: number) => z.string().superRefine((value, context) => {
+  if (value.includes('\u0000') || hasUnpairedUtf16Surrogate(value)) {
+    context.addIssue({
+      code: 'custom',
+      message: 'text must be PostgreSQL-compatible Unicode without NUL or unpaired surrogates',
+    })
+  }
   const codePointLength = Array.from(value).length
   if (codePointLength < 1 || codePointLength > maximum) {
     context.addIssue({

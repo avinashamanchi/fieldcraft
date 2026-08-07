@@ -117,3 +117,40 @@ Validation-alignment verification under Node 22:
   test, so it is intentionally not labeled an exact-commit count.
 - Mobile TypeScript and Expo lint passed with no diagnostics.
 - Root and mobile `npm audit --audit-level=high`: zero vulnerabilities.
+
+## PostgreSQL text-transport follow-up
+
+The third review found one remaining pre-persistence mismatch: JavaScript and
+SQLite can represent U+0000 and unpaired UTF-16 surrogates, but PostgreSQL
+`jsonb`/`text` cannot safely receive those values. Tests were added before the
+mobile validator changed. The targeted RED run had 15 failing and 114 passing
+tests: the shared schema, mutation creator, saver, gate, cloud decoder, and
+actual SQLite repository all admitted the three hostile values, including
+writing local profile and outbox rows.
+
+- The shared onboarding text validator now rejects U+0000 and scans UTF-16
+  code units to reject lone high or low surrogates before code-point length and
+  boundary checks. Correct high/low pairs remain one Unicode code point.
+- Saver tests prove rejection occurs before `transactLocalMutation`; repository
+  tests independently prove no SQLite profile or outbox row is written.
+- Valid paired astral characters at the 100/120/100 code-point maxima persist
+  through the saver, SQLite profile cache, and outbox without replacement.
+- PGlite calls the real RPC parameter cast with JSON containing U+0000 and lone
+  surrogates. PostgreSQL rejects it at the `jsonb` transport boundary with
+  SQLSTATE `22P02` or `22P05`, before the PL/pgSQL function can run; after every
+  attempt, the profile is unchanged and no receipt exists. No SQL predicate
+  claims to inspect values that PostgreSQL cannot represent.
+
+Text-transport verification under Node 22:
+
+- Exact final Git-index snapshot: 204/204 prescribed focused tests passed
+  across 4 suites.
+- Exact final Git-index SQLite repository suite: 36/36 passed, including three
+  no-write rejection cases and paired-astral profile/outbox persistence.
+- Exact final Git-index PGlite verifier: 37/37 checks passed.
+- Preserved dirty working tree: 205/205 focused tests passed; the one-test
+  difference remains the unstaged App Store/EAS assertion.
+- Dirty working-tree full mobile suite: 529/529 passed across 46 suites. It
+  includes preserved release work and is not labeled an exact-commit count.
+- Mobile TypeScript and Expo lint passed with no diagnostics.
+- Root and mobile `npm audit --audit-level=high`: zero vulnerabilities.

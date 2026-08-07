@@ -18,6 +18,7 @@ import { SQLiteFieldCraftRepository } from '../src/data/sqliteRepository'
 const OWNER = 'owner-a'
 const MUTATION_ONE = '00000000-0000-4000-8000-000000000001'
 const MUTATION_TWO = '00000000-0000-4000-8000-000000000002'
+const PROFILE_OWNER = '70000000-0000-4000-8000-000000000071'
 const cursor = (changeSeq: number) => JSON.stringify({
   updatedAt: `2026-08-03T10:00:${String(changeSeq).padStart(2, '0')}.000Z`,
   changeSeq,
@@ -62,6 +63,39 @@ const mutation = (overrides: Record<string, unknown> = {}) => ({
   createdAt: '2026-08-03T10:00:01.000Z',
   attempts: 0,
   ...overrides,
+})
+
+const onboardingProfile = (overrides: Record<string, unknown> = {}) => ({
+  id: PROFILE_OWNER,
+  ownerId: PROFILE_OWNER,
+  version: 0,
+  createdAt: '2026-08-07T18:00:00.000Z',
+  updatedAt: '2026-08-07T18:00:00.000Z',
+  syncState: 'pending',
+  displayName: 'Avi Builder',
+  businessName: 'FieldCraft Plumbing',
+  tradeType: 'Plumbing',
+  hourlyRateCents: 12550,
+  taxBasisPoints: 875,
+  paymentTerms: 'Net 30',
+  countryCode: 'US',
+  currency: 'USD',
+  timeZone: 'America/Los_Angeles',
+  onboardingVersion: 1,
+  onboardingCompletedAt: '2026-08-07T18:00:00.000Z',
+  ...overrides,
+})
+
+const onboardingMutation = (payload: Record<string, unknown>) => ({
+  id: '00000000-0000-4000-8000-000000000071',
+  ownerId: PROFILE_OWNER,
+  entity: 'profile' as const,
+  entityId: PROFILE_OWNER,
+  kind: 'create' as const,
+  baseVersion: null,
+  payload,
+  createdAt: '2026-08-07T18:00:00.000Z',
+  attempts: 0,
 })
 
 const invoiceBundle = () => ({
@@ -171,6 +205,41 @@ it('rejects a non-UUID mutation id before writing cache state', async () => {
 
   await expect(repository.transactLocalMutation(mutation({ id: 'not-a-uuid' }))).rejects.toThrow()
   await expect(repository.get('client', 'client-1')).resolves.toBeNull()
+})
+
+it.each([
+  ['NUL', { displayName: '😀\u0000😀' }],
+  ['lone high surrogate', { businessName: 'FieldCraft\uD800' }],
+  ['lone low surrogate', { timeZone: '\uDC00America/Los_Angeles' }],
+] as const)(
+  'rejects onboarding %s before writing a SQLite profile or outbox row',
+  async (_label, hostileText) => {
+    const repository = new SQLiteFieldCraftRepository({ databaseName: 'unsyncable-profile.db' })
+    await repository.initialize(PROFILE_OWNER)
+
+    await expect(repository.transactLocalMutation(
+      onboardingMutation(onboardingProfile(hostileText)),
+    )).rejects.toThrow()
+    await expect(repository.get('profile', PROFILE_OWNER)).resolves.toBeNull()
+    await expect(repository.outbox.list(PROFILE_OWNER)).resolves.toEqual([])
+  },
+)
+
+it('persists valid paired astral onboarding text to both SQLite and its outbox', async () => {
+  const repository = new SQLiteFieldCraftRepository({ databaseName: 'astral-profile.db' })
+  await repository.initialize(PROFILE_OWNER)
+  const payload = onboardingProfile({
+    displayName: `😀${'A'.repeat(98)}😀`,
+    businessName: `😀${'B'.repeat(118)}😀`,
+    timeZone: `😀${'T'.repeat(98)}😀`,
+  })
+
+  await repository.transactLocalMutation(onboardingMutation(payload))
+
+  await expect(repository.get('profile', PROFILE_OWNER)).resolves.toEqual(payload)
+  await expect(repository.outbox.list(PROFILE_OWNER)).resolves.toEqual([
+    expect.objectContaining({ entity: 'profile', entityId: PROFILE_OWNER, payload }),
+  ])
 })
 
 it('atomically applies canonical rows before completing an acknowledged mutation', async () => {
