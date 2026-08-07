@@ -45,6 +45,8 @@
 - Modify: `mobile/src/domain/entities.ts`
 - Create: `mobile/src/features/onboarding/saveOnboarding.ts`
 - Create: `mobile/src/features/onboarding/OnboardingGate.tsx`
+- Modify: `mobile/src/data/sqliteRepository.ts`
+- Modify: `mobile/src/data/supabaseGateway.ts`
 - Create: `supabase/migrations/202608070001_fieldcraft_identity_security.sql`
 - Modify: `mobile/__tests__/authLifecycle.test.tsx`
 - Create: `mobile/__tests__/onboardingPersistence.test.tsx`
@@ -55,7 +57,11 @@
 
 **Interfaces:**
 - Consumes: `FieldCraftRepository.get<UserProfile>('profile', ownerId)`, `transactLocalMutation`, Supabase session and `auth.mfa` methods.
-- Produces: `OnboardingProfileV1`, `createOnboardingMutation`, `MfaService`, `requireRecentAal2`, local/global sign-out, `OnboardingGate`, and SQL `fieldcraft_require_aal2()`; no production demo service remains.
+- Produces: `OnboardingProfileV1`, `createOnboardingMutation`, `MfaService`,
+  `requireRecentAal2`, local/global sign-out, `OnboardingGate`, SQL
+  `fieldcraft_require_aal2()`, and an immutable
+  `AuthenticatedOwnerLease { ownerId; sessionGeneration; repositoryRevision }`;
+  no production demo service remains.
 
 - [ ] **Step 1: Write failing identity, relaunch, duplicate-submit, owner-switch, TOTP, and AAL tests**
 
@@ -99,7 +105,15 @@ export interface MfaService {
 }
 ```
 
-Delete `createLocalDemoAuthService`, `isFieldCraftLocalDemoMode`, and the root demo branch. Tests inject fakes. Onboarding writes profile plus one stable mutation ID in a SQLite transaction; the gate reads the initialized active owner. Clear in-memory AAL2 on background, token/owner change, and sign-out.
+Delete `createLocalDemoAuthService`, `isFieldCraftLocalDemoMode`, and the root
+demo branch. Tests inject fakes. Onboarding writes the complete profile plus one
+stable mutation ID in a SQLite transaction and round-trips every field through
+cloud sync; ambiguous retries reuse the same mutation ID and content. The gate
+reads a matching initialized active owner and fails closed on direct/deep-linked
+product routes. Increment `sessionGeneration` on every token/session lifecycle
+event and `repositoryRevision` on each initialized/cleared owner boundary; issue
+an immutable owner lease only when all three values still match. Clear in-memory
+AAL2 on background, token refresh, owner/session/repository change, and sign-out.
 
 - [ ] **Step 4: Add server AAL enforcement and pass green gates**
 
@@ -118,10 +132,10 @@ Expected: PASS, including 15-minute step-up expiry, local/global sign-out, offli
 
 - [ ] **Step 5: Commit the identity boundary**
 
-```bash
-git add mobile/src/auth mobile/src/features/onboarding mobile/src/domain/entities.ts mobile/app mobile/__tests__ supabase/migrations scripts/verify-fieldcraft-sync-pglite.mjs
-git commit -m "feat: require identity and secure onboarding"
-```
+Stage only the literal Task 1 file list, require the cached name-status list to
+equal that allowlist, inspect the cached diff, and commit with
+`feat: require identity and secure onboarding`. Reconcile already-dirty files
+line by line and never stage a directory wholesale.
 
 ### Task 2: Add Downgrade-Safe Pro Policy and RevenueCat Reconciliation
 
@@ -130,6 +144,9 @@ git commit -m "feat: require identity and secure onboarding"
 - Create: `mobile/src/billing/entitlementStore.ts`
 - Create: `mobile/src/billing/revenueCatClient.ts`
 - Create: `mobile/src/billing/SubscriptionProvider.tsx`
+- Create: `mobile/src/billing/featureAdmission.ts`
+- Modify: `mobile/src/domain/sync.ts`
+- Modify: `mobile/src/data/supabaseGateway.ts`
 - Create: `mobile/app/subscription/index.tsx`
 - Modify: `mobile/app/_layout.tsx`
 - Modify: `mobile/app/(tabs)/settings.tsx`
@@ -144,17 +161,47 @@ git commit -m "feat: require identity and secure onboarding"
 - Create: `mobile/__tests__/monetizationPolicy.test.ts`
 - Create: `mobile/__tests__/revenueCatClient.test.ts`
 - Create: `mobile/__tests__/subscriptionFlow.test.tsx`
+- Create: `mobile/__tests__/featureAdmission.test.ts`
 - Modify: `supabase/tests/database/fieldcraft_rls.test.sql`
+- Modify: `supabase/tests/database/fieldcraft_idempotency.test.sql`
 - Modify: `scripts/verify-fieldcraft-sync-pglite.mjs`
+- Modify: `package.json`
+- Modify: `.github/workflows/ci.yml`
+- Modify: `.github/workflows/deploy.yml`
+- Modify: `.github/workflows/release-readiness.yml`
 
 **Interfaces:**
-- Consumes: verified owner UUID, public iOS RevenueCat SDK key, offering `default`, entitlement `pro`, bounded authorized webhook.
-- Produces: `evaluateFeature`, owner-bound `EntitlementStore`, `RevenueCatClient`, purchase/restore/manage UI, `subscription_entitlements`, provider receipt dedupe, and `get_my_entitlement()`.
+- Consumes: Task 1's immutable
+  `AuthenticatedOwnerLease { ownerId; sessionGeneration; repositoryRevision }`,
+  stable outbox mutation IDs, public iOS RevenueCat SDK key, offering `default`,
+  entitlement `pro`, and a bounded authorized webhook.
+- Produces: `evaluateFeature`, owner-lease-bound `EntitlementStore`,
+  `RevenueCatClient`, `FeatureAdmissionService`, purchase/restore/manage UI,
+  `subscription_entitlements`, atomic provider receipt reconciliation,
+  `get_my_entitlement()`, and idempotent `reserve_feature_admission()`.
 
 - [ ] **Step 1: Install the exact SDK and write failing policy/client/webhook tests**
 
 Run: `cd mobile && npm install --save-exact react-native-purchases@10.7.0`
-Then cover free limits at limit-1/limit, downgrade edits/exports, server/client mismatch, configure/logIn order, owner logOut, cancellation/pending/restore/expiry/refund, Expo Go no-purchase, wrong webhook auth, body over 64 KiB, malformed UUID, duplicate/out-of-order event, and RLS.
+Then cover free limits at limit-1/limit, downgrade edits/exports, server/client
+mismatch, configure/logIn order, owner logOut, cancellation/pending/restore,
+query-time and timer-driven expiry, billing retry/grace, refund/revoke, Expo Go
+no-purchase, wrong webhook auth, body over 64 KiB, malformed UUID,
+duplicate/out-of-order/equal-timestamp events, atomic rollback, and RLS.
+
+For every create that would exceed a free limit, allocate the stable mutation ID
+first and prove the client obtains exactly one online
+`reserve_feature_admission(mutation_id, feature)` result before starting the
+local SQLite transaction. A timeout/offline/stale entitlement returns
+`ENTITLEMENT_STALE` and queues nothing. Ambiguous retries reuse the same mutation
+ID and admission. A retained admission must allow the matching outbox mutation
+to replay after subscription expiry but never allow a different owner, feature,
+mutation, or second business write.
+
+Exercise owner change, token refresh, repository reset, foreground refresh,
+purchase, restore, and a late RevenueCat listener callback at every await point.
+The old lease must become inert before provider logout/repository teardown, and
+the next owner must not start until teardown completes.
 
 ```ts
 export type Feature =
@@ -175,18 +222,29 @@ Expected: FAIL before modules, route, migration, and function exist.
 
 ```ts
 export interface RevenueCatClient {
-  start(ownerId: string): Promise<ProEntitlement>
+  start(lease: AuthenticatedOwnerLease): Promise<ProEntitlement>
   getPackages(): Promise<SubscriptionPackage[]>
   purchase(packageId: string): Promise<'purchased' | 'cancelled' | 'pending'>
   restore(): Promise<ProEntitlement>
   openManageSubscriptions(): Promise<void>
-  stop(ownerId: string): Promise<void>
+  stop(lease: AuthenticatedOwnerLease): Promise<void>
   subscribe(listener: (value: ProEntitlement) => void): () => void
 }
 export const FREE_LIMITS = { clients: 10, openJobs: 3, issuedDocumentsPerRolling30Days: 5 } as const
 ```
 
-Render StoreKit package prices and renewal copy. Only active `pro` unlocks. Expo Go says `Purchases require the FieldCraft development build`; no state/button grants Pro. Downgrade preserves read/edit/sync/pay/export/delete.
+Render StoreKit package prices and renewal copy. Only an unexpired provider and
+server-verified `pro` unlocks. Expo Go says `Purchases require the FieldCraft
+development build`; no state/button grants Pro. Downgrade preserves
+read/edit/sync/pay/export/delete.
+
+Bind every request, listener, purchase, restore, and refresh result to the full
+owner lease. Invalidate it before calling RevenueCat logout or repository
+teardown, serialize teardown/start, ignore every late result whose lease no
+longer matches, and expose `unknown` while the new owner is being verified.
+Above-free offline creation is unavailable by design; all other offline edits,
+payments, exports, deletes, and below-limit creates retain their current local
+durability.
 
 - [ ] **Step 4: Implement the strict webhook mirror and pass green gates**
 
@@ -196,23 +254,66 @@ create table public.subscription_entitlements (
   entitlement text not null check (entitlement = 'pro'),
   product_id text not null check (product_id in ('fieldcraft_pro_monthly','fieldcraft_pro_annual')),
   environment text not null check (environment in ('SANDBOX','PRODUCTION')),
-  status text not null check (status in ('active','expired','billing_issue','revoked','refunded')),
+  status text not null check (status in
+    ('active','cancelled','billing_retry','grace_period','expired','revoked','refunded')),
   expires_at timestamptz, provider_event_at timestamptz not null,
   updated_at timestamptz not null default statement_timestamp()
 );
 ```
 
-Use `(provider,event_id)` receipts retained 400 days. Bound webhook to 64 KiB/10 seconds, constant-time authorization, exact fields, UUID/product validation, row lock, duplicate/stale response, and content-free logs.
+Migration `202608070002` must run after `202608070001`, create
+`revenuecat_event_receipts` and `feature_admissions`, and replace any entitlement
+or admission write surface with strict RPCs. The Edge Function may validate and
+normalize, but only the service-role-only SQL RPC
+`apply_revenuecat_event(...)` may write provider receipts or entitlements. In
+one transaction it hashes/stores the `(provider,event_id)` receipt, locks the
+owner entitlement row, applies the event or classifies it as duplicate/stale,
+and returns exactly `applied | duplicate | stale`; a failure changes neither
+table.
 
-Run: `deno fmt --check supabase/functions && deno lint supabase/functions && deno test supabase/functions/revenuecat-webhook/index_test.ts && deno check supabase/functions/revenuecat-webhook/index.ts && npm run test:supabase-pglite && cd mobile && npm test -- --runInBand __tests__/monetizationPolicy.test.ts __tests__/revenueCatClient.test.ts __tests__/subscriptionFlow.test.tsx && npm run typecheck && npm run lint && npx expo-doctor && npm run export:ios`
-Expected: PASS with no client/server entitlement leak across owner change.
+Use this transition policy: initial purchase/renewal/uncancellation/product
+change is active; cancellation remains entitled until `expires_at`; billing
+issue/retry or grace remains entitled only while RevenueCat reports the
+entitlement active and its provider expiry is future; expiration becomes
+inactive at the earlier of an expiration event or query/client-timer/relaunch
+observing `expires_at`; refund/revoke is immediately inactive and terminal.
+Older events never overwrite newer state. At equal provider timestamps,
+refund/revoke outranks expiration, which outranks cancellation/billing state,
+which outranks active state. A later nonterminal event cannot resurrect a
+terminal refund/revoke without an explicitly newer qualifying purchase event.
+
+`reserve_feature_admission(mutation_id, feature)` locks the authenticated owner,
+rechecks query-time entitlement plus authoritative rolling/current counts, and
+stores one immutable 400-day receipt keyed by owner/mutation/feature. A retry
+returns the original decision. Existing mutation RPCs must require and consume
+that matching retained receipt for above-free client/open-job/document creates,
+including after the subscription later expires; no receipt means no above-free
+write. Below-free creates and downgrade-safe operations retain their existing
+path.
+
+Bound the webhook to 64 KiB/10 seconds, use constant-time authorization, exact
+field/UUID/product/app/environment validation, and content-free logs. PGlite
+must load `070001` then `070002`, provide `auth.jwt()`, and prove anon/direct
+table/cross-owner access is denied; only authenticated owners may execute
+`get_my_entitlement` and `reserve_feature_admission`, and only service role may
+execute `apply_revenuecat_event`.
+
+Add dynamic root scripts that test and check every
+`supabase/functions/*/index_test.ts` and `supabase/functions/*/index.ts`. CI,
+deployment, and release-readiness workflows must call those shared scripts so a
+new function cannot be silently omitted.
+
+Run: `deno fmt --check supabase/functions && deno lint supabase/functions && npm run test:supabase-functions && npm run check:supabase-functions && npm run test:supabase-pglite && cd mobile && npm test -- --runInBand __tests__/monetizationPolicy.test.ts __tests__/revenueCatClient.test.ts __tests__/subscriptionFlow.test.tsx __tests__/featureAdmission.test.ts && npm run typecheck && npm run lint && npx expo-doctor && npm run export:ios`
+Expected: PASS with atomic event/application receipts, no bypassable above-free
+write, and no client/server entitlement leak across owner/session/repository
+change.
 
 - [ ] **Step 5: Commit Pro subscriptions**
 
-```bash
-git add mobile/package.json mobile/package-lock.json mobile/app.config.ts mobile/src/domain/monetization.ts mobile/src/billing mobile/app mobile/__tests__ supabase/migrations supabase/functions supabase/tests scripts/verify-fieldcraft-sync-pglite.mjs
-git commit -m "feat: add RevenueCat Pro subscriptions"
-```
+Stage only the literal Task 2 file list, require the cached name-status list to
+equal that allowlist, inspect the cached diff, and commit with
+`feat: add RevenueCat Pro subscriptions`. Reconcile already-dirty files line by
+line and never stage a directory wholesale.
 
 ### Task 3: Add the Canonical Estimate-to-Payment Lifecycle
 
