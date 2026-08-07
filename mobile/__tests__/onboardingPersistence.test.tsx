@@ -55,7 +55,19 @@ const corruptOnboardingCases: ReadonlyArray<readonly [
   (value: Record<string, unknown>) => Record<string, unknown>,
 ]> = [
   ['leading display-name whitespace', (value) => ({ ...value, displayName: ' Avi Builder' })],
+  ['leading display-name tab', (value) => ({ ...value, displayName: '\tAvi Builder' })],
+  ['leading display-name next-line whitespace', (value) => ({ ...value, displayName: '\u0085Avi Builder' })],
+  ['trailing display-name byte-order-mark whitespace', (value) => ({
+    ...value,
+    displayName: 'Avi Builder\uFEFF',
+  })],
   ['trailing business-name whitespace', (value) => ({ ...value, businessName: 'FieldCraft ' })],
+  ['trailing business-name newline', (value) => ({
+    ...value,
+    businessName: 'FieldCraft Plumbing\n',
+  })],
+  ['oversized astral display name', (value) => ({ ...value, displayName: '😀'.repeat(101) })],
+  ['oversized astral business name', (value) => ({ ...value, businessName: '😀'.repeat(121) })],
   ['unknown trade', (value) => ({ ...value, tradeType: 'Software' })],
   ['zero hourly rate', (value) => ({ ...value, hourlyRateCents: 0 })],
   ['excess hourly rate', (value) => ({ ...value, hourlyRateCents: 100_000_001 })],
@@ -65,7 +77,12 @@ const corruptOnboardingCases: ReadonlyArray<readonly [
   ['unknown country', (value) => ({ ...value, countryCode: 'CA' })],
   ['unknown currency', (value) => ({ ...value, currency: 'CAD' })],
   ['leading timezone whitespace', (value) => ({ ...value, timeZone: ' America/Los_Angeles' })],
+  ['leading timezone nonbreaking space', (value) => ({
+    ...value,
+    timeZone: '\u00A0America/Los_Angeles',
+  })],
   ['oversized timezone', (value) => ({ ...value, timeZone: 'A'.repeat(101) })],
+  ['oversized astral timezone', (value) => ({ ...value, timeZone: '😀'.repeat(101) })],
   ['noncanonical completion timestamp', (value) => ({
     ...value,
     onboardingCompletedAt: '2026-08-07T11:00:00-07:00',
@@ -73,6 +90,14 @@ const corruptOnboardingCases: ReadonlyArray<readonly [
   ['completion timestamp without milliseconds', (value) => ({
     ...value,
     onboardingCompletedAt: '2026-08-07T18:00:00Z',
+  })],
+  ['completion timestamp with year zero', (value) => ({
+    ...value,
+    onboardingCompletedAt: '0000-01-01T00:00:00.000Z',
+  })],
+  ['completion timestamp with an impossible date', (value) => ({
+    ...value,
+    onboardingCompletedAt: '2026-02-31T18:00:00.000Z',
   })],
   ['unexpected profile key', (value) => ({ ...value, administrator: true })],
 ]
@@ -144,6 +169,35 @@ it.each(corruptOnboardingCases)(
       OWNER,
       OWNER,
     )).toThrow()
+  },
+)
+
+it.each([
+  ['minimum supported year', '0001-01-01T00:00:00.000Z'],
+  ['maximum supported year', '9999-12-31T23:59:59.999Z'],
+] as const)(
+  'accepts Unicode code-point maxima and the %s timestamp endpoint',
+  (_label, timestamp) => {
+    const boundaryProfile: OnboardingProfileV1 = {
+      ...profile,
+      displayName: '😀'.repeat(100),
+      businessName: '😀'.repeat(120),
+      timeZone: '😀'.repeat(100),
+      onboardingCompletedAt: timestamp,
+    }
+    expect(OnboardingProfileV1Schema.parse(boundaryProfile)).toEqual(boundaryProfile)
+    const mutation = createOnboardingMutation({
+      lease,
+      mutationId: MUTATION,
+      now: timestamp,
+      profile: boundaryProfile,
+    })
+    expect(() => validateEntityPayload(
+      'profile',
+      mutation.payload,
+      OWNER,
+      OWNER,
+    )).not.toThrow()
   },
 )
 

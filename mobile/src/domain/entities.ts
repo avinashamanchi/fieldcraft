@@ -108,21 +108,41 @@ export type InventoryItem = VersionedEntity & {
   lastUsedAt?: string
 }
 
-const strictTrimmedText = (maximum: number) => z.string()
-  .min(1)
-  .max(maximum)
-  .refine((value) => value === value.trim(), 'text must not contain surrounding whitespace')
+// Frozen boundary contract shared with fieldcraft_has_boundary_whitespace in
+// 202608070001_fieldcraft_identity_security.sql: Unicode White_Space plus the
+// ECMAScript legacy U+FEFF boundary character. Length is Unicode code points,
+// not UTF-16 code units.
+const BOUNDARY_WHITESPACE = /^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]|[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]$/u
+
+const strictBoundaryText = (maximum: number) => z.string().superRefine((value, context) => {
+  const codePointLength = Array.from(value).length
+  if (codePointLength < 1 || codePointLength > maximum) {
+    context.addIssue({
+      code: 'custom',
+      message: `text must contain between 1 and ${maximum} Unicode code points`,
+    })
+  }
+  if (BOUNDARY_WHITESPACE.test(value)) {
+    context.addIssue({
+      code: 'custom',
+      message: 'text must not contain boundary whitespace',
+    })
+  }
+})
 
 export const CanonicalMillisecondUtcTimestampSchema = z.string()
-  .regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/)
+  .regex(/^(\d{4})-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/)
   .refine((value) => {
+    const match = /^(\d{4})-/.exec(value)
+    const year = match ? Number(match[1]) : 0
+    if (year < 1 || year > 9999) return false
     const parsed = Date.parse(value)
     return Number.isFinite(parsed) && new Date(parsed).toISOString() === value
   }, 'timestamp must be canonical millisecond UTC ISO-8601')
 
 export const OnboardingProfileV1Schema = z.object({
-  displayName: strictTrimmedText(100),
-  businessName: strictTrimmedText(120),
+  displayName: strictBoundaryText(100),
+  businessName: strictBoundaryText(120),
   tradeType: z.enum([
     'Plumbing', 'Electrical', 'HVAC', 'Carpentry', 'General', 'Roofing', 'Flooring', 'Painting',
   ]),
@@ -131,7 +151,7 @@ export const OnboardingProfileV1Schema = z.object({
   paymentTerms: z.enum(['Due on receipt', 'Net 14', 'Net 30']),
   countryCode: z.literal('US'),
   currency: z.literal('USD'),
-  timeZone: strictTrimmedText(100),
+  timeZone: strictBoundaryText(100),
   onboardingVersion: z.literal(1),
   onboardingCompletedAt: CanonicalMillisecondUtcTimestampSchema,
 }).strict()

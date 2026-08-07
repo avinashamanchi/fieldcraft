@@ -65,8 +65,55 @@ and the role-aware PGlite verifier failed the new malicious-payload check.
 
 Follow-up verification under Node 22:
 
-- Prescribed focused suites: 160/160 passed across 4 suites.
-- PGlite verifier: 34/34 passed.
-- TypeScript and Expo lint: passed with no diagnostics.
-- Full mobile Jest suite: 480/480 passed across 46 suites.
+- Exact `b4259f7` checkout: 159/159 prescribed focused tests passed across 4 suites.
+- The working tree at that checkpoint: 160/160 focused tests passed; the extra
+  test was a preserved, unstaged App Store/EAS release assertion in
+  `mobile/__tests__/foundation.test.tsx`, not part of `b4259f7`.
+- Exact `b4259f7` PGlite verifier: 34/34 checks passed.
+- TypeScript and Expo lint passed with no diagnostics.
+- The dirty working-tree full mobile suite passed 480/480 across 46 suites. It
+  included preserved release work, so this is not presented as an exact-commit
+  test count.
+- Root and mobile `npm audit --audit-level=high`: zero vulnerabilities.
+
+## Validation and role-alignment follow-up
+
+The second static review found that the mobile schema used JavaScript UTF-16
+length and runtime `trim()`, while PostgreSQL used code-point length and
+`btrim()`. It also found that year `0000` was accepted by the mobile timestamp
+schema and that the PGlite `service_role` fixture did not model Supabase's
+platform role or exercise AAL checks under each runtime role.
+
+Tests were added before implementation. The RED checkpoint was 7 failing and
+73 passing onboarding tests: U+0085 boundary whitespace and year `0000` were
+accepted, while valid astral strings at the code-point maxima were rejected.
+PGlite failed the malicious-payload durability check and the service-role
+platform contract; its new four-role AAL matrix already passed.
+
+- Mobile and SQL now share one frozen boundary set: Unicode White_Space plus
+  ECMAScript's U+FEFF. Both count Unicode code points, reject the same boundary
+  characters, and avoid `trim()`/`btrim()` semantics.
+- Canonical timestamps explicitly support years `0001` through `9999` and
+  reject year `0000`, malformed dates, offsets, and missing milliseconds.
+- Rejected onboarding inputs are checked after every RPC attempt to prove that
+  neither a profile mutation nor a durable receipt was written.
+- PGlite models `service_role` with `BYPASSRLS` and platform table/sequence
+  grants. It proves service access and RLS bypass, serialized-write integrity,
+  and explicit onboarding/AAL denial without granting those user-facing RPCs.
+- Public-only, `anon`, `authenticated`, and `service_role` execute AAL checks
+  under their actual roles for missing, `aal1`, and `aal2` claims; no case is
+  executed as the database owner.
+
+Validation-alignment verification under Node 22:
+
+- Exact final Git-index snapshot: 191/191 prescribed focused tests passed
+  across 4 suites. This is the commit-owned count; the report itself does not
+  affect test discovery.
+- Preserved dirty working tree: 192/192 focused tests passed. The one-test
+  difference remains the unstaged App Store/EAS release assertion.
+- PGlite verifier: 36/36 checks passed from the exact final Git-index snapshot.
+- Dirty working-tree full mobile suite: 512/512 passed across 46 suites. This
+  includes the preserved foundation assertion and untracked SQLite release
+  test, so it is intentionally not labeled an exact-commit count.
+- Mobile TypeScript and Expo lint passed with no diagnostics.
 - Root and mobile `npm audit --audit-level=high`: zero vulnerabilities.

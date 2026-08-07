@@ -76,7 +76,7 @@ try {
   await db.exec(`
     create role anon;
     create role authenticated;
-    create role service_role;
+    create role service_role bypassrls;
     create role public_client;
     create schema auth;
     create table auth.users (id uuid primary key, email text);
@@ -285,6 +285,14 @@ try {
   await db.exec(await readMigration('202608030003_fieldcraft_sync_changes.sql'))
   await db.exec(await readMigration('202608060004_fieldcraft_ai_rate_limits.sql'))
   await db.exec(await readMigration('202608070001_fieldcraft_identity_security.sql'))
+  // Supabase grants its service role platform-level table and sequence access.
+  // Model that runtime privilege here without changing production migrations or
+  // granting user-facing RPCs that the migration intentionally withholds.
+  await db.exec(`
+    grant usage on schema public to service_role;
+    grant select, insert, update, delete on all tables in schema public to service_role;
+    grant usage, select, update on all sequences in schema public to service_role;
+  `)
   await db.exec(
     `select set_config('request.jwt.claim.sub', '${ownerId}', false)`,
   )
@@ -292,18 +300,20 @@ try {
   await verify('AI rate limits are atomic and independently scoped', async () => {
     const userDigest = 'a'.repeat(64)
     const networkDigest = 'b'.repeat(64)
-    const first = await db.query(
-      'select * from public.consume_fieldcraft_ai_rate_limit($1, $2, $3)',
-      [userDigest, 'invoice.parse.v1', 1],
-    )
-    const second = await db.query(
-      'select * from public.consume_fieldcraft_ai_rate_limit($1, $2, $3)',
-      [userDigest, 'invoice.parse.v1', 1],
-    )
-    const independent = await db.query(
-      'select * from public.consume_fieldcraft_ai_rate_limit($1, $2, $3)',
-      [networkDigest, 'invoice.parse.v1', 1],
-    )
+    const { first, second, independent } = await withRole('service_role', async () => ({
+      first: await db.query(
+        'select * from public.consume_fieldcraft_ai_rate_limit($1, $2, $3)',
+        [userDigest, 'invoice.parse.v1', 1],
+      ),
+      second: await db.query(
+        'select * from public.consume_fieldcraft_ai_rate_limit($1, $2, $3)',
+        [userDigest, 'invoice.parse.v1', 1],
+      ),
+      independent: await db.query(
+        'select * from public.consume_fieldcraft_ai_rate_limit($1, $2, $3)',
+        [networkDigest, 'invoice.parse.v1', 1],
+      ),
+    }))
     if (
       first.rows[0]?.allowed !== true || second.rows[0]?.allowed !== false ||
       independent.rows[0]?.allowed !== true || Number(second.rows[0]?.retry_after_seconds) < 1
@@ -910,19 +920,46 @@ try {
     }
   })
 
-  await verify('AAL2 enforcement rejects missing and aal1 claims and permits aal2', async () => {
+  await verify('AAL2 execution and claims are enforced for every runtime role', async () => {
+    const privileges = await db.query(`
+      select
+        has_function_privilege('public_client', 'public.fieldcraft_require_aal2()', 'execute') as public_only,
+        has_function_privilege('anon', 'public.fieldcraft_require_aal2()', 'execute') as anon,
+        has_function_privilege('authenticated', 'public.fieldcraft_require_aal2()', 'execute') as authenticated,
+        has_function_privilege('service_role', 'public.fieldcraft_require_aal2()', 'execute') as service_role
+    `)
+    const expectedPrivileges = {
+      public_only: false,
+      anon: false,
+      authenticated: true,
+      service_role: false,
+    }
+    if (JSON.stringify(privileges.rows[0]) !== JSON.stringify(expectedPrivileges)) {
+      throw new Error(`AAL2 privileges were ${JSON.stringify(privileges.rows[0])}`)
+    }
+
+    for (const role of ['public_client', 'anon', 'service_role']) {
+      for (const claims of ['', '{"aal":"aal1"}', '{"aal":"aal2"}']) {
+        await db.query(`select set_config('request.jwt.claims', $1, false)`, [claims])
+        await withRole(role, () => expectSqlState(
+          () => db.query('select public.fieldcraft_require_aal2()'),
+          '42501',
+        ))
+      }
+    }
+
     await db.exec(`select set_config('request.jwt.claims', '', false)`)
-    await expectSqlState(
+    await withRole('authenticated', () => expectSqlState(
       () => db.query('select public.fieldcraft_require_aal2()'),
       '42501',
-    )
+    ))
     await db.exec(`select set_config('request.jwt.claims', '{"aal":"aal1"}', false)`)
-    await expectSqlState(
+    await withRole('authenticated', () => expectSqlState(
       () => db.query('select public.fieldcraft_require_aal2()'),
       '42501',
-    )
+    ))
     await db.exec(`select set_config('request.jwt.claims', '{"aal":"aal2"}', false)`)
-    await db.query('select public.fieldcraft_require_aal2()')
+    await withRole('authenticated', () => db.query('select public.fieldcraft_require_aal2()'))
   })
 
   await verify('onboarding receipt replay and pull preserve the complete profile', async () => {
@@ -992,22 +1029,17 @@ try {
     }
   })
 
-  await verify('onboarding execution grants deny public-only and anon roles', async () => {
+  await verify('onboarding execution grants deny public-only, anon, and service roles', async () => {
     const dummyPayload = JSON.stringify({ id: ownerId, ownerId })
-    await withRole('public_client', () => expectSqlState(
-      () => db.query(
-        'select public.save_fieldcraft_onboarding($1, $2::jsonb)',
-        [roleOnboardingMutationId, dummyPayload],
-      ),
-      '42501',
-    ))
-    await withRole('anon', () => expectSqlState(
-      () => db.query(
-        'select public.save_fieldcraft_onboarding($1, $2::jsonb)',
-        [roleOnboardingMutationId, dummyPayload],
-      ),
-      '42501',
-    ))
+    for (const role of ['public_client', 'anon', 'service_role']) {
+      await withRole(role, () => expectSqlState(
+        () => db.query(
+          'select public.save_fieldcraft_onboarding($1, $2::jsonb)',
+          [roleOnboardingMutationId, dummyPayload],
+        ),
+        '42501',
+      ))
+    }
   })
 
   await verify('onboarding security definer uses only the trusted pg_catalog search path', async () => {
@@ -1071,8 +1103,14 @@ try {
 
     const maliciousPayloads = [
       { ...validPayload, displayName: ' Avi Builder' },
+      { ...validPayload, displayName: '\tAvi Builder' },
+      { ...validPayload, displayName: '\u0085Avi Builder' },
+      { ...validPayload, displayName: `Avi Builder\uFEFF` },
       { ...validPayload, displayName: ' ' },
       { ...validPayload, businessName: 'FieldCraft Plumbing ' },
+      { ...validPayload, businessName: 'FieldCraft Plumbing\n' },
+      { ...validPayload, displayName: '😀'.repeat(101) },
+      { ...validPayload, businessName: '😀'.repeat(121) },
       { ...validPayload, tradeType: 'Software' },
       { ...validPayload, hourlyRateCents: 0 },
       { ...validPayload, hourlyRateCents: 100000001 },
@@ -1082,16 +1120,28 @@ try {
       { ...validPayload, countryCode: 'CA' },
       { ...validPayload, currency: 'CAD' },
       { ...validPayload, timeZone: ' America/Los_Angeles' },
+      { ...validPayload, timeZone: '\u00A0America/Los_Angeles' },
       { ...validPayload, timeZone: 'A'.repeat(101) },
+      { ...validPayload, timeZone: '😀'.repeat(101) },
       { ...validPayload, onboardingCompletedAt: '2026-08-07T11:00:00-07:00' },
       { ...validPayload, onboardingCompletedAt: '2026-08-07T18:00:00Z' },
       { ...validPayload, onboardingCompletedAt: '2026-02-31T18:00:00.000Z' },
+      {
+        ...validPayload,
+        onboardingCompletedAt: '0000-01-01T00:00:00.000Z',
+        createdAt: '0000-01-01T00:00:00.000Z',
+        updatedAt: '0000-01-01T00:00:00.000Z',
+      },
       { ...validPayload, createdAt: '2026-08-07T18:00:00.001Z' },
       { ...validPayload, updatedAt: '2026-08-07T18:00:00.001Z' },
       { ...validPayload, version: 1 },
       { ...validPayload, syncState: 'current' },
       { ...validPayload, administrator: true },
     ]
+    const profileBefore = await db.query(
+      'select to_jsonb(profile) as profile from public.profiles as profile where id = $1',
+      [ownerId],
+    )
     for (const [index, payload] of maliciousPayloads.entries()) {
       const mutationId = `7b000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`
       await withRole('authenticated', () => expectSqlState(
@@ -1101,6 +1151,59 @@ try {
         ),
         '22023',
       ))
+      const durableState = await db.query(`
+        select
+          (select count(*) from public.mutation_receipts
+            where user_id = $1 and mutation_id = $2)::int as receipts,
+          (select to_jsonb(profile) from public.profiles as profile where id = $1) as profile
+      `, [ownerId, mutationId])
+      if (
+        durableState.rows[0]?.receipts !== 0 ||
+        JSON.stringify(durableState.rows[0]?.profile) !== JSON.stringify(profileBefore.rows[0]?.profile)
+      ) {
+        throw new Error(`rejected payload ${index} wrote ${JSON.stringify(durableState.rows[0])}`)
+      }
+    }
+  })
+
+  await verify('authenticated onboarding accepts code-point maxima and timestamp endpoints', async () => {
+    await db.exec(`select set_config('request.jwt.claim.sub', '${ownerId}', false)`)
+    const endpoints = [
+      '0001-01-01T00:00:00.000Z',
+      '9999-12-31T23:59:59.999Z',
+    ]
+    for (const [index, completedAt] of endpoints.entries()) {
+      const mutationId = `7d000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`
+      const payload = {
+        id: ownerId,
+        ownerId,
+        displayName: '😀'.repeat(100),
+        businessName: '😀'.repeat(120),
+        tradeType: 'General',
+        hourlyRateCents: 15000,
+        taxBasisPoints: 900,
+        paymentTerms: 'Due on receipt',
+        countryCode: 'US',
+        currency: 'USD',
+        timeZone: '😀'.repeat(100),
+        onboardingVersion: 1,
+        onboardingCompletedAt: completedAt,
+        version: 0,
+        createdAt: completedAt,
+        updatedAt: completedAt,
+        syncState: 'pending',
+      }
+      const result = await withRole('authenticated', () => db.query(
+        'select public.save_fieldcraft_onboarding($1, $2::jsonb) as response',
+        [mutationId, JSON.stringify(payload)],
+      ))
+      if (
+        result.rows[0]?.response?.cloud?.display_name !== payload.displayName ||
+        result.rows[0]?.response?.cloud?.business_name !== payload.businessName ||
+        result.rows[0]?.response?.cloud?.time_zone !== payload.timeZone
+      ) {
+        throw new Error(`endpoint response was ${JSON.stringify(result.rows[0]?.response ?? null)}`)
+      }
     }
   })
 
@@ -1161,6 +1264,36 @@ try {
       await expectSqlState(
         () => db.query(`update public.profiles set display_name = 'Bypass' where id = $1`, [ownerId]),
         '42501',
+      )
+    })
+  })
+
+  await verify('service role has platform table access, bypasses RLS, and cannot bypass write integrity', async () => {
+    const role = await db.query(`
+      select rolbypassrls,
+        has_table_privilege('service_role', 'public.profiles', 'select') as can_select,
+        has_function_privilege('service_role', 'public.save_fieldcraft_onboarding(uuid, jsonb)', 'execute') as can_onboard
+      from pg_catalog.pg_roles where rolname = 'service_role'
+    `)
+    if (
+      role.rows[0]?.rolbypassrls !== true ||
+      role.rows[0]?.can_select !== true ||
+      role.rows[0]?.can_onboard !== false
+    ) {
+      throw new Error(`service role contract was ${JSON.stringify(role.rows[0] ?? null)}`)
+    }
+    await db.exec(`select set_config('request.jwt.claim.sub', '${ownerId}', false)`)
+    await withRole('service_role', async () => {
+      const visible = await db.query(
+        'select id from public.profiles where id in ($1, $2) order by id',
+        [ownerId, secondOwnerId],
+      )
+      if (visible.rows.length !== 2) {
+        throw new Error(`service role did not bypass RLS: ${JSON.stringify(visible.rows)}`)
+      }
+      await expectSqlState(
+        () => db.query(`update public.profiles set display_name = 'Unserialized' where id = $1`, [ownerId]),
+        '55000',
       )
     })
   })

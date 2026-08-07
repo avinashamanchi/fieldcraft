@@ -15,18 +15,42 @@ alter table public.profiles
     or (onboarding_version = 1 and onboarding_completed_at is not null)
   );
 
+-- Frozen boundary contract shared with mobile/src/domain/entities.ts:
+-- Unicode White_Space plus ECMAScript's legacy U+FEFF boundary character.
+-- PostgreSQL char_length and JavaScript Array.from both count Unicode code
+-- points for this contract.
+create or replace function public.fieldcraft_has_boundary_whitespace(p_value text)
+returns boolean
+language sql
+immutable
+strict
+security invoker
+set search_path = ''
+as $$
+  select p_value ~ U&'^[\0009-\000D\0020\0085\00A0\1680\2000-\200A\2028\2029\202F\205F\3000\FEFF]'
+    or p_value ~ U&'[\0009-\000D\0020\0085\00A0\1680\2000-\200A\2028\2029\202F\205F\3000\FEFF]$'
+$$;
+
+revoke execute on function public.fieldcraft_has_boundary_whitespace(text)
+  from public, anon, authenticated, service_role;
+-- The platform service role performs privileged table maintenance, so it must
+-- be able to evaluate this CHECK-constraint helper. User-facing roles remain
+-- unable to invoke it directly.
+grant execute on function public.fieldcraft_has_boundary_whitespace(text)
+  to service_role;
+
 alter table public.profiles
   add constraint profiles_onboarding_v1_contract_check check (
     onboarding_version = 0
     or (
       char_length(display_name) between 1 and 100
-      and display_name = btrim(display_name)
+      and not public.fieldcraft_has_boundary_whitespace(display_name)
       and char_length(business_name) between 1 and 120
-      and business_name = btrim(business_name)
+      and not public.fieldcraft_has_boundary_whitespace(business_name)
       and hourly_rate_cents between 1 and 100000000
       and tax_basis_points between 0 and 10000
       and char_length(time_zone) between 1 and 100
-      and time_zone = btrim(time_zone)
+      and not public.fieldcraft_has_boundary_whitespace(time_zone)
       and onboarding_complete = true
     )
   );
@@ -102,9 +126,9 @@ begin
     or jsonb_typeof(p_payload -> 'updatedAt') <> 'string'
     or jsonb_typeof(p_payload -> 'syncState') <> 'string'
     or char_length(coalesce(p_payload ->> 'displayName', '')) not between 1 and 100
-    or p_payload ->> 'displayName' <> btrim(p_payload ->> 'displayName')
+    or public.fieldcraft_has_boundary_whitespace(p_payload ->> 'displayName')
     or char_length(coalesce(p_payload ->> 'businessName', '')) not between 1 and 120
-    or p_payload ->> 'businessName' <> btrim(p_payload ->> 'businessName')
+    or public.fieldcraft_has_boundary_whitespace(p_payload ->> 'businessName')
     or p_payload ->> 'tradeType' not in (
       'Plumbing', 'Electrical', 'HVAC', 'Carpentry', 'General', 'Roofing', 'Flooring', 'Painting'
     )
@@ -112,7 +136,7 @@ begin
     or p_payload ->> 'countryCode' <> 'US'
     or p_payload ->> 'currency' <> 'USD'
     or char_length(coalesce(p_payload ->> 'timeZone', '')) not between 1 and 100
-    or p_payload ->> 'timeZone' <> btrim(p_payload ->> 'timeZone')
+    or public.fieldcraft_has_boundary_whitespace(p_payload ->> 'timeZone')
     or public.require_jsonb_integer(p_payload -> 'hourlyRateCents', 'hourlyRateCents', 1, 100000000) < 1
     or public.require_jsonb_integer(p_payload -> 'taxBasisPoints', 'taxBasisPoints', 0, 10000) < 0
     or public.require_jsonb_integer(p_payload -> 'onboardingVersion', 'onboardingVersion', 1, 1) <> 1
@@ -121,6 +145,8 @@ begin
     or nullif(p_payload ->> 'onboardingCompletedAt', '') is null
     or p_payload ->> 'onboardingCompletedAt'
       !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$'
+    or substring(p_payload ->> 'onboardingCompletedAt' from 1 for 4)
+      not between '0001' and '9999'
     or p_payload ->> 'createdAt' <> p_payload ->> 'onboardingCompletedAt'
     or p_payload ->> 'updatedAt' <> p_payload ->> 'onboardingCompletedAt'
   then
