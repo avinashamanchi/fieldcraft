@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { router } from 'expo-router'
 import { Pressable, StyleSheet, Text, TextInput, View } from 'react-native'
 
-import { useAuthenticatedOwnerLease } from '../../src/auth/AuthProvider'
+import { useAuthActions, useAuthenticatedOwnerLease } from '../../src/auth/AuthProvider'
 import { createMfaService, type MfaService } from '../../src/auth/mfaService'
 import { getRecentAal2Guard } from '../../src/auth/requireAal2'
 import { Screen } from '../../src/components/Screen'
@@ -10,6 +10,7 @@ import { colors, MIN_TOUCH_TARGET, spacing } from '../../src/theme/tokens'
 
 export default function MfaScreen({ service: suppliedService }: { service?: MfaService }) {
   const lease = useAuthenticatedOwnerLease()
+  const { verifyMfaChallenge } = useAuthActions()
   const service = useMemo(() => suppliedService ?? createMfaService(), [suppliedService])
   const [factors, setFactors] = useState<{ id: string; friendlyName?: string }[]>([])
   const [enrollment, setEnrollment] = useState<{ factorId: string; qrCode: string } | null>(null)
@@ -22,8 +23,7 @@ export default function MfaScreen({ service: suppliedService }: { service?: MfaS
   const verifyEnrollment = async () => {
     if (!enrollment || !lease) return
     try {
-      await service.verifyEnrollment(enrollment.factorId, code)
-      getRecentAal2Guard().markVerified({ ...lease, verifiedAt: Date.now() })
+      await verifyMfaChallenge(() => service.verifyEnrollment(enrollment.factorId, code))
       setEnrollment(null)
       setCode('')
       setMessage('Authenticator enabled.')

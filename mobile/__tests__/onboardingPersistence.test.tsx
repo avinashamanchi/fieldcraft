@@ -2,8 +2,13 @@ import { act, render, screen, waitFor } from '@testing-library/react-native'
 import { Text } from 'react-native'
 
 import type { AuthenticatedOwnerLease } from '../src/auth/AuthProvider'
+import { validateEntityPayload } from '../src/data/sqliteRepository'
 import { createSupabaseGateway } from '../src/data/supabaseGateway'
-import type { OnboardingProfileV1, UserProfile } from '../src/domain/entities'
+import {
+  OnboardingProfileV1Schema,
+  type OnboardingProfileV1,
+  type UserProfile,
+} from '../src/domain/entities'
 import {
   createOnboardingMutation,
   createOnboardingSaver,
@@ -44,6 +49,33 @@ const persistedProfile = (overrides: Partial<UserProfile> = {}): UserProfile => 
   ...profile,
   ...overrides,
 })
+
+const corruptOnboardingCases: ReadonlyArray<readonly [
+  string,
+  (value: Record<string, unknown>) => Record<string, unknown>,
+]> = [
+  ['leading display-name whitespace', (value) => ({ ...value, displayName: ' Avi Builder' })],
+  ['trailing business-name whitespace', (value) => ({ ...value, businessName: 'FieldCraft ' })],
+  ['unknown trade', (value) => ({ ...value, tradeType: 'Software' })],
+  ['zero hourly rate', (value) => ({ ...value, hourlyRateCents: 0 })],
+  ['excess hourly rate', (value) => ({ ...value, hourlyRateCents: 100_000_001 })],
+  ['fractional tax', (value) => ({ ...value, taxBasisPoints: 1.5 })],
+  ['excess tax', (value) => ({ ...value, taxBasisPoints: 10_001 })],
+  ['unknown payment terms', (value) => ({ ...value, paymentTerms: 'Net 60' })],
+  ['unknown country', (value) => ({ ...value, countryCode: 'CA' })],
+  ['unknown currency', (value) => ({ ...value, currency: 'CAD' })],
+  ['leading timezone whitespace', (value) => ({ ...value, timeZone: ' America/Los_Angeles' })],
+  ['oversized timezone', (value) => ({ ...value, timeZone: 'A'.repeat(101) })],
+  ['noncanonical completion timestamp', (value) => ({
+    ...value,
+    onboardingCompletedAt: '2026-08-07T11:00:00-07:00',
+  })],
+  ['completion timestamp without milliseconds', (value) => ({
+    ...value,
+    onboardingCompletedAt: '2026-08-07T18:00:00Z',
+  })],
+  ['unexpected profile key', (value) => ({ ...value, administrator: true })],
+]
 
 it('reuses the exact mutation ID and content after an ambiguous onboarding save', async () => {
   const writes: unknown[] = []
@@ -94,6 +126,26 @@ it('rejects a mismatched or noncanonical onboarding owner before local persisten
     profile,
   })).toThrow('timestamp')
 })
+
+it.each(corruptOnboardingCases)(
+  'rejects %s through the reusable create and SQLite profile contract',
+  (_label, corrupt) => {
+    const corruptInput = corrupt({ ...profile })
+    expect(() => OnboardingProfileV1Schema.parse(corruptInput)).toThrow()
+    expect(() => createOnboardingMutation({
+      lease,
+      mutationId: MUTATION,
+      now: String(corruptInput.onboardingCompletedAt ?? NOW),
+      profile: corruptInput as OnboardingProfileV1,
+    })).toThrow()
+    expect(() => validateEntityPayload(
+      'profile',
+      corrupt(persistedProfile() as unknown as Record<string, unknown>),
+      OWNER,
+      OWNER,
+    )).toThrow()
+  },
+)
 
 it('uses the reviewed completion timestamp instead of rereading a drifting clock during save', async () => {
   const repository = { transactLocalMutation: jest.fn(async () => undefined) }
@@ -229,6 +281,29 @@ it('renders a visible local-data error and discards a stale owner result', async
   expect(screen.queryByText('Protected job')).toBeNull()
 })
 
+it.each(corruptOnboardingCases)(
+  'fails the onboarding gate closed for %s',
+  async (_label, corrupt) => {
+    render(
+      <OnboardingGate
+        lease={lease}
+        repository={{
+          get: jest.fn(async () => corrupt(
+            persistedProfile() as unknown as Record<string, unknown>,
+          )),
+        }}
+        repositoryOwnerId={OWNER}
+        replace={jest.fn()}
+      >
+        <Text>Protected dashboard</Text>
+      </OnboardingGate>,
+    )
+
+    expect(await screen.findByRole('alert')).toBeTruthy()
+    expect(screen.queryByText('Protected dashboard')).toBeNull()
+  },
+)
+
 type Reply = { data: unknown; error: unknown | null; status: number }
 class Client {
   readonly calls: { name: string; parameters: Record<string, unknown> }[] = []
@@ -242,34 +317,76 @@ class Client {
   }
 }
 
-const rawProfile = () => ({
+const rawProfile = (
+  source: Record<string, unknown> = profile as unknown as Record<string, unknown>,
+) => ({
   id: OWNER,
-  display_name: profile.displayName,
-  business_name: profile.businessName,
-  trade_type: profile.tradeType,
-  hourly_rate_cents: profile.hourlyRateCents,
-  tax_basis_points: profile.taxBasisPoints,
-  payment_terms: profile.paymentTerms,
-  country_code: profile.countryCode,
-  currency: profile.currency,
-  time_zone: profile.timeZone,
-  onboarding_version: profile.onboardingVersion,
-  onboarding_completed_at: profile.onboardingCompletedAt,
+  display_name: source.displayName,
+  business_name: source.businessName,
+  trade_type: source.tradeType,
+  hourly_rate_cents: source.hourlyRateCents,
+  tax_basis_points: source.taxBasisPoints,
+  payment_terms: source.paymentTerms,
+  country_code: source.countryCode,
+  currency: source.currency,
+  time_zone: source.timeZone,
+  onboarding_version: source.onboardingVersion,
+  onboarding_completed_at: source.onboardingCompletedAt,
   version: 1,
   created_at: NOW,
   updated_at: NOW,
 })
 
+it.each(corruptOnboardingCases.filter(([label]) => ![
+  'unexpected profile key',
+  'noncanonical completion timestamp',
+  'completion timestamp without milliseconds',
+].includes(label)))(
+  'rejects %s from cloud onboarding normalization',
+  async (_label, corrupt) => {
+    const client = new Client()
+    const mutation = createOnboardingMutation({ lease, mutationId: MUTATION, now: NOW, profile })
+    client.replies = [{
+      data: {
+        status: 'applied',
+        mutation_id: MUTATION,
+        entity: 'profile',
+        kind: 'create',
+        entity_id: OWNER,
+        cloud: rawProfile(corrupt({ ...profile })),
+        sync_position: {
+          updated_at: NOW,
+          change_seq: 1,
+          change_id: 1,
+          source: 'sync_changes',
+        },
+      },
+      error: null,
+      status: 200,
+    }]
+
+    await expect(createSupabaseGateway(client).pushMutation(
+      OWNER,
+      mutation,
+      new AbortController().signal,
+    )).rejects.toMatchObject({ reason: 'invalid-response' })
+  },
+)
+
 it('round-trips every onboarding field through push receipt replay and pull normalization', async () => {
   const client = new Client()
   const mutation = createOnboardingMutation({ lease, mutationId: MUTATION, now: NOW, profile })
+  const postgresProfile = {
+    ...rawProfile(),
+    onboarding_completed_at: '2026-08-07T18:00:00+00:00',
+  }
   const applied = {
     status: 'applied',
     mutation_id: MUTATION,
     entity: 'profile',
     kind: 'create',
     entity_id: OWNER,
-    cloud: rawProfile(),
+    cloud: postgresProfile,
     sync_position: {
       updated_at: NOW,
       change_seq: 1,
@@ -292,7 +409,7 @@ it('round-trips every onboarding field through push receipt replay and pull norm
           version: 1,
           updated_at: NOW,
           deleted: false,
-          payload: rawProfile(),
+          payload: postgresProfile,
         }],
         cursor: { updated_at: NOW, change_seq: 1, change_id: 1 },
         has_more: false,

@@ -35,3 +35,38 @@ Additional regression tests were observed failing before their fixes for incompl
 - TypeScript: passed.
 - Expo lint: passed with no diagnostics.
 - Full mobile Jest suite: 384/384 passed across 46 suites.
+
+## Static-review follow-up
+
+The post-commit review identified five fail-closed gaps. Regression tests were
+added first; the RED checkpoint was 56 failing and 80 passing focused tests,
+and the role-aware PGlite verifier failed the new malicious-payload check.
+
+- Product admission now classifies only the intended public auth/privacy
+  routes as public. Every tabs, jobs, invoices, settings, and security route is
+  blocked or redirected for signed-out, verification-required, initializing,
+  hydrating, missing-lease, and owner-mismatch states. Secure onboarding and
+  product routes require the current hydrated lease and repository owner.
+- Sign-out, invalid-session callbacks, session-restore failures, and
+  subscription failures capture the prior owner and register serialized local
+  erasure before revoking access. Failed clears remain retryable across
+  provider remounts, and later owners cannot hydrate until the registry drains.
+- MFA challenge completion is coordinated by `AuthProvider`: the provider's
+  `MFA_CHALLENGE_VERIFIED` event still rotates session generation, and only the
+  resulting current lease is marked recently verified. Refresh, background,
+  sign-out, owner changes, repository changes, timeout, and teardown cancel it.
+- One strict `OnboardingProfileV1Schema` now governs create, SQLite, cloud, and
+  gate normalization. SQL mirrors its identity, exact-key, enum, range,
+  whitespace, metadata, and canonical millisecond-UTC timestamp contract with
+  a `pg_catalog`-only security-definer search path.
+- PGlite now executes as public-only, `anon`, and `authenticated` roles and
+  proves execution grants, missing/cross-owner/malformed rejection,
+  authenticated apply/replay, RLS owner reads, and direct-DML denial.
+
+Follow-up verification under Node 22:
+
+- Prescribed focused suites: 160/160 passed across 4 suites.
+- PGlite verifier: 34/34 passed.
+- TypeScript and Expo lint: passed with no diagnostics.
+- Full mobile Jest suite: 480/480 passed across 46 suites.
+- Root and mobile `npm audit --audit-level=high`: zero vulnerabilities.

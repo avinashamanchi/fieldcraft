@@ -1,6 +1,6 @@
 import { router, Stack, useSegments } from 'expo-router'
 import { ActivityIndicator, StyleSheet, Text, View } from 'react-native'
-import { useState, type PropsWithChildren } from 'react'
+import { useEffect, useState, type PropsWithChildren } from 'react'
 import 'react-native-gesture-handler'
 import 'react-native-reanimated'
 
@@ -55,13 +55,41 @@ const RepositoryProviders = ({
   )
 }
 
-const ProductRouteBoundary = ({ children }: PropsWithChildren) => {
+const PUBLIC_AUTH_ROUTES = new Set(['login', 'signup', 'reset-password', 'verify-email'])
+
+export const ProductRouteBoundary = ({ children }: PropsWithChildren) => {
   const auth = useAuth()
   const lease = useAuthenticatedOwnerLease()
   const { owner, repository } = useFieldCraftData()
   const segments = useSegments()
-  const publicRoute = segments[0] === '(auth)' || segments[0] === 'privacy'
-  if (publicRoute || auth.status !== 'signedIn' || !auth.hydrated) return children
+  const routeRoot = String(segments[0] ?? '')
+  const routeLeaf = String(segments[1] ?? '')
+  const publicRoute = routeRoot === 'privacy' || (
+    routeRoot === '(auth)' && PUBLIC_AUTH_ROUTES.has(routeLeaf)
+  )
+  const onboardingRoute = routeRoot === '(auth)' && routeLeaf === 'onboarding'
+  const redirectRoute = !publicRoute && auth.status === 'signedOut'
+    ? '/(auth)/login'
+    : !publicRoute && auth.status === 'verificationRequired'
+      ? '/(auth)/verify-email'
+      : null
+  const admittedOwner = auth.status === 'signedIn' && auth.hydrated && lease !== null &&
+    lease.ownerId === auth.userId && repositoryOwnerIdMatches(owner.ownerId, lease.ownerId)
+
+  useEffect(() => {
+    if (redirectRoute) router.replace(redirectRoute)
+  }, [redirectRoute])
+
+  if (publicRoute) return children
+  if (redirectRoute || !admittedOwner) {
+    return (
+      <View accessibilityLabel="Checking FieldCraft access" style={styles.centered}>
+        <ActivityIndicator color={colors.orange} />
+        <Text style={styles.bootText}>Checking secure access…</Text>
+      </View>
+    )
+  }
+  if (onboardingRoute) return children
   return (
     <OnboardingGate
       lease={lease}
@@ -73,6 +101,11 @@ const ProductRouteBoundary = ({ children }: PropsWithChildren) => {
     </OnboardingGate>
   )
 }
+
+const repositoryOwnerIdMatches = (
+  repositoryOwnerId: string | null,
+  leaseOwnerId: string,
+): boolean => repositoryOwnerId !== null && repositoryOwnerId === leaseOwnerId
 
 const InvoiceSessionBoundary = ({ children }: PropsWithChildren) => {
   const auth = useAuth()

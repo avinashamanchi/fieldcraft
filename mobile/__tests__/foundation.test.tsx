@@ -1,18 +1,27 @@
-import { render, screen } from '@testing-library/react-native'
+import { render, screen, waitFor } from '@testing-library/react-native'
 import type { ReactNode } from 'react'
-import RootLayout from '../app/_layout'
+import { Text } from 'react-native'
+import RootLayout, { ProductRouteBoundary } from '../app/_layout'
 import appConfig from '../app.config'
 import { colors } from '../src/theme/tokens'
 
-let mockAuthState: { status: string; userId?: string; hydrated?: boolean; message?: string } = { status: 'signedOut' }
-const mockRepository = { list: jest.fn(async () => []), transactLocalMutation: jest.fn(async () => {}) }
+let mockAuthState: { status: string; userId?: string; email?: string; hydrated?: boolean; message?: string } = { status: 'signedOut' }
+let mockSegments: string[] = ['(tabs)']
+let mockLease: { ownerId: string; sessionGeneration: number; repositoryRevision: number } | null = null
+let mockRepositoryOwnerId: string | null = null
+const mockRouterReplace = jest.fn()
+const mockRepository = {
+  get: jest.fn(async () => null),
+  list: jest.fn(async () => []),
+  transactLocalMutation: jest.fn(async () => {}),
+}
 let observedAuthProviderProps: Record<string, unknown> = {}
 let observedSyncProviderProps: Record<string, unknown> = {}
 
 jest.mock('expo-router', () => ({
-  router: { replace: jest.fn() },
+  router: { replace: (...args: unknown[]) => mockRouterReplace(...args) },
   Stack: () => null,
-  useSegments: () => ['(tabs)'],
+  useSegments: () => mockSegments,
 }))
 jest.mock('../src/auth/AuthProvider', () => ({
   AuthProvider: ({ children, ...props }: { children: ReactNode } & Record<string, unknown>) => {
@@ -20,17 +29,23 @@ jest.mock('../src/auth/AuthProvider', () => ({
     return children
   },
   useAuth: () => mockAuthState,
-  useAuthenticatedOwnerLease: () => mockAuthState.status === 'signedIn' && mockAuthState.userId
-    ? Object.freeze({ ownerId: mockAuthState.userId, sessionGeneration: 1, repositoryRevision: 1 })
-    : null,
+  useAuthenticatedOwnerLease: () => mockLease,
 }))
 jest.mock('../src/data/DataProvider', () => ({
   DataProvider: ({ children }: { children: ReactNode }) => children,
   useFieldCraftData: () => ({
-    owner: { ownerId: mockAuthState.userId ?? null },
+    owner: { ownerId: mockRepositoryOwnerId },
     repository: mockRepository,
   }),
 }))
+
+beforeEach(() => {
+  mockAuthState = { status: 'signedOut' }
+  mockSegments = ['(tabs)']
+  mockLease = null
+  mockRepositoryOwnerId = null
+  mockRouterReplace.mockReset()
+})
 jest.mock('../src/data/SyncProvider', () => ({
   SyncProvider: ({ children, ...props }: { children: ReactNode } & Record<string, unknown>) => {
     observedSyncProviderProps = props
@@ -56,6 +71,102 @@ it('mounts the native root', () => {
   mockAuthState = { status: 'signedOut' }
   render(<RootLayout />)
   expect(screen.queryByText(/vite/i)).toBeNull()
+})
+
+const productRouteFamilies = [
+  ['tabs', ['(tabs)', 'index']],
+  ['jobs', ['jobs', '[id]']],
+  ['invoices', ['invoices', '[id]']],
+  ['settings', ['settings', 'sync']],
+  ['security', ['security', 'mfa']],
+] as const
+
+it.each(productRouteFamilies)(
+  'redirects signed-out %s deep links without rendering product children',
+  async (_family, segments) => {
+    mockSegments = [...segments]
+    render(<ProductRouteBoundary><Text>Protected product</Text></ProductRouteBoundary>)
+
+    expect(screen.queryByText('Protected product')).toBeNull()
+    await waitFor(() => expect(mockRouterReplace).toHaveBeenCalledWith('/(auth)/login'))
+  },
+)
+
+it.each(productRouteFamilies)(
+  'redirects verification-required %s deep links without rendering product children',
+  async (_family, segments) => {
+    mockSegments = [...segments]
+    mockAuthState = { status: 'verificationRequired', email: 'person@example.com' }
+    render(<ProductRouteBoundary><Text>Protected product</Text></ProductRouteBoundary>)
+
+    expect(screen.queryByText('Protected product')).toBeNull()
+    await waitFor(() => expect(mockRouterReplace).toHaveBeenCalledWith('/(auth)/verify-email'))
+  },
+)
+
+const blockedIdentityStates = [
+  ['initializing', { status: 'initializing' }, null, null],
+  ['hydrating', { status: 'signedIn', userId: 'owner-a', email: 'a@example.com', hydrated: false }, null, null],
+  ['missing lease', { status: 'signedIn', userId: 'owner-a', email: 'a@example.com', hydrated: true }, null, 'owner-a'],
+  ['repository owner mismatch', { status: 'signedIn', userId: 'owner-a', email: 'a@example.com', hydrated: true }, { ownerId: 'owner-a', sessionGeneration: 1, repositoryRevision: 1 }, 'owner-b'],
+  ['lease owner mismatch', { status: 'signedIn', userId: 'owner-a', email: 'a@example.com', hydrated: true }, { ownerId: 'owner-b', sessionGeneration: 1, repositoryRevision: 1 }, 'owner-b'],
+] as const
+
+const blockedProductCases = productRouteFamilies.flatMap(([family, segments]) =>
+  blockedIdentityStates.map(([state, authState, lease, repositoryOwnerId]) => [
+    `${family} / ${state}`,
+    segments,
+    authState,
+    lease,
+    repositoryOwnerId,
+  ] as const),
+)
+
+it.each(blockedProductCases)(
+  'does not admit product children while route identity is %s',
+  (_label, segments, authState, lease, repositoryOwnerId) => {
+    mockSegments = [...segments]
+    mockAuthState = authState
+    mockLease = lease
+    mockRepositoryOwnerId = repositoryOwnerId
+
+    render(<ProductRouteBoundary><Text>Protected product</Text></ProductRouteBoundary>)
+
+    expect(screen.queryByText('Protected product')).toBeNull()
+    expect(mockRouterReplace).not.toHaveBeenCalled()
+  },
+)
+
+it.each(productRouteFamilies)(
+  'admits hydrated %s routes only under the current owner lease',
+  (_family, segments) => {
+    mockSegments = [...segments]
+    mockAuthState = { status: 'signedIn', userId: 'owner-a', email: 'a@example.com', hydrated: true }
+    mockLease = Object.freeze({ ownerId: 'owner-a', sessionGeneration: 2, repositoryRevision: 3 })
+    mockRepositoryOwnerId = 'owner-a'
+    render(<ProductRouteBoundary><Text>Hydrated product</Text></ProductRouteBoundary>)
+    expect(screen.getByText('Hydrated product')).toBeTruthy()
+  },
+)
+
+it.each([
+  ['login', ['(auth)', 'login']],
+  ['signup', ['(auth)', 'signup']],
+  ['reset password', ['(auth)', 'reset-password']],
+  ['verify email', ['(auth)', 'verify-email']],
+  ['privacy', ['privacy']],
+] as const)('renders the intended public %s route', (_label, segments) => {
+  mockSegments = [...segments]
+  render(<ProductRouteBoundary><Text>Public route</Text></ProductRouteBoundary>)
+  expect(screen.getByText('Public route')).toBeTruthy()
+})
+
+it('requires identity before rendering secure onboarding', async () => {
+  mockSegments = ['(auth)', 'onboarding']
+  render(<ProductRouteBoundary><Text>Secure onboarding</Text></ProductRouteBoundary>)
+  expect(screen.queryByText('Secure onboarding')).toBeNull()
+  await waitFor(() => expect(mockRouterReplace).toHaveBeenCalledWith('/(auth)/login'))
+
 })
 
 it('keeps the application tree hidden while first cloud hydration is incomplete', () => {

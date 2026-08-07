@@ -2,9 +2,9 @@ import { useEffect, useMemo, useState } from 'react'
 import { router, useLocalSearchParams } from 'expo-router'
 import { Pressable, StyleSheet, Text, TextInput } from 'react-native'
 
-import { useAuthenticatedOwnerLease } from '../../src/auth/AuthProvider'
+import { useAuthActions, useAuthenticatedOwnerLease } from '../../src/auth/AuthProvider'
 import { createMfaService, type MfaService } from '../../src/auth/mfaService'
-import { getRecentAal2Guard, type SensitiveOperation } from '../../src/auth/requireAal2'
+import type { SensitiveOperation } from '../../src/auth/requireAal2'
 import { Screen } from '../../src/components/Screen'
 import { colors, MIN_TOUCH_TARGET, spacing } from '../../src/theme/tokens'
 
@@ -14,6 +14,7 @@ const SENSITIVE_OPERATIONS: readonly SensitiveOperation[] = [
 
 export default function StepUpScreen({ service: suppliedService }: { service?: MfaService }) {
   const lease = useAuthenticatedOwnerLease()
+  const { verifyMfaChallenge } = useAuthActions()
   const params = useLocalSearchParams<{ operation?: string }>()
   const operation = SENSITIVE_OPERATIONS.includes(params.operation as SensitiveOperation)
     ? params.operation as SensitiveOperation
@@ -35,8 +36,7 @@ export default function StepUpScreen({ service: suppliedService }: { service?: M
       return
     }
     try {
-      await service.stepUp(factorId, code)
-      getRecentAal2Guard().markVerified({ ...lease, verifiedAt: Date.now() })
+      await verifyMfaChallenge(() => service.stepUp(factorId, code))
       setCode('')
       router.back()
     } catch {

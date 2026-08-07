@@ -34,6 +34,8 @@ const bundleConflictMutationId = '78000000-0000-0000-0000-000000000072'
 const bundleClientId = '79000000-0000-0000-0000-000000000071'
 const bundleJobId = '79000000-0000-0000-0000-000000000072'
 const bundleInvoiceId = '79000000-0000-0000-0000-000000000073'
+const secondOwnerId = '70000000-0000-0000-0000-000000000072'
+const roleOnboardingMutationId = '7a000000-0000-4000-8000-000000000072'
 
 const db = new PGlite()
 const failures = []
@@ -61,11 +63,21 @@ const expectSqlState = async (operation, expectedCode) => {
   throw new Error(`expected SQLSTATE ${expectedCode}`)
 }
 
+const withRole = async (role, operation) => {
+  await db.exec(`set role ${role}`)
+  try {
+    return await operation()
+  } finally {
+    await db.exec('reset role')
+  }
+}
+
 try {
   await db.exec(`
     create role anon;
     create role authenticated;
     create role service_role;
+    create role public_client;
     create schema auth;
     create table auth.users (id uuid primary key, email text);
     create or replace function auth.uid() returns uuid
@@ -79,6 +91,8 @@ try {
         '{}'::jsonb
       )
     $$;
+    grant usage on schema auth to anon, authenticated, service_role;
+    grant execute on function auth.uid(), auth.jwt() to anon, authenticated, service_role;
   `)
 
   await db.exec(await readMigration('202608030001_fieldcraft_core.sql'))
@@ -89,7 +103,12 @@ try {
   // must make the invoice row self-contained rather than relying on page order.
   await db.exec(`
     insert into auth.users (id, email)
-    values ('${ownerId}', 'migration-order@example.test');
+    values
+      ('${ownerId}', 'migration-order@example.test'),
+      ('${secondOwnerId}', 'second-owner@example.test');
+
+    insert into public.profiles (id, display_name, business_name)
+    values ('${secondOwnerId}', 'Second Owner', 'Separate Business');
 
     insert into public.clients (
       id, user_id, name, version, created_at, updated_at
@@ -971,6 +990,179 @@ try {
     ) {
       throw new Error(`onboarding pull was ${JSON.stringify(profileChange ?? null)}`)
     }
+  })
+
+  await verify('onboarding execution grants deny public-only and anon roles', async () => {
+    const dummyPayload = JSON.stringify({ id: ownerId, ownerId })
+    await withRole('public_client', () => expectSqlState(
+      () => db.query(
+        'select public.save_fieldcraft_onboarding($1, $2::jsonb)',
+        [roleOnboardingMutationId, dummyPayload],
+      ),
+      '42501',
+    ))
+    await withRole('anon', () => expectSqlState(
+      () => db.query(
+        'select public.save_fieldcraft_onboarding($1, $2::jsonb)',
+        [roleOnboardingMutationId, dummyPayload],
+      ),
+      '42501',
+    ))
+  })
+
+  await verify('onboarding security definer uses only the trusted pg_catalog search path', async () => {
+    const result = await db.query(`
+      select procedure.prosecdef, procedure.proconfig
+      from pg_catalog.pg_proc as procedure
+      join pg_catalog.pg_namespace as namespace on namespace.oid = procedure.pronamespace
+      where namespace.nspname = 'public'
+        and procedure.proname = 'save_fieldcraft_onboarding'
+    `)
+    const row = result.rows[0]
+    if (
+      row?.prosecdef !== true ||
+      !Array.isArray(row.proconfig) ||
+      row.proconfig.length !== 1 ||
+      row.proconfig[0] !== 'search_path=pg_catalog'
+    ) {
+      throw new Error(`onboarding function configuration was ${JSON.stringify(row ?? null)}`)
+    }
+  })
+
+  await verify('authenticated onboarding rejects missing identity, cross-owner, and malformed payloads', async () => {
+    const completedAt = '2026-08-07T18:00:00.000Z'
+    const validPayload = {
+      id: ownerId,
+      ownerId,
+      displayName: 'Avi Builder',
+      businessName: 'FieldCraft Plumbing',
+      tradeType: 'Plumbing',
+      hourlyRateCents: 12550,
+      taxBasisPoints: 875,
+      paymentTerms: 'Net 30',
+      countryCode: 'US',
+      currency: 'USD',
+      timeZone: 'America/Los_Angeles',
+      onboardingVersion: 1,
+      onboardingCompletedAt: completedAt,
+      version: 0,
+      createdAt: completedAt,
+      updatedAt: completedAt,
+      syncState: 'pending',
+    }
+
+    await db.exec(`select set_config('request.jwt.claim.sub', '', false)`)
+    await withRole('authenticated', () => expectSqlState(
+      () => db.query(
+        'select public.save_fieldcraft_onboarding($1, $2::jsonb)',
+        [roleOnboardingMutationId, JSON.stringify(validPayload)],
+      ),
+      '42501',
+    ))
+
+    await db.exec(`select set_config('request.jwt.claim.sub', '${ownerId}', false)`)
+    await withRole('authenticated', () => expectSqlState(
+      () => db.query(
+        'select public.save_fieldcraft_onboarding($1, $2::jsonb)',
+        [roleOnboardingMutationId, JSON.stringify({ ...validPayload, ownerId: secondOwnerId })],
+      ),
+      '42501',
+    ))
+
+    const maliciousPayloads = [
+      { ...validPayload, displayName: ' Avi Builder' },
+      { ...validPayload, displayName: ' ' },
+      { ...validPayload, businessName: 'FieldCraft Plumbing ' },
+      { ...validPayload, tradeType: 'Software' },
+      { ...validPayload, hourlyRateCents: 0 },
+      { ...validPayload, hourlyRateCents: 100000001 },
+      { ...validPayload, taxBasisPoints: 10001 },
+      { ...validPayload, taxBasisPoints: 1.5 },
+      { ...validPayload, paymentTerms: 'Net 60' },
+      { ...validPayload, countryCode: 'CA' },
+      { ...validPayload, currency: 'CAD' },
+      { ...validPayload, timeZone: ' America/Los_Angeles' },
+      { ...validPayload, timeZone: 'A'.repeat(101) },
+      { ...validPayload, onboardingCompletedAt: '2026-08-07T11:00:00-07:00' },
+      { ...validPayload, onboardingCompletedAt: '2026-08-07T18:00:00Z' },
+      { ...validPayload, onboardingCompletedAt: '2026-02-31T18:00:00.000Z' },
+      { ...validPayload, createdAt: '2026-08-07T18:00:00.001Z' },
+      { ...validPayload, updatedAt: '2026-08-07T18:00:00.001Z' },
+      { ...validPayload, version: 1 },
+      { ...validPayload, syncState: 'current' },
+      { ...validPayload, administrator: true },
+    ]
+    for (const [index, payload] of maliciousPayloads.entries()) {
+      const mutationId = `7b000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`
+      await withRole('authenticated', () => expectSqlState(
+        () => db.query(
+          'select public.save_fieldcraft_onboarding($1, $2::jsonb)',
+          [mutationId, JSON.stringify(payload)],
+        ),
+        '22023',
+      ))
+    }
+  })
+
+  await verify('authenticated onboarding applies and replays under owner RLS', async () => {
+    const completedAt = '2026-08-07T18:00:00.000Z'
+    const payload = {
+      id: ownerId,
+      ownerId,
+      displayName: 'Role Tested Owner',
+      businessName: 'Role Tested Business',
+      tradeType: 'General',
+      hourlyRateCents: 15000,
+      taxBasisPoints: 900,
+      paymentTerms: 'Due on receipt',
+      countryCode: 'US',
+      currency: 'USD',
+      timeZone: 'America/Los_Angeles',
+      onboardingVersion: 1,
+      onboardingCompletedAt: completedAt,
+      version: 0,
+      createdAt: completedAt,
+      updatedAt: completedAt,
+      syncState: 'pending',
+    }
+    await db.exec(`select set_config('request.jwt.claim.sub', '${ownerId}', false)`)
+    await withRole('authenticated', async () => {
+      const first = await db.query(
+        'select public.save_fieldcraft_onboarding($1, $2::jsonb) as response',
+        [roleOnboardingMutationId, JSON.stringify(payload)],
+      )
+      const replay = await db.query(
+        'select public.save_fieldcraft_onboarding($1, $2::jsonb) as response',
+        [roleOnboardingMutationId, JSON.stringify({ ...payload, displayName: 'Replay differs' })],
+      )
+      if (JSON.stringify(first.rows[0].response) !== JSON.stringify(replay.rows[0].response)) {
+        throw new Error('authenticated onboarding replay changed its immutable receipt')
+      }
+    })
+  })
+
+  await verify('authenticated direct DML is isolated to owner reads and cannot bypass RPC writes', async () => {
+    await db.exec(`select set_config('request.jwt.claim.sub', '${ownerId}', false)`)
+    await withRole('authenticated', async () => {
+      const visible = await db.query(
+        'select id from public.profiles where id in ($1, $2) order by id',
+        [ownerId, secondOwnerId],
+      )
+      if (visible.rows.length !== 1 || visible.rows[0].id !== ownerId) {
+        throw new Error(`RLS exposed profiles ${JSON.stringify(visible.rows)}`)
+      }
+      await expectSqlState(
+        () => db.query(
+          `insert into public.clients (id, user_id, name) values ($1, $2, 'Bypass')`,
+          ['7c000000-0000-4000-8000-000000000001', ownerId],
+        ),
+        '42501',
+      )
+      await expectSqlState(
+        () => db.query(`update public.profiles set display_name = 'Bypass' where id = $1`, [ownerId]),
+        '42501',
+      )
+    })
   })
 
   await verify('deleting the auth owner cascades canonical and synchronization state', async () => {

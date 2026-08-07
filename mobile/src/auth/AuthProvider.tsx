@@ -71,6 +71,20 @@ type OwnerClear = {
   status: 'pending' | 'failed'
   promise: Promise<void>
 }
+type SessionRevocationOptions = {
+  clearOwner: boolean
+  nextState?: AuthState
+}
+type PendingMfaVerification = {
+  ownerId: string
+  startingSessionGeneration: number
+  verifiedAt: number
+  challengeSucceeded: boolean
+  eventLease: AuthenticatedOwnerLease | null
+  timeout: ReturnType<typeof setTimeout>
+  resolve(): void
+  reject(error: unknown): void
+}
 type RefreshLifecycleHandlers = {
   onBlocked(): void
   onFailure(): void
@@ -88,6 +102,7 @@ const repositoryRevisionCounters = new WeakMap<object, number>()
 const REFRESH_RETRY_BASE_DELAY_MS = 25
 const REFRESH_RETRY_MAX_DELAY_MS = 1_000
 const MAX_UNMOUNT_REFRESH_FAILURES = 3
+const MFA_EVENT_TIMEOUT_MS = 15_000
 
 class RefreshLifecycleController {
   private desiredRefresh = false
@@ -236,6 +251,7 @@ const AuthContext = createContext<AuthState | null>(null)
 const AuthenticatedOwnerLeaseContext = createContext<AuthenticatedOwnerLease | null>(null)
 const AuthActionsContext = createContext<{
   signOut(scope?: 'local' | 'global'): Promise<void>
+  verifyMfaChallenge(challenge: () => Promise<void>, verifiedAt?: number): Promise<void>
 } | null>(null)
 
 const STORAGE_MESSAGE = 'Secure authentication storage is unavailable.'
@@ -263,17 +279,32 @@ export const AuthProvider = ({
   const service = useMemo(() => suppliedService ?? getAuthService(), [suppliedService])
   const lifecycleBlocks = useRef(new Set<LifecycleBlock>())
   const restoreSession = useRef<() => void>(() => {})
-  const invalidateSession = useRef<() => void>(() => dataLifecycle.deactivateOwner())
+  const revokeSession = useRef<(options: SessionRevocationOptions) => Promise<void>>(
+    async ({ nextState }) => {
+      dataLifecycle.deactivateOwner()
+      if (nextState) setState(nextState)
+    },
+  )
+  const verifyMfaChallenge = useRef<(
+    challenge: () => Promise<void>,
+    verifiedAt?: number,
+  ) => Promise<void>>(async () => {
+    throw new Error('A current authenticated owner lease is required.')
+  })
   const actions = useMemo(() => ({
     async signOut(scope: 'local' | 'global' = 'local') {
-      ownerLeaseRef.current = null
-      aal2Guard.clear()
-      aal2Guard.updateLease(null)
-      setOwnerLease(null)
-      invalidateSession.current()
-      await service.signOut(scope)
+      const clearing = revokeSession.current({
+        clearOwner: true,
+        nextState: { status: 'signedOut' },
+      })
+      const providerSignOut = service.signOut(scope)
+      const [clearResult, providerResult] = await Promise.allSettled([clearing, providerSignOut])
+      if (clearResult.status === 'rejected') throw clearResult.reason
+      if (providerResult.status === 'rejected') throw providerResult.reason
     },
-  }), [aal2Guard, service])
+    verifyMfaChallenge: (challenge: () => Promise<void>, verifiedAt?: number) =>
+      verifyMfaChallenge.current(challenge, verifiedAt),
+  }), [service])
 
   useEffect(() => {
     let disposed = false
@@ -281,6 +312,7 @@ export const AuthProvider = ({
     let targetOwnerId: string | null = null
     let activeOwnerId = dataLifecycle.ownerBoundary?.getSnapshot().ownerId ?? null
     let callbackVersion = 0
+    let pendingMfaVerification: PendingMfaVerification | null = null
     let sessionGeneration = sessionGenerationCounters.get(service) ?? 0
     let repositoryRevision = repositoryRevisionCounters.get(dataLifecycle) ?? 0
     const ownerClears = getOwnerClearRegistry(dataLifecycle)
@@ -292,16 +324,56 @@ export const AuthProvider = ({
       repositoryRevision += 1
       repositoryRevisionCounters.set(dataLifecycle, repositoryRevision)
     }
+    const synchronizeRepositoryRevision = () => {
+      repositoryRevision = Math.max(
+        repositoryRevision,
+        repositoryRevisionCounters.get(dataLifecycle) ?? 0,
+      )
+    }
 
-    const publishLease = (ownerId: string) => {
-      if (disposed) return
+    const cancelMfaVerification = (error = new Error('MFA verification was interrupted.')) => {
+      const pending = pendingMfaVerification
+      if (!pending) return
+      pendingMfaVerification = null
+      clearTimeout(pending.timeout)
+      pending.reject(error)
+    }
+
+    const completeMfaVerification = () => {
+      const pending = pendingMfaVerification
+      if (!pending || !pending.challengeSucceeded || !pending.eventLease) return
+      pendingMfaVerification = null
+      clearTimeout(pending.timeout)
+      try {
+        aal2Guard.markVerified({ ...pending.eventLease, verifiedAt: pending.verifiedAt })
+        pending.resolve()
+      } catch (error) {
+        pending.reject(error)
+      }
+    }
+
+    const recordMfaEventLease = (lease: AuthenticatedOwnerLease) => {
+      const pending = pendingMfaVerification
+      if (
+        !pending ||
+        lease.ownerId !== pending.ownerId ||
+        lease.sessionGeneration <= pending.startingSessionGeneration
+      ) return
+      pending.eventLease = lease
+      completeMfaVerification()
+    }
+
+    const publishLease = (ownerId: string): AuthenticatedOwnerLease | null => {
+      if (disposed) return null
       const next = Object.freeze({ ownerId, sessionGeneration, repositoryRevision })
       ownerLeaseRef.current = next
       aal2Guard.updateLease(next)
       setOwnerLease(next)
+      return next
     }
 
     const invalidateLease = () => {
+      cancelMfaVerification()
       aal2Guard.clear()
       aal2Guard.updateLease(null)
       ownerLeaseRef.current = null
@@ -311,14 +383,6 @@ export const AuthProvider = ({
     dataLifecycle.deactivateOwner()
     advanceRepositoryRevision()
     invalidateLease()
-    invalidateSession.current = () => {
-      generation += 1
-      targetOwnerId = null
-      activeOwnerId = null
-      advanceRepositoryRevision()
-      invalidateLease()
-      dataLifecycle.deactivateOwner()
-    }
 
     const showStorageError = (message: string) => {
       if (!disposed) setState({ status: 'storageError', message })
@@ -344,6 +408,80 @@ export const AuthProvider = ({
       return clearing
     }
 
+    const capturePriorOwner = (): string | null =>
+      ownerLeaseRef.current?.ownerId ??
+      targetOwnerId ??
+      activeOwnerId ??
+      dataLifecycle.ownerBoundary?.getSnapshot().ownerId ??
+      null
+
+    const revokeOwnerSession = ({
+      clearOwner,
+      nextState,
+    }: SessionRevocationOptions): Promise<void> => {
+      const priorOwnerId = capturePriorOwner()
+      const clearing = clearOwner && priorOwnerId
+        ? startOwnerClear(priorOwnerId, true)
+        : Promise.resolve()
+      generation += 1
+      targetOwnerId = null
+      activeOwnerId = null
+      advanceRepositoryRevision()
+      invalidateLease()
+      dataLifecycle.deactivateOwner()
+      if (!disposed && nextState) setState(nextState)
+      return clearing.catch(() => {
+        showStorageError(LOCAL_DATA_MESSAGE)
+        throw new Error(LOCAL_DATA_MESSAGE)
+      })
+    }
+    revokeSession.current = revokeOwnerSession
+
+    verifyMfaChallenge.current = (challenge, verifiedAt = Date.now()) => {
+      const startingLease = ownerLeaseRef.current
+      if (
+        !startingLease ||
+        !Number.isFinite(verifiedAt) ||
+        verifiedAt < 0 ||
+        pendingMfaVerification
+      ) {
+        return Promise.reject(new Error('A current authenticated owner lease is required.'))
+      }
+
+      return new Promise<void>((resolve, reject) => {
+        let pending!: PendingMfaVerification
+        const timeout = setTimeout(() => {
+          if (pendingMfaVerification !== pending) return
+          pendingMfaVerification = null
+          reject(new Error('Authenticator verification could not be confirmed securely.'))
+        }, MFA_EVENT_TIMEOUT_MS)
+        pending = {
+          ownerId: startingLease.ownerId,
+          startingSessionGeneration: startingLease.sessionGeneration,
+          verifiedAt,
+          challengeSucceeded: false,
+          eventLease: null,
+          timeout,
+          resolve,
+          reject,
+        }
+        pendingMfaVerification = pending
+        void Promise.resolve()
+          .then(challenge)
+          .then(() => {
+            if (pendingMfaVerification !== pending) return
+            pending.challengeSucceeded = true
+            completeMfaVerification()
+          })
+          .catch((error: unknown) => {
+            if (pendingMfaVerification !== pending) return
+            pendingMfaVerification = null
+            clearTimeout(pending.timeout)
+            reject(error)
+          })
+      })
+    }
+
     const failOwnerLifecycle = (currentGeneration: number) => {
       if (currentGeneration !== generation) return
       targetOwnerId = null
@@ -357,6 +495,7 @@ export const AuthProvider = ({
     const clearPreviousOwner = async (ownerId: string, currentGeneration: number) => {
       try {
         await startOwnerClear(ownerId, true)
+        synchronizeRepositoryRevision()
       } catch {
         failOwnerLifecycle(currentGeneration)
         throw new Error(LOCAL_DATA_MESSAGE)
@@ -367,6 +506,7 @@ export const AuthProvider = ({
       for (const [ownerId, record] of [...ownerClears.entries()]) {
         try {
           await startOwnerClear(ownerId, record.status === 'failed')
+          synchronizeRepositoryRevision()
         } catch {
           failOwnerLifecycle(currentGeneration)
           return false
@@ -387,11 +527,10 @@ export const AuthProvider = ({
         invalidateLease()
       }
       if (event === 'INVALID_SESSION') {
-        targetOwnerId = null
-        activeOwnerId = null
-        advanceRepositoryRevision()
-        dataLifecycle.deactivateOwner()
-        showStorageError(STORAGE_MESSAGE)
+        void revokeOwnerSession({
+          clearOwner: true,
+          nextState: { status: 'storageError', message: STORAGE_MESSAGE },
+        }).catch(() => {})
         return
       }
       if (lifecycleBlocks.current.size > 0) {
@@ -430,7 +569,10 @@ export const AuthProvider = ({
       }
 
       if (targetOwnerId === user.id && ownerClears.size === 0) {
-        if (activeOwnerId === user.id) publishLease(user.id)
+        if (activeOwnerId === user.id) {
+          const nextLease = publishLease(user.id)
+          if (event === 'MFA_CHALLENGE_VERIFIED' && nextLease) recordMfaEventLease(nextLease)
+        }
         return
       }
       const previousOwnerId = targetOwnerId ?? activeOwnerId
@@ -502,7 +644,8 @@ export const AuthProvider = ({
           return
         }
       }
-      publishLease(user.id)
+      const nextLease = publishLease(user.id)
+      if (event === 'MFA_CHALLENGE_VERIFIED' && nextLease) recordMfaEventLease(nextLease)
       setState({ status: 'signedIn', userId: user.id, email: user.email, hydrated: true })
     }
 
@@ -515,8 +658,10 @@ export const AuthProvider = ({
       lifecycleBlocks.current.delete('subscription')
     } catch {
       lifecycleBlocks.current.add('subscription')
-      dataLifecycle.deactivateOwner()
-      showStorageError(STORAGE_MESSAGE)
+      void revokeOwnerSession({
+        clearOwner: true,
+        nextState: { status: 'storageError', message: STORAGE_MESSAGE },
+      }).catch(() => {})
       restoreSession.current = () => {}
       return () => {
         disposed = true
@@ -540,13 +685,10 @@ export const AuthProvider = ({
         })
         .catch(() => {
           if (!disposed && callbackVersion === versionBeforeSession) {
-            generation += 1
-            targetOwnerId = null
-            activeOwnerId = null
-            advanceRepositoryRevision()
-            invalidateLease()
-            dataLifecycle.deactivateOwner()
-            showStorageError(STORAGE_MESSAGE)
+            void revokeOwnerSession({
+              clearOwner: true,
+              nextState: { status: 'storageError', message: STORAGE_MESSAGE },
+            }).catch(() => {})
           }
         })
     }
@@ -554,13 +696,20 @@ export const AuthProvider = ({
     restore()
 
     return () => {
+      cancelMfaVerification()
       disposed = true
       generation += 1
       aal2Guard.clear()
       aal2Guard.updateLease(null)
       ownerLeaseRef.current = null
       restoreSession.current = () => {}
-      invalidateSession.current = () => dataLifecycle.deactivateOwner()
+      revokeSession.current = async ({ nextState }) => {
+        dataLifecycle.deactivateOwner()
+        if (nextState) setState(nextState)
+      }
+      verifyMfaChallenge.current = async () => {
+        throw new Error('A current authenticated owner lease is required.')
+      }
       unsubscribe()
       dataLifecycle.deactivateOwner()
     }
@@ -572,10 +721,7 @@ export const AuthProvider = ({
     const validateBoundary = () => {
       const lease = ownerLeaseRef.current
       if (lease && boundary.getSnapshot().ownerId !== lease.ownerId) {
-        ownerLeaseRef.current = null
-        aal2Guard.clear()
-        aal2Guard.updateLease(null)
-        setOwnerLease(null)
+        void revokeSession.current({ clearOwner: false })
       }
     }
     validateBoundary()
@@ -588,7 +734,7 @@ export const AuthProvider = ({
     const blockRefreshLifecycle = () => {
       lifecycleBlocks.current.add('refresh')
       aal2Guard.clear()
-      invalidateSession.current()
+      void revokeSession.current({ clearOwner: false })
     }
 
     const failRefreshLifecycle = () => {

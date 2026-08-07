@@ -1,4 +1,5 @@
 import { getSupabaseClient } from '../auth/supabase'
+import { OnboardingProfileV1Schema } from '../domain/entities'
 import type { EntityName, MutationEnvelope } from '../domain/sync'
 import type { CloudRowEnvelope, InvoiceBundlePayload } from './repository'
 import { parsePostgresTimestamp } from './postgresTimestamp'
@@ -121,6 +122,19 @@ const requireTimestamp = (record: RawRecord, key: string): string => {
   return value
 }
 
+const requireCanonicalMillisecondTimestamp = (record: RawRecord, key: string): string => {
+  const value = requireString(record, key)
+  try {
+    const parsed = parsePostgresTimestamp(value)
+    if (parsed.microseconds % 1_000 !== 0) throw new Error('sub-millisecond timestamp')
+    return new Date(
+      parsed.wholeSecondMilliseconds + parsed.microseconds / 1_000,
+    ).toISOString()
+  } catch {
+    throw new RemoteGatewayError('invalid-response')
+  }
+}
+
 const decodeCursor = (cursor: string | null): CursorTuple | null => {
   if (cursor === null) return null
   try {
@@ -237,7 +251,7 @@ const normalizePayload = (
 ): Record<string, unknown> => {
   const common = canonicalCommon(entity, raw, ownerId)
   switch (entity) {
-    case 'profile':
+    case 'profile': {
       if (optionalInteger(raw, 'onboarding_version') !== 1) {
         return {
           ...common,
@@ -245,8 +259,7 @@ const normalizePayload = (
           ...(optionalString(raw, 'logo_path') ? { logoPath: optionalString(raw, 'logo_path') } : {}),
         }
       }
-      return {
-        ...common,
+      const onboarding = OnboardingProfileV1Schema.safeParse({
         displayName: requireString(raw, 'display_name'),
         businessName: requireString(raw, 'business_name'),
         tradeType: requireString(raw, 'trade_type'),
@@ -257,9 +270,15 @@ const normalizePayload = (
         currency: requireString(raw, 'currency'),
         timeZone: requireString(raw, 'time_zone'),
         onboardingVersion: 1,
-        onboardingCompletedAt: requireTimestamp(raw, 'onboarding_completed_at'),
+        onboardingCompletedAt: requireCanonicalMillisecondTimestamp(raw, 'onboarding_completed_at'),
+      })
+      if (!onboarding.success) throw new RemoteGatewayError('invalid-response')
+      return {
+        ...common,
+        ...onboarding.data,
         ...(optionalString(raw, 'logo_path') ? { logoPath: optionalString(raw, 'logo_path') } : {}),
       }
+    }
     case 'client':
       return {
         ...common,

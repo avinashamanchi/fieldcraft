@@ -19,6 +19,7 @@ import {
   type AuthService,
   type AuthSession,
 } from '../src/auth/authService'
+import { createRecentAal2Guard, type RecentAal2Guard } from '../src/auth/requireAal2'
 import { SecureAuthStorageError } from '../src/auth/secureStoreAuthStorage'
 import {
   createConfiguredSupabaseClient,
@@ -232,9 +233,12 @@ class FakeLinking implements LinkingLifecycle {
 const StateProbe = () => <Text testID="auth-state">{JSON.stringify(useAuth())}</Text>
 let observedLease: AuthenticatedOwnerLease | null = null
 let observedSignOut: ((scope?: 'local' | 'global') => Promise<void>) | null = null
+let observedVerifyMfaChallenge: ((challenge: () => Promise<void>, verifiedAt?: number) => Promise<void>) | null = null
 const LeaseProbe = () => {
   observedLease = useAuthenticatedOwnerLease()
-  observedSignOut = useAuthActions().signOut
+  const actions = useAuthActions()
+  observedSignOut = actions.signOut
+  observedVerifyMfaChallenge = actions.verifyMfaChallenge
   return <Text testID="owner-lease">{JSON.stringify(observedLease)}</Text>
 }
 
@@ -256,6 +260,15 @@ const renderProvider = (
 }
 
 const readState = () => JSON.parse(screen.getByTestId('auth-state').props.children as string)
+const deferred = <T = void>() => {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
+}
 
 it('keeps first-login cached app data unhydrated until a full cloud pull, then permits offline revisit', async () => {
   const service = new FakeAuthService()
@@ -428,6 +441,257 @@ it('invalidates repository access before a local or global provider sign-out can
   expect(service.signOut).toHaveBeenCalledWith('global')
   finishSignOut()
   await signingOut
+  view.unmount()
+})
+
+it.each(['local', 'global'] as const)(
+  'captures and clears the immutable prior owner during %s sign-out before admitting another owner',
+  async (scope) => {
+    const clearGate = deferred()
+    const service = new FakeAuthService()
+    service.session = verifiedSession(CANONICAL_OWNER)
+    const dataLifecycle = new FakeDataLifecycle()
+    const view = render(
+      <AuthProvider appState={new FakeAppState()} dataLifecycle={dataLifecycle} service={service}>
+        <LeaseProbe />
+      </AuthProvider>,
+    )
+    await waitFor(() => expect(observedLease?.ownerId).toBe(CANONICAL_OWNER))
+    dataLifecycle.clearers.set(CANONICAL_OWNER, clearGate.promise)
+
+    let signingOut!: Promise<void>
+    act(() => { signingOut = observedSignOut!(scope) })
+    expect(observedLease).toBeNull()
+    await waitFor(() => expect(dataLifecycle.calls).toContain(`clear:${CANONICAL_OWNER}`))
+
+    act(() => service.emit(verifiedSession(SECOND_CANONICAL_OWNER), 'SIGNED_IN'))
+    expect(dataLifecycle.calls).not.toContain(`initialize:${SECOND_CANONICAL_OWNER}`)
+
+    await act(async () => {
+      clearGate.resolve(undefined)
+      await Promise.resolve()
+    })
+    await expect(signingOut).resolves.toBeUndefined()
+    await waitFor(() => expect(dataLifecycle.calls).toContain(`initialize:${SECOND_CANONICAL_OWNER}`))
+    view.unmount()
+  },
+)
+
+it('finishes secure owner teardown and leaves a non-product state when provider sign-out fails', async () => {
+  const service = new FakeAuthService()
+  service.session = verifiedSession(CANONICAL_OWNER)
+  service.signOut = jest.fn(async () => { throw new Error('provider sign-out secret') })
+  const dataLifecycle = new FakeDataLifecycle()
+  const view = render(
+    <AuthProvider appState={new FakeAppState()} dataLifecycle={dataLifecycle} service={service}>
+      <StateProbe />
+      <LeaseProbe />
+    </AuthProvider>,
+  )
+  await waitFor(() => expect(observedLease?.ownerId).toBe(CANONICAL_OWNER))
+
+  await act(async () => {
+    await expect(observedSignOut!('global')).rejects.toThrow('provider sign-out secret')
+  })
+
+  expect(observedLease).toBeNull()
+  expect(dataLifecycle.retainedOwners).not.toContain(CANONICAL_OWNER)
+  expect(readState().status).not.toBe('signedIn')
+  expect(screen.getByTestId('auth-state').props.children).not.toContain('provider sign-out secret')
+  view.unmount()
+})
+
+it('clears retained SQLite ownership on invalid-session callbacks and getSession failures', async () => {
+  const invalidService = new FakeAuthService()
+  invalidService.session = verifiedSession(CANONICAL_OWNER)
+  const invalidData = new FakeDataLifecycle()
+  const invalidView = render(
+    <AuthProvider appState={new FakeAppState()} dataLifecycle={invalidData} service={invalidService}>
+      <StateProbe />
+      <LeaseProbe />
+    </AuthProvider>,
+  )
+  await waitFor(() => expect(observedLease?.ownerId).toBe(CANONICAL_OWNER))
+  act(() => invalidService.emit(null, 'INVALID_SESSION'))
+  await waitFor(() => expect(invalidData.calls).toContain(`clear:${CANONICAL_OWNER}`))
+  expect(invalidData.retainedOwners).not.toContain(CANONICAL_OWNER)
+  expect(readState()).toMatchObject({ status: 'storageError' })
+  invalidView.unmount()
+
+  const restoreService = new FakeAuthService()
+  restoreService.sessionError = new Error('getSession provider secret')
+  const restoreData = new ObservableDataLifecycle()
+  await restoreData.initialize(CANONICAL_OWNER)
+  const restoreView = renderProvider(restoreService, restoreData)
+  await waitFor(() => expect(restoreData.calls).toContain(`clear:${CANONICAL_OWNER}`))
+  expect(restoreData.retainedOwners).not.toContain(CANONICAL_OWNER)
+  expect(readState()).toMatchObject({ status: 'storageError' })
+  expect(screen.getByTestId('auth-state').props.children).not.toContain('getSession provider secret')
+  restoreView.unmount()
+})
+
+it('retains failed owner clears across remount and drains them before hydrating the next owner', async () => {
+  const service = new FakeAuthService()
+  service.session = verifiedSession(CANONICAL_OWNER)
+  const dataLifecycle = new FakeDataLifecycle()
+  dataLifecycle.clearFailures.add(CANONICAL_OWNER)
+  const first = render(
+    <AuthProvider appState={new FakeAppState()} dataLifecycle={dataLifecycle} service={service}>
+      <StateProbe />
+      <LeaseProbe />
+    </AuthProvider>,
+  )
+  await waitFor(() => expect(observedLease?.ownerId).toBe(CANONICAL_OWNER))
+  act(() => service.emit(null, 'INVALID_SESSION'))
+  await waitFor(() => expect(readState()).toMatchObject({ status: 'storageError' }))
+  expect(dataLifecycle.calls).toContain(`clear:${CANONICAL_OWNER}`)
+  first.unmount()
+
+  dataLifecycle.clearFailures.delete(CANONICAL_OWNER)
+  service.session = verifiedSession(SECOND_CANONICAL_OWNER)
+  const clearGate = deferred()
+  dataLifecycle.clearers.set(CANONICAL_OWNER, clearGate.promise)
+  const callsBeforeRemount = dataLifecycle.calls.length
+  const second = render(
+    <AuthProvider appState={new FakeAppState()} dataLifecycle={dataLifecycle} service={service}>
+      <StateProbe />
+      <LeaseProbe />
+    </AuthProvider>,
+  )
+  await waitFor(() => expect(
+    dataLifecycle.calls.slice(callsBeforeRemount),
+  ).toContain(`clear:${CANONICAL_OWNER}`))
+  expect(dataLifecycle.calls.slice(callsBeforeRemount)).not.toContain(
+    `initialize:${SECOND_CANONICAL_OWNER}`,
+  )
+
+  await act(async () => {
+    clearGate.resolve(undefined)
+    await Promise.resolve()
+  })
+  await waitFor(() => expect(observedLease?.ownerId).toBe(SECOND_CANONICAL_OWNER))
+  second.unmount()
+})
+
+it('authorizes recent AAL2 only on the post-event lease and invalidates it on lifecycle changes', async () => {
+  const guard: RecentAal2Guard = createRecentAal2Guard()
+  const service = new FakeAuthService()
+  service.session = verifiedSession(CANONICAL_OWNER)
+  const dataLifecycle = new FakeDataLifecycle()
+  const appState = new FakeAppState()
+  const view = render(
+    <AuthProvider
+      aal2Guard={guard}
+      appState={appState}
+      dataLifecycle={dataLifecycle}
+      service={service}
+    >
+      <LeaseProbe />
+    </AuthProvider>,
+  )
+  await waitFor(() => expect(observedLease?.ownerId).toBe(CANONICAL_OWNER))
+  const preEventLease = observedLease!
+
+  await act(async () => {
+    await observedVerifyMfaChallenge!(async () => {
+      service.emit(verifiedSession(CANONICAL_OWNER), 'MFA_CHALLENGE_VERIFIED')
+    }, 1_000)
+  })
+  expect(observedLease!.sessionGeneration).toBeGreaterThan(preEventLease.sessionGeneration)
+  expect(guard.requireRecentAal2('payment-link', 1_000 + 15 * 60_000)).toEqual(observedLease)
+  const authorizedLease = observedLease!
+
+  act(() => service.emit(verifiedSession(CANONICAL_OWNER), 'TOKEN_REFRESHED'))
+  await waitFor(() => expect(observedLease?.sessionGeneration).toBeGreaterThan(
+    authorizedLease.sessionGeneration,
+  ))
+  expect(() => guard.requireRecentAal2('payment-link', 1_001)).toThrow(
+    expect.objectContaining({ code: 'STEP_UP_REQUIRED' }),
+  )
+
+  await act(async () => {
+    await observedVerifyMfaChallenge!(async () => {
+      service.emit(verifiedSession(CANONICAL_OWNER), 'MFA_CHALLENGE_VERIFIED')
+    }, 2_000)
+  })
+  expect(guard.requireRecentAal2('payment-link', 2_001)).toEqual(observedLease)
+  act(() => appState.emit('background'))
+  expect(() => guard.requireRecentAal2('payment-link', 2_002)).toThrow(
+    expect.objectContaining({ code: 'STEP_UP_REQUIRED' }),
+  )
+
+  act(() => appState.emit('active'))
+  await waitFor(() => expect(observedLease?.ownerId).toBe(CANONICAL_OWNER))
+  await act(async () => {
+    await observedVerifyMfaChallenge!(async () => {
+      service.emit(verifiedSession(CANONICAL_OWNER), 'MFA_CHALLENGE_VERIFIED')
+    }, 3_000)
+  })
+  act(() => service.emit(verifiedSession(SECOND_CANONICAL_OWNER), 'SIGNED_IN'))
+  expect(() => guard.requireRecentAal2('payment-link', 3_001)).toThrow(
+    expect.objectContaining({ code: 'STEP_UP_REQUIRED' }),
+  )
+  view.unmount()
+})
+
+it('keeps a successful MFA challenge pending until the provider publishes its rotated lease', async () => {
+  const guard = createRecentAal2Guard()
+  const service = new FakeAuthService()
+  service.session = verifiedSession(CANONICAL_OWNER)
+  const view = render(
+    <AuthProvider
+      aal2Guard={guard}
+      appState={new FakeAppState()}
+      dataLifecycle={new FakeDataLifecycle()}
+      service={service}
+    >
+      <LeaseProbe />
+    </AuthProvider>,
+  )
+  await waitFor(() => expect(observedLease?.ownerId).toBe(CANONICAL_OWNER))
+  const preEventLease = observedLease!
+  let settled = false
+  const verification = observedVerifyMfaChallenge!(async () => {}).then(() => { settled = true })
+  await act(async () => { await Promise.resolve() })
+
+  expect(settled).toBe(false)
+  expect(() => guard.requireRecentAal2('payment-link', 5_000)).toThrow(
+    expect.objectContaining({ code: 'STEP_UP_REQUIRED' }),
+  )
+
+  act(() => service.emit(verifiedSession(CANONICAL_OWNER), 'MFA_CHALLENGE_VERIFIED'))
+  await act(async () => verification)
+  expect(observedLease!.sessionGeneration).toBeGreaterThan(preEventLease.sessionGeneration)
+  expect(guard.requireRecentAal2('payment-link', Date.now())).toEqual(observedLease)
+  view.unmount()
+})
+
+it('invalidates an authorized AAL2 lease immediately on sign-out', async () => {
+  const guard = createRecentAal2Guard()
+  const service = new FakeAuthService()
+  service.session = verifiedSession(CANONICAL_OWNER)
+  const view = render(
+    <AuthProvider
+      aal2Guard={guard}
+      appState={new FakeAppState()}
+      dataLifecycle={new FakeDataLifecycle()}
+      service={service}
+    >
+      <LeaseProbe />
+    </AuthProvider>,
+  )
+  await waitFor(() => expect(observedLease?.ownerId).toBe(CANONICAL_OWNER))
+  await act(async () => {
+    await observedVerifyMfaChallenge!(async () => {
+      service.emit(verifiedSession(CANONICAL_OWNER), 'MFA_CHALLENGE_VERIFIED')
+    }, 4_000)
+  })
+  expect(guard.requireRecentAal2('delete-account', 4_001)).toEqual(observedLease)
+
+  await act(async () => observedSignOut!('local'))
+  expect(() => guard.requireRecentAal2('delete-account', 4_002)).toThrow(
+    expect.objectContaining({ code: 'STEP_UP_REQUIRED' }),
+  )
   view.unmount()
 })
 

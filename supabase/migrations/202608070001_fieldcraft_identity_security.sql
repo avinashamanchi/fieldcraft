@@ -15,6 +15,22 @@ alter table public.profiles
     or (onboarding_version = 1 and onboarding_completed_at is not null)
   );
 
+alter table public.profiles
+  add constraint profiles_onboarding_v1_contract_check check (
+    onboarding_version = 0
+    or (
+      char_length(display_name) between 1 and 100
+      and display_name = btrim(display_name)
+      and char_length(business_name) between 1 and 120
+      and business_name = btrim(business_name)
+      and hourly_rate_cents between 1 and 100000000
+      and tax_basis_points between 0 and 10000
+      and char_length(time_zone) between 1 and 100
+      and time_zone = btrim(time_zone)
+      and onboarding_complete = true
+    )
+  );
+
 create or replace function public.fieldcraft_require_aal2()
 returns void
 language plpgsql
@@ -38,7 +54,7 @@ create or replace function public.save_fieldcraft_onboarding(
 returns jsonb
 language plpgsql
 security definer
-set search_path = pg_catalog, public
+set search_path = pg_catalog
 as $$
 declare
   v_user_id uuid := auth.uid();
@@ -48,6 +64,7 @@ declare
   v_change_id bigint;
   v_change_updated_at timestamptz;
   v_previous_mutation_id text;
+  v_completed_at timestamptz;
 begin
   if v_user_id is null then
     raise exception 'authentication required' using errcode = '42501';
@@ -55,13 +72,39 @@ begin
   if p_mutation_id is null or p_payload is null or jsonb_typeof(p_payload) <> 'object' then
     raise exception 'mutation ID and onboarding payload are required' using errcode = '22023';
   end if;
-  if p_payload ->> 'id' <> v_user_id::text
+  if jsonb_typeof(p_payload -> 'id') <> 'string'
+    or jsonb_typeof(p_payload -> 'ownerId') <> 'string'
+    or p_payload ->> 'id' <> v_user_id::text
     or p_payload ->> 'ownerId' <> v_user_id::text
   then
     raise exception 'profile identity must match the authenticated user' using errcode = '42501';
   end if;
-  if char_length(coalesce(p_payload ->> 'displayName', '')) not between 1 and 100
+  if (select count(*) from jsonb_object_keys(p_payload)) <> 17
+    or exists (
+      select 1
+      from jsonb_object_keys(p_payload) as payload_key(name)
+      where payload_key.name not in (
+        'id', 'ownerId', 'version', 'createdAt', 'updatedAt', 'syncState',
+        'displayName', 'businessName', 'tradeType', 'hourlyRateCents',
+        'taxBasisPoints', 'paymentTerms', 'countryCode', 'currency', 'timeZone',
+        'onboardingVersion', 'onboardingCompletedAt'
+      )
+    )
+    or jsonb_typeof(p_payload -> 'displayName') <> 'string'
+    or jsonb_typeof(p_payload -> 'businessName') <> 'string'
+    or jsonb_typeof(p_payload -> 'tradeType') <> 'string'
+    or jsonb_typeof(p_payload -> 'paymentTerms') <> 'string'
+    or jsonb_typeof(p_payload -> 'countryCode') <> 'string'
+    or jsonb_typeof(p_payload -> 'currency') <> 'string'
+    or jsonb_typeof(p_payload -> 'timeZone') <> 'string'
+    or jsonb_typeof(p_payload -> 'onboardingCompletedAt') <> 'string'
+    or jsonb_typeof(p_payload -> 'createdAt') <> 'string'
+    or jsonb_typeof(p_payload -> 'updatedAt') <> 'string'
+    or jsonb_typeof(p_payload -> 'syncState') <> 'string'
+    or char_length(coalesce(p_payload ->> 'displayName', '')) not between 1 and 100
+    or p_payload ->> 'displayName' <> btrim(p_payload ->> 'displayName')
     or char_length(coalesce(p_payload ->> 'businessName', '')) not between 1 and 120
+    or p_payload ->> 'businessName' <> btrim(p_payload ->> 'businessName')
     or p_payload ->> 'tradeType' not in (
       'Plumbing', 'Electrical', 'HVAC', 'Carpentry', 'General', 'Roofing', 'Flooring', 'Painting'
     )
@@ -69,12 +112,31 @@ begin
     or p_payload ->> 'countryCode' <> 'US'
     or p_payload ->> 'currency' <> 'USD'
     or char_length(coalesce(p_payload ->> 'timeZone', '')) not between 1 and 100
+    or p_payload ->> 'timeZone' <> btrim(p_payload ->> 'timeZone')
     or public.require_jsonb_integer(p_payload -> 'hourlyRateCents', 'hourlyRateCents', 1, 100000000) < 1
     or public.require_jsonb_integer(p_payload -> 'taxBasisPoints', 'taxBasisPoints', 0, 10000) < 0
     or public.require_jsonb_integer(p_payload -> 'onboardingVersion', 'onboardingVersion', 1, 1) <> 1
+    or public.require_jsonb_integer(p_payload -> 'version', 'version', 0, 0) <> 0
+    or p_payload ->> 'syncState' <> 'pending'
     or nullif(p_payload ->> 'onboardingCompletedAt', '') is null
+    or p_payload ->> 'onboardingCompletedAt'
+      !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$'
+    or p_payload ->> 'createdAt' <> p_payload ->> 'onboardingCompletedAt'
+    or p_payload ->> 'updatedAt' <> p_payload ->> 'onboardingCompletedAt'
   then
     raise exception 'onboarding payload is invalid' using errcode = '22023';
+  end if;
+
+  begin
+    v_completed_at := (p_payload ->> 'onboardingCompletedAt')::timestamptz;
+  exception when others then
+    raise exception 'onboarding completion timestamp is invalid' using errcode = '22023';
+  end;
+  if to_char(
+    v_completed_at at time zone 'UTC',
+    'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+  ) <> p_payload ->> 'onboardingCompletedAt' then
+    raise exception 'onboarding completion timestamp is not canonical' using errcode = '22023';
   end if;
 
   perform public.fieldcraft_lock_sync_owner(v_user_id, p_mutation_id);
@@ -124,7 +186,7 @@ begin
       'USD',
       p_payload ->> 'timeZone',
       1,
-      (p_payload ->> 'onboardingCompletedAt')::timestamptz,
+      v_completed_at,
       true
     )
     on conflict (id) do update set

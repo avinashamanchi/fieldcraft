@@ -2,6 +2,7 @@ import type { SQLiteDatabase } from 'expo-sqlite'
 import { z } from 'zod'
 
 import type { ConflictRecord, EntityName, MutationEnvelope } from '../domain/sync'
+import { OnboardingProfileV1Schema } from '../domain/entities'
 import { calculateInvoice, InvoiceDraftSchema } from '../domain/invoice'
 import { MAX_MONEY_CENTS } from '../domain/limits'
 import { openFieldCraftDatabase } from './database'
@@ -36,11 +37,6 @@ const EntityNameSchema = z.enum([
 const MutationKindSchema = z.enum(['create', 'update', 'delete', 'save_invoice_bundle'])
 const SyncStateSchema = z.enum(['current', 'pending', 'syncing', 'failed', 'conflict'])
 const MoneySchema = z.number().finite().int().min(0).max(MAX_MONEY_CENTS)
-const TradeTypeSchema = z.enum([
-  'Plumbing', 'Electrical', 'HVAC', 'Carpentry', 'General', 'Roofing', 'Flooring', 'Painting',
-])
-const PaymentTermsSchema = z.enum(['Due on receipt', 'Net 14', 'Net 30'])
-
 const VersionedEntitySchema = z
   .object({
     id: z.string().min(1),
@@ -59,17 +55,7 @@ const entityPayloadSchemas: Record<EntityName, z.ZodType> = {
       logoPath: z.string().max(500).optional(),
     }),
     VersionedEntitySchema.extend({
-      displayName: z.string().min(1).max(100),
-      businessName: z.string().min(1).max(120),
-      tradeType: TradeTypeSchema,
-      hourlyRateCents: MoneySchema.min(1),
-      taxBasisPoints: z.number().finite().int().min(0).max(10_000),
-      paymentTerms: PaymentTermsSchema,
-      countryCode: z.literal('US'),
-      currency: z.literal('USD'),
-      timeZone: z.string().min(1).max(100),
-      onboardingVersion: z.literal(1),
-      onboardingCompletedAt: z.string().min(1),
+      ...OnboardingProfileV1Schema.shape,
       logoPath: z.string().max(500).optional(),
     }),
   ]),
@@ -336,7 +322,7 @@ const parseSyncCursorTuple = (cursor: string): ImmutablePosition => {
   }
 }
 
-const validateEntityPayload = (
+export const validateEntityPayload = (
   entity: EntityName,
   payload: unknown,
   ownerId: string,

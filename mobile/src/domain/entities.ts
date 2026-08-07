@@ -1,3 +1,6 @@
+import { z } from 'zod'
+
+import { MAX_MONEY_CENTS, MAX_TAX_BASIS_POINTS } from './limits'
 import type { MoneyCents } from './money'
 
 export type JobStatus = 'Scheduled' | 'In Progress' | 'Invoiced' | 'Paid'
@@ -105,19 +108,35 @@ export type InventoryItem = VersionedEntity & {
   lastUsedAt?: string
 }
 
-export type OnboardingProfileV1 = {
-  displayName: string
-  businessName: string
-  tradeType: TradeType
-  hourlyRateCents: MoneyCents
-  taxBasisPoints: number
-  paymentTerms: PaymentTerms
-  countryCode: 'US'
-  currency: 'USD'
-  timeZone: string
-  onboardingVersion: 1
-  onboardingCompletedAt: string
-}
+const strictTrimmedText = (maximum: number) => z.string()
+  .min(1)
+  .max(maximum)
+  .refine((value) => value === value.trim(), 'text must not contain surrounding whitespace')
+
+export const CanonicalMillisecondUtcTimestampSchema = z.string()
+  .regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/)
+  .refine((value) => {
+    const parsed = Date.parse(value)
+    return Number.isFinite(parsed) && new Date(parsed).toISOString() === value
+  }, 'timestamp must be canonical millisecond UTC ISO-8601')
+
+export const OnboardingProfileV1Schema = z.object({
+  displayName: strictTrimmedText(100),
+  businessName: strictTrimmedText(120),
+  tradeType: z.enum([
+    'Plumbing', 'Electrical', 'HVAC', 'Carpentry', 'General', 'Roofing', 'Flooring', 'Painting',
+  ]),
+  hourlyRateCents: z.number().finite().int().min(1).max(MAX_MONEY_CENTS),
+  taxBasisPoints: z.number().finite().int().min(0).max(MAX_TAX_BASIS_POINTS),
+  paymentTerms: z.enum(['Due on receipt', 'Net 14', 'Net 30']),
+  countryCode: z.literal('US'),
+  currency: z.literal('USD'),
+  timeZone: strictTrimmedText(100),
+  onboardingVersion: z.literal(1),
+  onboardingCompletedAt: CanonicalMillisecondUtcTimestampSchema,
+}).strict()
+
+export type OnboardingProfileV1 = z.infer<typeof OnboardingProfileV1Schema>
 
 export type UserProfile = VersionedEntity & OnboardingProfileV1 & {
   logoPath?: string

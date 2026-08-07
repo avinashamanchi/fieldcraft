@@ -2,7 +2,7 @@ import { type PropsWithChildren, useEffect, useState } from 'react'
 import { ActivityIndicator, StyleSheet, Text, View } from 'react-native'
 
 import type { AuthenticatedOwnerLease } from '../../auth/AuthProvider'
-import type { UserProfile } from '../../domain/entities'
+import { OnboardingProfileV1Schema, type UserProfile } from '../../domain/entities'
 import { colors } from '../../theme/tokens'
 
 type ProfileRepository = {
@@ -14,20 +14,35 @@ type GateState = 'checking' | 'complete' | 'redirecting' | 'error'
 const isCompleteProfile = (value: unknown, ownerId: string): value is UserProfile => {
   if (!value || typeof value !== 'object') return false
   const profile = value as Partial<UserProfile>
+  const allowedKeys = new Set([
+    'id', 'ownerId', 'version', 'createdAt', 'updatedAt', 'syncState', 'logoPath',
+    ...Object.keys(OnboardingProfileV1Schema.shape),
+  ])
+  const onboarding = OnboardingProfileV1Schema.safeParse({
+    displayName: profile.displayName,
+    businessName: profile.businessName,
+    tradeType: profile.tradeType,
+    hourlyRateCents: profile.hourlyRateCents,
+    taxBasisPoints: profile.taxBasisPoints,
+    paymentTerms: profile.paymentTerms,
+    countryCode: profile.countryCode,
+    currency: profile.currency,
+    timeZone: profile.timeZone,
+    onboardingVersion: profile.onboardingVersion,
+    onboardingCompletedAt: profile.onboardingCompletedAt,
+  })
   return (
     profile.id === ownerId &&
     profile.ownerId === ownerId &&
-    profile.onboardingVersion === 1 &&
-    typeof profile.onboardingCompletedAt === 'string' &&
-    Number.isFinite(Date.parse(profile.onboardingCompletedAt)) &&
-    typeof profile.displayName === 'string' && profile.displayName.length > 0 &&
-    typeof profile.businessName === 'string' && profile.businessName.length > 0 &&
-    typeof profile.tradeType === 'string' &&
-    Number.isSafeInteger(profile.hourlyRateCents) &&
-    Number.isSafeInteger(profile.taxBasisPoints) &&
-    profile.countryCode === 'US' &&
-    profile.currency === 'USD' &&
-    typeof profile.timeZone === 'string' && profile.timeZone.length > 0
+    Object.keys(profile).every((key) => allowedKeys.has(key)) &&
+    Number.isSafeInteger(profile.version) && Number(profile.version) >= 0 &&
+    typeof profile.createdAt === 'string' && Number.isFinite(Date.parse(profile.createdAt)) &&
+    typeof profile.updatedAt === 'string' && Number.isFinite(Date.parse(profile.updatedAt)) &&
+    ['current', 'pending', 'syncing', 'failed', 'conflict'].includes(String(profile.syncState)) &&
+    (profile.logoPath === undefined || (
+      typeof profile.logoPath === 'string' && profile.logoPath.length <= 500
+    )) &&
+    onboarding.success
   )
 }
 
