@@ -71,6 +71,14 @@ try {
     create or replace function auth.uid() returns uuid
     language sql stable
     as $$ select nullif(current_setting('request.jwt.claim.sub', true), '')::uuid $$;
+    create or replace function auth.jwt() returns jsonb
+    language sql stable
+    as $$
+      select coalesce(
+        nullif(current_setting('request.jwt.claims', true), '')::jsonb,
+        '{}'::jsonb
+      )
+    $$;
   `)
 
   await db.exec(await readMigration('202608030001_fieldcraft_core.sql'))
@@ -257,6 +265,7 @@ try {
 
   await db.exec(await readMigration('202608030003_fieldcraft_sync_changes.sql'))
   await db.exec(await readMigration('202608060004_fieldcraft_ai_rate_limits.sql'))
+  await db.exec(await readMigration('202608070001_fieldcraft_identity_security.sql'))
   await db.exec(
     `select set_config('request.jwt.claim.sub', '${ownerId}', false)`,
   )
@@ -879,6 +888,88 @@ try {
       )
     ) {
       throw new Error(`bundle conflict was ${JSON.stringify(conflictResponse)}`)
+    }
+  })
+
+  await verify('AAL2 enforcement rejects missing and aal1 claims and permits aal2', async () => {
+    await db.exec(`select set_config('request.jwt.claims', '', false)`)
+    await expectSqlState(
+      () => db.query('select public.fieldcraft_require_aal2()'),
+      '42501',
+    )
+    await db.exec(`select set_config('request.jwt.claims', '{"aal":"aal1"}', false)`)
+    await expectSqlState(
+      () => db.query('select public.fieldcraft_require_aal2()'),
+      '42501',
+    )
+    await db.exec(`select set_config('request.jwt.claims', '{"aal":"aal2"}', false)`)
+    await db.query('select public.fieldcraft_require_aal2()')
+  })
+
+  await verify('onboarding receipt replay and pull preserve the complete profile', async () => {
+    const mutationId = '7a000000-0000-4000-8000-000000000071'
+    const completedAt = '2026-08-07T18:00:00.000Z'
+    const payload = {
+      id: ownerId,
+      ownerId,
+      displayName: 'Avi Builder',
+      businessName: 'FieldCraft Plumbing',
+      tradeType: 'Plumbing',
+      hourlyRateCents: 12550,
+      taxBasisPoints: 875,
+      paymentTerms: 'Net 30',
+      countryCode: 'US',
+      currency: 'USD',
+      timeZone: 'America/Los_Angeles',
+      onboardingVersion: 1,
+      onboardingCompletedAt: completedAt,
+      version: 0,
+      createdAt: completedAt,
+      updatedAt: completedAt,
+      syncState: 'pending',
+    }
+    const first = await db.query(
+      'select public.save_fieldcraft_onboarding($1, $2::jsonb) as response',
+      [mutationId, JSON.stringify(payload)],
+    )
+    const replay = await db.query(
+      'select public.save_fieldcraft_onboarding($1, $2::jsonb) as response',
+      [mutationId, JSON.stringify({ ...payload, displayName: 'Different replay body' })],
+    )
+    const response = first.rows[0].response
+    if (
+      JSON.stringify(response) !== JSON.stringify(replay.rows[0].response) ||
+      response.status !== 'applied' ||
+      response.entity !== 'profile' ||
+      response.entity_id !== ownerId ||
+      response.cloud?.display_name !== payload.displayName ||
+      response.cloud?.business_name !== payload.businessName ||
+      response.cloud?.trade_type !== payload.tradeType ||
+      Number(response.cloud?.hourly_rate_cents) !== payload.hourlyRateCents ||
+      Number(response.cloud?.tax_basis_points) !== payload.taxBasisPoints ||
+      response.cloud?.payment_terms !== payload.paymentTerms ||
+      response.cloud?.country_code !== payload.countryCode ||
+      response.cloud?.currency !== payload.currency ||
+      response.cloud?.time_zone !== payload.timeZone ||
+      Number(response.cloud?.onboarding_version) !== 1 ||
+      new Date(response.cloud?.onboarding_completed_at).toISOString() !== completedAt ||
+      response.sync_position?.source !== 'sync_changes'
+    ) {
+      throw new Error(`onboarding response was ${JSON.stringify(response)}`)
+    }
+    const pulled = await db.query(
+      'select public.pull_sync_changes($1, 500) as response',
+      [Number(response.sync_position.change_seq) - 1],
+    )
+    const profileChange = pulled.rows[0].response.changes.find(
+      (change) => change.entity === 'profile' && change.entity_id === ownerId,
+    )
+    if (
+      profileChange?.payload?.display_name !== payload.displayName ||
+      profileChange?.payload?.time_zone !== payload.timeZone ||
+      Number(profileChange?.payload?.onboarding_version) !== 1
+    ) {
+      throw new Error(`onboarding pull was ${JSON.stringify(profileChange ?? null)}`)
     }
   })
 

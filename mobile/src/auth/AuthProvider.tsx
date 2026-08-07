@@ -12,7 +12,13 @@ import * as Linking from 'expo-linking'
 import { router } from 'expo-router'
 
 import { createAuthDeepLinkProcessor, type SafeAuthRoute } from './deepLinks'
-import { getAuthService, type AuthService, type AuthSession } from './authService'
+import {
+  getAuthService,
+  type AuthEvent,
+  type AuthService,
+  type AuthSession,
+} from './authService'
+import { getRecentAal2Guard, type RecentAal2Guard } from './requireAal2'
 
 export type AuthState =
   | { status: 'initializing' }
@@ -27,8 +33,17 @@ export type AuthDataLifecycle = {
   clearOwner(ownerId: string): Promise<void>
   hasCompletedInitialPull?(ownerId: string): Promise<boolean>
   waitForInitialPull?(ownerId: string): Promise<void>
-  ownerBoundary?: { getSnapshot(): { ownerId: string | null } }
+  ownerBoundary?: {
+    getSnapshot(): { ownerId: string | null }
+    subscribe?(listener: () => void): () => void
+  }
 }
+
+export type AuthenticatedOwnerLease = Readonly<{
+  ownerId: string
+  sessionGeneration: number
+  repositoryRevision: number
+}>
 
 type RemovableSubscription = { remove(): void }
 
@@ -48,6 +63,7 @@ type AuthProviderProps = PropsWithChildren<{
   appState?: AppStateLifecycle
   linking?: LinkingLifecycle
   replaceRoute?: (route: SafeAuthRoute) => void
+  aal2Guard?: RecentAal2Guard
 }>
 
 type LifecycleBlock = 'refresh' | 'subscription'
@@ -67,6 +83,8 @@ type RefreshLifecycleLease = {
 
 const ownerClearRegistries = new WeakMap<object, Map<string, OwnerClear>>()
 const refreshLifecycleControllers = new WeakMap<object, RefreshLifecycleController>()
+const sessionGenerationCounters = new WeakMap<object, number>()
+const repositoryRevisionCounters = new WeakMap<object, number>()
 const REFRESH_RETRY_BASE_DELAY_MS = 25
 const REFRESH_RETRY_MAX_DELAY_MS = 1_000
 const MAX_UNMOUNT_REFRESH_FAILURES = 3
@@ -215,11 +233,20 @@ const getRefreshLifecycleController = (service: AuthService): RefreshLifecycleCo
 }
 
 const AuthContext = createContext<AuthState | null>(null)
+const AuthenticatedOwnerLeaseContext = createContext<AuthenticatedOwnerLease | null>(null)
+const AuthActionsContext = createContext<{
+  signOut(scope?: 'local' | 'global'): Promise<void>
+} | null>(null)
 
 const STORAGE_MESSAGE = 'Secure authentication storage is unavailable.'
 const LOCAL_DATA_MESSAGE = 'Local data could not be prepared securely.'
 const SESSION_LIFECYCLE_MESSAGE = 'Authentication session lifecycle is unavailable.'
 const defaultReplaceRoute = (route: SafeAuthRoute) => router.replace(route)
+const localDataDiagnosticMessage = (error: unknown): string => {
+  if (!__DEV__) return LOCAL_DATA_MESSAGE
+  const detail = error instanceof Error ? error.message : String(error)
+  return `${LOCAL_DATA_MESSAGE}\nDevelopment detail: ${detail}`
+}
 
 export const AuthProvider = ({
   dataLifecycle,
@@ -227,13 +254,26 @@ export const AuthProvider = ({
   appState = AppState,
   linking = Linking,
   replaceRoute = defaultReplaceRoute,
+  aal2Guard = getRecentAal2Guard(),
   children,
 }: AuthProviderProps) => {
   const [state, setState] = useState<AuthState>({ status: 'initializing' })
+  const [ownerLease, setOwnerLease] = useState<AuthenticatedOwnerLease | null>(null)
+  const ownerLeaseRef = useRef<AuthenticatedOwnerLease | null>(null)
   const service = useMemo(() => suppliedService ?? getAuthService(), [suppliedService])
   const lifecycleBlocks = useRef(new Set<LifecycleBlock>())
   const restoreSession = useRef<() => void>(() => {})
   const invalidateSession = useRef<() => void>(() => dataLifecycle.deactivateOwner())
+  const actions = useMemo(() => ({
+    async signOut(scope: 'local' | 'global' = 'local') {
+      ownerLeaseRef.current = null
+      aal2Guard.clear()
+      aal2Guard.updateLease(null)
+      setOwnerLease(null)
+      invalidateSession.current()
+      await service.signOut(scope)
+    },
+  }), [aal2Guard, service])
 
   useEffect(() => {
     let disposed = false
@@ -241,13 +281,42 @@ export const AuthProvider = ({
     let targetOwnerId: string | null = null
     let activeOwnerId = dataLifecycle.ownerBoundary?.getSnapshot().ownerId ?? null
     let callbackVersion = 0
+    let sessionGeneration = sessionGenerationCounters.get(service) ?? 0
+    let repositoryRevision = repositoryRevisionCounters.get(dataLifecycle) ?? 0
     const ownerClears = getOwnerClearRegistry(dataLifecycle)
+    const advanceSessionGeneration = () => {
+      sessionGeneration += 1
+      sessionGenerationCounters.set(service, sessionGeneration)
+    }
+    const advanceRepositoryRevision = () => {
+      repositoryRevision += 1
+      repositoryRevisionCounters.set(dataLifecycle, repositoryRevision)
+    }
+
+    const publishLease = (ownerId: string) => {
+      if (disposed) return
+      const next = Object.freeze({ ownerId, sessionGeneration, repositoryRevision })
+      ownerLeaseRef.current = next
+      aal2Guard.updateLease(next)
+      setOwnerLease(next)
+    }
+
+    const invalidateLease = () => {
+      aal2Guard.clear()
+      aal2Guard.updateLease(null)
+      ownerLeaseRef.current = null
+      if (!disposed) setOwnerLease(null)
+    }
 
     dataLifecycle.deactivateOwner()
+    advanceRepositoryRevision()
+    invalidateLease()
     invalidateSession.current = () => {
       generation += 1
       targetOwnerId = null
       activeOwnerId = null
+      advanceRepositoryRevision()
+      invalidateLease()
       dataLifecycle.deactivateOwner()
     }
 
@@ -263,6 +332,7 @@ export const AuthProvider = ({
       const clearing = Promise.resolve()
         .then(() => dataLifecycle.clearOwner(ownerId))
         .then(() => {
+          advanceRepositoryRevision()
           if (ownerClears.get(ownerId) === record) ownerClears.delete(ownerId)
         })
         .catch(() => {
@@ -278,6 +348,8 @@ export const AuthProvider = ({
       if (currentGeneration !== generation) return
       targetOwnerId = null
       activeOwnerId = null
+      advanceRepositoryRevision()
+      invalidateLease()
       dataLifecycle.deactivateOwner()
       showStorageError(LOCAL_DATA_MESSAGE)
     }
@@ -304,8 +376,27 @@ export const AuthProvider = ({
       return currentGeneration === generation
     }
 
-    const reconcile = async (session: AuthSession | null) => {
+    const reconcile = async (session: AuthSession | null, event: AuthEvent) => {
+      advanceSessionGeneration()
+      if (
+        event === 'SIGNED_OUT' ||
+        event === 'TOKEN_REFRESHED' ||
+        event === 'USER_UPDATED' ||
+        event === 'INVALID_SESSION'
+      ) {
+        invalidateLease()
+      }
+      if (event === 'INVALID_SESSION') {
+        targetOwnerId = null
+        activeOwnerId = null
+        advanceRepositoryRevision()
+        dataLifecycle.deactivateOwner()
+        showStorageError(STORAGE_MESSAGE)
+        return
+      }
       if (lifecycleBlocks.current.size > 0) {
+        advanceRepositoryRevision()
+        invalidateLease()
         dataLifecycle.deactivateOwner()
         return
       }
@@ -316,7 +407,11 @@ export const AuthProvider = ({
         const previousOwnerId = targetOwnerId ?? activeOwnerId
         targetOwnerId = null
         activeOwnerId = null
-        if (previousOwnerId) dataLifecycle.deactivateOwner()
+        if (previousOwnerId) {
+          advanceRepositoryRevision()
+          invalidateLease()
+          dataLifecycle.deactivateOwner()
+        }
         if (!disposed) {
           setState(
             user
@@ -334,11 +429,18 @@ export const AuthProvider = ({
         return
       }
 
-      if (targetOwnerId === user.id && ownerClears.size === 0) return
+      if (targetOwnerId === user.id && ownerClears.size === 0) {
+        if (activeOwnerId === user.id) publishLease(user.id)
+        return
+      }
       const previousOwnerId = targetOwnerId ?? activeOwnerId
       targetOwnerId = user.id
       activeOwnerId = null
-      if (previousOwnerId && previousOwnerId !== user.id) dataLifecycle.deactivateOwner()
+      if (previousOwnerId && previousOwnerId !== user.id) {
+        advanceRepositoryRevision()
+        invalidateLease()
+        dataLifecycle.deactivateOwner()
+      }
       if (!disposed) {
         setState({ status: 'signedIn', userId: user.id, email: user.email, hydrated: false })
       }
@@ -362,11 +464,17 @@ export const AuthProvider = ({
 
       try {
         await dataLifecycle.initialize(user.id)
-      } catch {
+        advanceRepositoryRevision()
+      } catch (error) {
+        if (__DEV__) {
+          console.error('[FieldCraft boot] Local repository initialization failed.', error)
+        }
         if (!disposed && currentGeneration === generation) {
           targetOwnerId = null
+          advanceRepositoryRevision()
+          invalidateLease()
           dataLifecycle.deactivateOwner()
-          showStorageError(LOCAL_DATA_MESSAGE)
+          showStorageError(localDataDiagnosticMessage(error))
         }
         return
       }
@@ -394,14 +502,15 @@ export const AuthProvider = ({
           return
         }
       }
+      publishLease(user.id)
       setState({ status: 'signedIn', userId: user.id, email: user.email, hydrated: true })
     }
 
     let unsubscribe = () => {}
     try {
-      unsubscribe = service.subscribe((session) => {
+      unsubscribe = service.subscribe((event, session) => {
         callbackVersion += 1
-        void reconcile(session)
+        void reconcile(session, event)
       })
       lifecycleBlocks.current.delete('subscription')
     } catch {
@@ -426,7 +535,7 @@ export const AuthProvider = ({
             lifecycleBlocks.current.size === 0 &&
             callbackVersion === versionBeforeSession
           ) {
-            return reconcile(session)
+            return reconcile(session, 'INITIAL_SESSION')
           }
         })
         .catch(() => {
@@ -434,6 +543,8 @@ export const AuthProvider = ({
             generation += 1
             targetOwnerId = null
             activeOwnerId = null
+            advanceRepositoryRevision()
+            invalidateLease()
             dataLifecycle.deactivateOwner()
             showStorageError(STORAGE_MESSAGE)
           }
@@ -445,18 +556,38 @@ export const AuthProvider = ({
     return () => {
       disposed = true
       generation += 1
+      aal2Guard.clear()
+      aal2Guard.updateLease(null)
+      ownerLeaseRef.current = null
       restoreSession.current = () => {}
       invalidateSession.current = () => dataLifecycle.deactivateOwner()
       unsubscribe()
       dataLifecycle.deactivateOwner()
     }
-  }, [dataLifecycle, service])
+  }, [aal2Guard, dataLifecycle, service])
+
+  useEffect(() => {
+    const boundary = dataLifecycle.ownerBoundary
+    if (!boundary?.subscribe) return undefined
+    const validateBoundary = () => {
+      const lease = ownerLeaseRef.current
+      if (lease && boundary.getSnapshot().ownerId !== lease.ownerId) {
+        ownerLeaseRef.current = null
+        aal2Guard.clear()
+        aal2Guard.updateLease(null)
+        setOwnerLease(null)
+      }
+    }
+    validateBoundary()
+    return boundary.subscribe(validateBoundary)
+  }, [aal2Guard, dataLifecycle])
 
   useEffect(() => {
     let mounted = true
 
     const blockRefreshLifecycle = () => {
       lifecycleBlocks.current.add('refresh')
+      aal2Guard.clear()
       invalidateSession.current()
     }
 
@@ -488,7 +619,7 @@ export const AuthProvider = ({
       blockRefreshLifecycle()
       lease.release()
     }
-  }, [appState, dataLifecycle, service])
+  }, [aal2Guard, appState, dataLifecycle, service])
 
   useEffect(() => {
     const processor = createAuthDeepLinkProcessor({
@@ -512,11 +643,26 @@ export const AuthProvider = ({
     }
   }, [linking, replaceRoute, service])
 
-  return <AuthContext.Provider value={state}>{children}</AuthContext.Provider>
+  return (
+    <AuthActionsContext.Provider value={actions}>
+      <AuthenticatedOwnerLeaseContext.Provider value={ownerLease}>
+        <AuthContext.Provider value={state}>{children}</AuthContext.Provider>
+      </AuthenticatedOwnerLeaseContext.Provider>
+    </AuthActionsContext.Provider>
+  )
 }
 
 export const useAuth = (): AuthState => {
   const state = useContext(AuthContext)
   if (!state) throw new Error('useAuth must be used inside AuthProvider')
   return state
+}
+
+export const useAuthenticatedOwnerLease = (): AuthenticatedOwnerLease | null =>
+  useContext(AuthenticatedOwnerLeaseContext)
+
+export const useAuthActions = () => {
+  const actions = useContext(AuthActionsContext)
+  if (!actions) throw new Error('useAuthActions must be used inside AuthProvider')
+  return actions
 }

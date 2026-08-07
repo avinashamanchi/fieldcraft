@@ -6,12 +6,16 @@ import {
   AuthProvider,
   type AuthDataLifecycle,
   type AppStateLifecycle,
+  type AuthenticatedOwnerLease,
   type LinkingLifecycle,
+  useAuthActions,
+  useAuthenticatedOwnerLease,
   useAuth,
 } from '../src/auth/AuthProvider'
 import {
   AuthOperationError,
   createAuthService,
+  type AuthEvent,
   type AuthService,
   type AuthSession,
 } from '../src/auth/authService'
@@ -23,7 +27,11 @@ import {
 import LoginScreen from '../app/(auth)/login'
 import SignupScreen from '../app/(auth)/signup'
 import ResetPasswordScreen from '../app/(auth)/reset-password'
-import OnboardingScreen, { type OnboardingProfile } from '../app/(auth)/onboarding'
+import OnboardingScreen from '../app/(auth)/onboarding'
+import type { OnboardingProfileV1 } from '../src/domain/entities'
+
+const CANONICAL_OWNER = '123e4567-e89b-12d3-a456-426614174000'
+const SECOND_CANONICAL_OWNER = '223e4567-e89b-12d3-a456-426614174000'
 
 const verifiedSession = (userId: string, email = `${userId}@example.com`): AuthSession => ({
   user: {
@@ -36,7 +44,7 @@ const verifiedSession = (userId: string, email = `${userId}@example.com`): AuthS
 class FakeAuthService implements AuthService {
   session: AuthSession | null = null
   sessionError: unknown = null
-  readonly listeners = new Set<(session: AuthSession | null) => void>()
+  readonly listeners = new Set<(event: AuthEvent, session: AuthSession | null) => void>()
   starts = 0
   stops = 0
   refreshRunning = false
@@ -54,14 +62,14 @@ class FakeAuthService implements AuthService {
     return this.session
   }
 
-  subscribe(listener: (session: AuthSession | null) => void): () => void {
+  subscribe(listener: (event: AuthEvent, session: AuthSession | null) => void): () => void {
     this.listeners.add(listener)
     return () => this.listeners.delete(listener)
   }
 
-  emit(session: AuthSession | null): void {
+  emit(session: AuthSession | null, event: AuthEvent = session ? 'SIGNED_IN' : 'SIGNED_OUT'): void {
     this.session = session
-    for (const listener of this.listeners) listener(session)
+    for (const listener of this.listeners) listener(event, session)
   }
 
   async startAutoRefresh(): Promise<void> {
@@ -108,7 +116,7 @@ class FakeAuthService implements AuthService {
   }
   async requestPasswordReset(): Promise<void> {}
   async updatePassword(): Promise<void> {}
-  async signOut(): Promise<void> {}
+  async signOut(_scope: 'local' | 'global' = 'local'): Promise<void> {}
   async exchangeCode(): Promise<void> {}
   async verifySignup(): Promise<void> {}
   async recoverPassword(): Promise<void> {}
@@ -140,6 +148,33 @@ class FakeDataLifecycle implements AuthDataLifecycle {
     if (this.clearFailures.has(ownerId)) throw new Error('clear failed: provider-secret')
     this.retainedOwners.delete(ownerId)
     if (this.activeOwnerId === ownerId) this.activeOwnerId = null
+  }
+}
+
+class ObservableDataLifecycle extends FakeDataLifecycle {
+  private boundaryOwnerId: string | null = null
+  private readonly boundaryListeners = new Set<() => void>()
+  readonly ownerBoundary = {
+    getSnapshot: () => ({ ownerId: this.boundaryOwnerId }),
+    subscribe: (listener: () => void) => {
+      this.boundaryListeners.add(listener)
+      return () => this.boundaryListeners.delete(listener)
+    },
+  }
+
+  private publishBoundary(ownerId: string | null) {
+    this.boundaryOwnerId = ownerId
+    for (const listener of this.boundaryListeners) listener()
+  }
+
+  override async initialize(ownerId: string): Promise<void> {
+    await super.initialize(ownerId)
+    this.publishBoundary(ownerId)
+  }
+
+  override deactivateOwner(): void {
+    super.deactivateOwner()
+    this.publishBoundary(null)
   }
 }
 
@@ -195,6 +230,13 @@ class FakeLinking implements LinkingLifecycle {
 }
 
 const StateProbe = () => <Text testID="auth-state">{JSON.stringify(useAuth())}</Text>
+let observedLease: AuthenticatedOwnerLease | null = null
+let observedSignOut: ((scope?: 'local' | 'global') => Promise<void>) | null = null
+const LeaseProbe = () => {
+  observedLease = useAuthenticatedOwnerLease()
+  observedSignOut = useAuthActions().signOut
+  return <Text testID="owner-lease">{JSON.stringify(observedLease)}</Text>
+}
 
 const renderProvider = (
   service: FakeAuthService,
@@ -239,6 +281,154 @@ it('keeps first-login cached app data unhydrated until a full cloud pull, then p
     hydrated: true,
   }))
   revisit.unmount()
+})
+
+it('rejects noncanonical session owners and preserves auth events and sign-out scope', async () => {
+  const signOut = jest.fn().mockResolvedValue({ data: {}, error: null })
+  const callbacks: Array<(event: string, session: never) => void> = []
+  const service = createAuthService({
+    auth: {
+      getSession: jest.fn().mockResolvedValue({
+        data: {
+          session: {
+            user: {
+              id: 'NOT-A-CANONICAL-UUID',
+              email: 'person@example.com',
+              email_confirmed_at: '2026-08-03T10:00:00.000Z',
+            },
+          },
+        },
+        error: null,
+      }),
+      onAuthStateChange: (callback) => {
+        callbacks.push(callback as never)
+        return { data: { subscription: { unsubscribe() {} } } }
+      },
+      signOut,
+    },
+  })
+
+  await expect(service.getSession()).rejects.toMatchObject({ code: 'INVALID_SESSION_OWNER' })
+  const listener = jest.fn()
+  service.subscribe(listener)
+  callbacks[0]('TOKEN_REFRESHED', {
+    user: {
+      id: CANONICAL_OWNER,
+      email: 'person@example.com',
+      email_confirmed_at: '2026-08-03T10:00:00.000Z',
+    },
+  } as never)
+  expect(listener).toHaveBeenCalledWith('TOKEN_REFRESHED', verifiedSession(
+    CANONICAL_OWNER,
+    'person@example.com',
+  ))
+
+  await service.signOut('local')
+  await service.signOut('global')
+  expect(signOut.mock.calls).toEqual([[{ scope: 'local' }], [{ scope: 'global' }]])
+})
+
+it('rotates an immutable owner lease on token refresh and removes it before owner teardown', async () => {
+  let finishClear!: () => void
+  const service = new FakeAuthService()
+  service.session = verifiedSession(CANONICAL_OWNER)
+  const dataLifecycle = new FakeDataLifecycle()
+  const appState = new FakeAppState()
+  const view = render(
+    <AuthProvider appState={appState} dataLifecycle={dataLifecycle} service={service}>
+      <LeaseProbe />
+    </AuthProvider>,
+  )
+
+  const readLease = (): AuthenticatedOwnerLease | null =>
+    JSON.parse(screen.getByTestId('owner-lease').props.children as string)
+  await waitFor(() => expect(readLease()?.ownerId).toBe(CANONICAL_OWNER))
+  const first = readLease()!
+  expect(Object.isFrozen(observedLease)).toBe(true)
+
+  act(() => service.emit(verifiedSession(CANONICAL_OWNER), 'TOKEN_REFRESHED'))
+  await waitFor(() => expect(readLease()?.sessionGeneration).toBeGreaterThan(first.sessionGeneration))
+  const refreshed = readLease()!
+  expect(refreshed.repositoryRevision).toBe(first.repositoryRevision)
+
+  dataLifecycle.clearers.set(CANONICAL_OWNER, new Promise<void>((resolve) => {
+    finishClear = resolve
+  }))
+  act(() => service.emit(verifiedSession(SECOND_CANONICAL_OWNER), 'SIGNED_IN'))
+  expect(readLease()).toBeNull()
+  expect(dataLifecycle.calls).not.toContain(`initialize:${SECOND_CANONICAL_OWNER}`)
+  finishClear()
+  await waitFor(() => expect(readLease()?.ownerId).toBe(SECOND_CANONICAL_OWNER))
+  expect(readLease()).not.toEqual(refreshed)
+  view.unmount()
+})
+
+it('invalidates the owner lease when the initialized repository resets outside auth callbacks', async () => {
+  const service = new FakeAuthService()
+  service.session = verifiedSession(CANONICAL_OWNER)
+  const dataLifecycle = new ObservableDataLifecycle()
+  const view = render(
+    <AuthProvider appState={new FakeAppState()} dataLifecycle={dataLifecycle} service={service}>
+      <LeaseProbe />
+    </AuthProvider>,
+  )
+  const readLease = (): AuthenticatedOwnerLease | null =>
+    JSON.parse(screen.getByTestId('owner-lease').props.children as string)
+  await waitFor(() => expect(readLease()?.ownerId).toBe(CANONICAL_OWNER))
+
+  act(() => dataLifecycle.deactivateOwner())
+
+  await waitFor(() => expect(readLease()).toBeNull())
+  view.unmount()
+})
+
+it('never reissues the same owner lease tuple after an auth-provider relaunch', async () => {
+  const service = new FakeAuthService()
+  service.session = verifiedSession(CANONICAL_OWNER)
+  const dataLifecycle = new FakeDataLifecycle()
+  const appState = new FakeAppState()
+  const renderLease = () => render(
+    <AuthProvider appState={appState} dataLifecycle={dataLifecycle} service={service}>
+      <LeaseProbe />
+    </AuthProvider>,
+  )
+  const readLease = (): AuthenticatedOwnerLease | null =>
+    JSON.parse(screen.getByTestId('owner-lease').props.children as string)
+
+  const firstView = renderLease()
+  await waitFor(() => expect(readLease()?.ownerId).toBe(CANONICAL_OWNER))
+  const firstLease = readLease()
+  firstView.unmount()
+
+  const secondView = renderLease()
+  await waitFor(() => expect(readLease()?.ownerId).toBe(CANONICAL_OWNER))
+  expect(readLease()).not.toEqual(firstLease)
+  secondView.unmount()
+})
+
+it('invalidates repository access before a local or global provider sign-out can settle', async () => {
+  let finishSignOut!: () => void
+  const pendingSignOut = new Promise<void>((resolve) => { finishSignOut = resolve })
+  const service = new FakeAuthService()
+  service.session = verifiedSession(CANONICAL_OWNER)
+  service.signOut = jest.fn(async () => pendingSignOut)
+  const dataLifecycle = new FakeDataLifecycle()
+  const view = render(
+    <AuthProvider appState={new FakeAppState()} dataLifecycle={dataLifecycle} service={service}>
+      <LeaseProbe />
+    </AuthProvider>,
+  )
+  await waitFor(() => expect(observedLease?.ownerId).toBe(CANONICAL_OWNER))
+
+  let signingOut!: Promise<void>
+  act(() => { signingOut = observedSignOut!('global') })
+
+  expect(observedLease).toBeNull()
+  expect(dataLifecycle.calls.at(-1)).toBe('deactivate')
+  expect(service.signOut).toHaveBeenCalledWith('global')
+  finishSignOut()
+  await signingOut
+  view.unmount()
 })
 
 it('starts refresh only while active, stops in background, and cleans up on unmount', async () => {
@@ -1057,9 +1247,11 @@ it('clears both recovery secrets after a stable password-update failure', async 
   expect(JSON.stringify(screen.toJSON())).not.toContain('raw provider reset error')
 })
 
-it('submits onboarding with only the approved bounded profile fields', async () => {
-  const onComplete = jest.fn<Promise<void>, [OnboardingProfile]>(async () => undefined)
-  render(<OnboardingScreen onComplete={onComplete} />)
+it('submits the complete bounded onboarding profile once on a duplicate tap', async () => {
+  let finish!: () => void
+  const pending = new Promise<void>((resolve) => { finish = resolve })
+  const onComplete = jest.fn<Promise<void>, [OnboardingProfileV1]>(async () => pending)
+  render(<OnboardingScreen onComplete={onComplete} now={() => '2026-08-07T18:00:00.000Z'} timeZone="America/Los_Angeles" />)
   fireEvent.changeText(screen.getByLabelText('Your name'), 'Avi Builder')
   fireEvent.changeText(screen.getByLabelText('Business name'), 'FieldCraft Plumbing')
   fireEvent.changeText(screen.getByLabelText('Trade'), 'Plumbing')
@@ -1068,23 +1260,36 @@ it('submits onboarding with only the approved bounded profile fields', async () 
   fireEvent.changeText(screen.getByLabelText('Payment terms'), 'Net 30')
 
   fireEvent.press(screen.getByRole('button', { name: 'Finish setup' }))
+  fireEvent.press(screen.getByRole('button', { name: 'Saving…' }))
 
   await waitFor(() =>
     expect(onComplete).toHaveBeenCalledWith({
-      name: 'Avi Builder',
+      displayName: 'Avi Builder',
       businessName: 'FieldCraft Plumbing',
-      trade: 'Plumbing',
-      rate: 125.5,
-      tax: 8.75,
+      tradeType: 'Plumbing',
+      hourlyRateCents: 12_550,
+      taxBasisPoints: 875,
       paymentTerms: 'Net 30',
+      countryCode: 'US',
+      currency: 'USD',
+      timeZone: 'America/Los_Angeles',
+      onboardingVersion: 1,
+      onboardingCompletedAt: '2026-08-07T18:00:00.000Z',
     }),
   )
-  expect(Object.keys(onComplete.mock.calls[0][0])).toEqual([
-    'name',
+  expect(onComplete).toHaveBeenCalledTimes(1)
+  expect(Object.keys(onComplete.mock.calls[0][0]).sort()).toEqual([
     'businessName',
-    'trade',
-    'rate',
-    'tax',
+    'countryCode',
+    'currency',
+    'displayName',
+    'hourlyRateCents',
+    'onboardingCompletedAt',
+    'onboardingVersion',
     'paymentTerms',
-  ])
+    'taxBasisPoints',
+    'timeZone',
+    'tradeType',
+  ].sort())
+  await act(async () => finish())
 })

@@ -238,9 +238,26 @@ const normalizePayload = (
   const common = canonicalCommon(entity, raw, ownerId)
   switch (entity) {
     case 'profile':
+      if (optionalInteger(raw, 'onboarding_version') !== 1) {
+        return {
+          ...common,
+          businessName: requireString(raw, 'business_name'),
+          ...(optionalString(raw, 'logo_path') ? { logoPath: optionalString(raw, 'logo_path') } : {}),
+        }
+      }
       return {
         ...common,
+        displayName: requireString(raw, 'display_name'),
         businessName: requireString(raw, 'business_name'),
+        tradeType: requireString(raw, 'trade_type'),
+        hourlyRateCents: requireInteger(raw, 'hourly_rate_cents'),
+        taxBasisPoints: requireInteger(raw, 'tax_basis_points'),
+        paymentTerms: requireString(raw, 'payment_terms'),
+        countryCode: requireString(raw, 'country_code'),
+        currency: requireString(raw, 'currency'),
+        timeZone: requireString(raw, 'time_zone'),
+        onboardingVersion: 1,
+        onboardingCompletedAt: requireTimestamp(raw, 'onboarding_completed_at'),
         ...(optionalString(raw, 'logo_path') ? { logoPath: optionalString(raw, 'logo_path') } : {}),
       }
     case 'client':
@@ -833,6 +850,11 @@ export const createSupabaseGateway = (
             p_mutation_id: mutation.id,
             p_payload: mutationRpcPayload(mutation),
           }), signal, deadlineMs, true)
+        : mutation.entity === 'profile' && mutation.kind === 'create'
+          ? await callProvider(() => client.rpc('save_fieldcraft_onboarding', {
+              p_mutation_id: mutation.id,
+              p_payload: mutation.payload,
+            }), signal, deadlineMs, true)
         : await callProvider(() => client.rpc('apply_entity_mutation', {
             p_mutation_id: mutation.id,
             p_entity: mutation.entity,

@@ -36,6 +36,10 @@ const EntityNameSchema = z.enum([
 const MutationKindSchema = z.enum(['create', 'update', 'delete', 'save_invoice_bundle'])
 const SyncStateSchema = z.enum(['current', 'pending', 'syncing', 'failed', 'conflict'])
 const MoneySchema = z.number().finite().int().min(0).max(MAX_MONEY_CENTS)
+const TradeTypeSchema = z.enum([
+  'Plumbing', 'Electrical', 'HVAC', 'Carpentry', 'General', 'Roofing', 'Flooring', 'Painting',
+])
+const PaymentTermsSchema = z.enum(['Due on receipt', 'Net 14', 'Net 30'])
 
 const VersionedEntitySchema = z
   .object({
@@ -49,7 +53,26 @@ const VersionedEntitySchema = z
   .strict()
 
 const entityPayloadSchemas: Record<EntityName, z.ZodType> = {
-  profile: VersionedEntitySchema.extend({ businessName: z.string().min(1), logoPath: z.string().max(500).optional() }),
+  profile: z.union([
+    VersionedEntitySchema.extend({
+      businessName: z.string().max(120),
+      logoPath: z.string().max(500).optional(),
+    }),
+    VersionedEntitySchema.extend({
+      displayName: z.string().min(1).max(100),
+      businessName: z.string().min(1).max(120),
+      tradeType: TradeTypeSchema,
+      hourlyRateCents: MoneySchema.min(1),
+      taxBasisPoints: z.number().finite().int().min(0).max(10_000),
+      paymentTerms: PaymentTermsSchema,
+      countryCode: z.literal('US'),
+      currency: z.literal('USD'),
+      timeZone: z.string().min(1).max(100),
+      onboardingVersion: z.literal(1),
+      onboardingCompletedAt: z.string().min(1),
+      logoPath: z.string().max(500).optional(),
+    }),
+  ]),
   client: VersionedEntitySchema.extend({
     name: z.string().min(1).max(200),
     phone: z.string().max(64).optional(),

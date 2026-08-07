@@ -1,29 +1,35 @@
-import { Stack } from 'expo-router'
+import { router, Stack, useSegments } from 'expo-router'
 import { ActivityIndicator, StyleSheet, Text, View } from 'react-native'
 import { useState, type PropsWithChildren } from 'react'
 import 'react-native-gesture-handler'
 import 'react-native-reanimated'
 
-import { AuthProvider, useAuth } from '../src/auth/AuthProvider'
+import {
+  AuthProvider,
+  useAuth,
+  useAuthenticatedOwnerLease,
+} from '../src/auth/AuthProvider'
 import { DataProvider, useFieldCraftData } from '../src/data/DataProvider'
 import { SQLiteFieldCraftRepository } from '../src/data/sqliteRepository'
 import { SyncProvider } from '../src/data/SyncProvider'
 import { InvoiceSessionProvider } from '../src/features/invoices/invoiceSession'
+import { OnboardingGate } from '../src/features/onboarding/OnboardingGate'
+import { colors } from '../src/theme/tokens'
 
 const HydrationGate = ({ children }: PropsWithChildren) => {
   const auth = useAuth()
   if (auth.status === 'initializing' || (auth.status === 'signedIn' && !auth.hydrated)) {
     return (
       <View accessibilityLabel="Preparing FieldCraft data" style={styles.centered}>
-        <ActivityIndicator />
-        <Text>Preparing your secure workspace…</Text>
+        <ActivityIndicator color={colors.orange} />
+        <Text style={styles.bootText}>Preparing your secure workspace…</Text>
       </View>
     )
   }
   if (auth.status === 'storageError') {
     return (
       <View style={styles.centered}>
-        <Text accessibilityRole="alert">{auth.message}</Text>
+        <Text accessibilityRole="alert" style={styles.bootError}>{auth.message}</Text>
       </View>
     )
   }
@@ -40,10 +46,31 @@ const RepositoryProviders = ({
     <DataProvider ownerId={ownerId} repository={repository}>
       <SyncProvider>
         <InvoiceSessionBoundary>
-          <HydrationGate>{children}</HydrationGate>
+          <HydrationGate>
+            <ProductRouteBoundary>{children}</ProductRouteBoundary>
+          </HydrationGate>
         </InvoiceSessionBoundary>
       </SyncProvider>
     </DataProvider>
+  )
+}
+
+const ProductRouteBoundary = ({ children }: PropsWithChildren) => {
+  const auth = useAuth()
+  const lease = useAuthenticatedOwnerLease()
+  const { owner, repository } = useFieldCraftData()
+  const segments = useSegments()
+  const publicRoute = segments[0] === '(auth)' || segments[0] === 'privacy'
+  if (publicRoute || auth.status !== 'signedIn' || !auth.hydrated) return children
+  return (
+    <OnboardingGate
+      lease={lease}
+      repository={repository}
+      repositoryOwnerId={owner.ownerId}
+      replace={(route) => router.replace(route)}
+    >
+      {children}
+    </OnboardingGate>
   )
 }
 
@@ -71,10 +98,13 @@ export default function RootLayout() {
 const styles = StyleSheet.create({
   centered: {
     alignItems: 'center',
+    backgroundColor: colors.charcoal,
     flex: 1,
     gap: 12,
     justifyContent: 'center',
     padding: 24,
   },
-  root: { flex: 1 },
+  bootError: { color: colors.danger, fontSize: 17, lineHeight: 24, textAlign: 'center' },
+  bootText: { color: colors.warmWhite, fontSize: 17, lineHeight: 24, textAlign: 'center' },
+  root: { backgroundColor: colors.charcoal, flex: 1 },
 })

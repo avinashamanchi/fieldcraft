@@ -105,7 +105,20 @@ export type InventoryItem = VersionedEntity & {
   lastUsedAt?: string
 }
 
-export type UserProfile = VersionedEntity & {
+export type OnboardingProfileV1 = {
+  displayName: string
   businessName: string
+  tradeType: TradeType
+  hourlyRateCents: MoneyCents
+  taxBasisPoints: number
+  paymentTerms: PaymentTerms
+  countryCode: 'US'
+  currency: 'USD'
+  timeZone: string
+  onboardingVersion: 1
+  onboardingCompletedAt: string
+}
+
+export type UserProfile = VersionedEntity & OnboardingProfileV1 & {
   logoPath?: string
 }

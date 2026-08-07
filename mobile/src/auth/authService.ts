@@ -35,7 +35,7 @@ type AuthClientLike = {
     }) => ProviderResult<{ session: Session | null }>
     resetPasswordForEmail?: (email: string, options: { redirectTo: string }) => ProviderResult
     updateUser?: (attributes: { password: string }) => ProviderResult
-    signOut?: () => ProviderResult
+    signOut?: (options: { scope: 'local' | 'global' }) => ProviderResult
     exchangeCodeForSession?: (code: string) => ProviderResult
     verifyOtp?: (parameters: { token_hash: string; type: 'signup' | 'recovery' }) => ProviderResult
   }
@@ -43,22 +43,46 @@ type AuthClientLike = {
 
 export interface AuthService {
   getSession(): Promise<AuthSession | null>
-  subscribe(listener: (session: AuthSession | null) => void): () => void
+  subscribe(listener: (event: AuthEvent, session: AuthSession | null) => void): () => void
   startAutoRefresh(): Promise<void>
   stopAutoRefresh(): Promise<void>
   signIn(email: string, password: string): Promise<void>
   signUp(email: string, password: string): Promise<{ verificationRequired: boolean }>
   requestPasswordReset(email: string): Promise<void>
   updatePassword(password: string): Promise<void>
-  signOut(): Promise<void>
+  signOut(scope?: 'local' | 'global'): Promise<void>
   exchangeCode(code: string): Promise<void>
   verifySignup(tokenHash: string): Promise<void>
   recoverPassword(tokenHash: string): Promise<void>
 }
 
+export type AuthEvent =
+  | 'INITIAL_SESSION'
+  | 'PASSWORD_RECOVERY'
+  | 'SIGNED_IN'
+  | 'SIGNED_OUT'
+  | 'TOKEN_REFRESHED'
+  | 'USER_UPDATED'
+  | 'MFA_CHALLENGE_VERIFIED'
+  | 'INVALID_SESSION'
+
+const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+
+export class InvalidSessionOwnerError extends AuthOperationError {
+  readonly code = 'INVALID_SESSION_OWNER'
+
+  constructor() {
+    super('The authentication session owner is invalid.')
+    this.name = 'InvalidSessionOwnerError'
+  }
+}
+
+export const isCanonicalOwnerId = (value: string): boolean => CANONICAL_UUID.test(value)
+
 const normalizeSession = (session: Session | null): AuthSession | null => {
   const email = session?.user.email
   if (!session || !email) return null
+  if (!isCanonicalOwnerId(session.user.id)) throw new InvalidSessionOwnerError()
   return {
     user: {
       id: session.user.id,
@@ -102,7 +126,17 @@ export const createAuthService = (client: AuthClientLike): AuthService => ({
   subscribe(listener) {
     try {
       const method = requireMethod(client.auth.onAuthStateChange)
-      const { data } = method.call(client.auth, (_event, session) => listener(normalizeSession(session)))
+      const { data } = method.call(client.auth, (event, session) => {
+        try {
+          listener(event as AuthEvent, normalizeSession(session))
+        } catch (error) {
+          if (error instanceof InvalidSessionOwnerError) {
+            listener('INVALID_SESSION', null)
+            return
+          }
+          throw error
+        }
+      })
       return () => data.subscription.unsubscribe()
     } catch {
       throw new AuthOperationError('Unable to observe authentication securely.')
@@ -165,10 +199,10 @@ export const createAuthService = (client: AuthClientLike): AuthService => ({
     )
   },
 
-  async signOut() {
+  async signOut(scope = 'local') {
     const method = requireMethod(client.auth.signOut)
     await callProvider(
-      () => method.call(client.auth),
+      () => method.call(client.auth, { scope }),
       'Unable to sign out securely. Please try again.',
     )
   },

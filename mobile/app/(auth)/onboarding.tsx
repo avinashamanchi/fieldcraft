@@ -1,4 +1,5 @@
-import { useRef, useState } from 'react'
+import * as Crypto from 'expo-crypto'
+import { useMemo, useRef, useState } from 'react'
 import { router } from 'expo-router'
 import {
   Pressable,
@@ -10,17 +11,15 @@ import {
 } from 'react-native'
 import { SafeAreaView } from 'react-native-safe-area-context'
 
-export type OnboardingProfile = {
-  name: string
-  businessName: string
-  trade: string
-  rate: number
-  tax: number
-  paymentTerms: string
-}
+import { useAuthenticatedOwnerLease } from '../../src/auth/AuthProvider'
+import { useFieldCraftData } from '../../src/data/DataProvider'
+import type { OnboardingProfileV1, PaymentTerms, TradeType } from '../../src/domain/entities'
+import { createOnboardingSaver } from '../../src/features/onboarding/saveOnboarding'
 
 type OnboardingScreenProps = {
-  onComplete?: (profile: OnboardingProfile) => Promise<void>
+  onComplete?: (profile: OnboardingProfileV1) => Promise<void>
+  now?: () => string
+  timeZone?: string
 }
 
 type TextFieldProps = {
@@ -53,9 +52,24 @@ const TextField = ({
   </View>
 )
 
-export default function OnboardingScreen({
-  onComplete = async () => router.replace('/'),
-}: OnboardingScreenProps) {
+const TRADES: readonly TradeType[] = [
+  'Plumbing', 'Electrical', 'HVAC', 'Carpentry', 'General', 'Roofing', 'Flooring', 'Painting',
+]
+const PAYMENT_TERMS: readonly PaymentTerms[] = ['Due on receipt', 'Net 14', 'Net 30']
+
+const scaledDecimal = (value: string, decimalPlaces: number): number | null => {
+  const match = value.trim().match(/^(\d{1,9})(?:\.(\d{1,2}))?$/)
+  if (!match) return null
+  const fractional = (match[2] ?? '').padEnd(decimalPlaces, '0')
+  const scaled = Number(match[1]) * 10 ** decimalPlaces + Number(fractional)
+  return Number.isSafeInteger(scaled) ? scaled : null
+}
+
+const OnboardingForm = ({
+  onComplete,
+  now = () => new Date().toISOString(),
+  timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+}: Required<Pick<OnboardingScreenProps, 'onComplete'>> & Omit<OnboardingScreenProps, 'onComplete'>) => {
   const [name, setName] = useState('')
   const [businessName, setBusinessName] = useState('')
   const [trade, setTrade] = useState('')
@@ -71,21 +85,33 @@ export default function OnboardingScreen({
     submissionLocked.current = true
     setSubmitting(true)
     setError('')
-    const profile: OnboardingProfile = {
-      name: name.trim(),
+    const tradeType = trade.trim()
+    const selectedPaymentTerms = paymentTerms.trim()
+    const hourlyRateCents = scaledDecimal(rate, 2)
+    const taxBasisPoints = scaledDecimal(tax, 2)
+    const profile: OnboardingProfileV1 = {
+      displayName: name.trim(),
       businessName: businessName.trim(),
-      trade: trade.trim(),
-      rate: Number(rate),
-      tax: Number(tax),
-      paymentTerms: paymentTerms.trim(),
+      tradeType: tradeType as TradeType,
+      hourlyRateCents: hourlyRateCents ?? -1,
+      taxBasisPoints: taxBasisPoints ?? -1,
+      paymentTerms: selectedPaymentTerms as PaymentTerms,
+      countryCode: 'US',
+      currency: 'USD',
+      timeZone,
+      onboardingVersion: 1,
+      onboardingCompletedAt: now(),
     }
     if (
-      profile.name.length < 1 || profile.name.length > 100 ||
+      profile.displayName.length < 1 || profile.displayName.length > 100 ||
       profile.businessName.length < 1 || profile.businessName.length > 120 ||
-      profile.trade.length < 1 || profile.trade.length > 80 ||
-      profile.paymentTerms.length < 1 || profile.paymentTerms.length > 40 ||
-      !Number.isFinite(profile.rate) || profile.rate <= 0 || profile.rate > 1_000_000 ||
-      !Number.isFinite(profile.tax) || profile.tax < 0 || profile.tax > 100
+      !TRADES.includes(profile.tradeType) ||
+      !PAYMENT_TERMS.includes(profile.paymentTerms) ||
+      !Number.isSafeInteger(profile.hourlyRateCents) ||
+      profile.hourlyRateCents <= 0 || profile.hourlyRateCents > 100_000_000 ||
+      !Number.isSafeInteger(profile.taxBasisPoints) ||
+      profile.taxBasisPoints < 0 || profile.taxBasisPoints > 10_000 ||
+      timeZone.length < 1 || timeZone.length > 100
     ) {
       setError('Check each field and enter values within the shown limits.')
       submissionLocked.current = false
@@ -129,6 +155,35 @@ export default function OnboardingScreen({
       </ScrollView>
     </SafeAreaView>
   )
+}
+
+const ConnectedOnboardingScreen = () => {
+  const lease = useAuthenticatedOwnerLease()
+  const { repository } = useFieldCraftData()
+  const saver = useMemo(() => lease ? createOnboardingSaver({
+    lease,
+    repository,
+    createMutationId: Crypto.randomUUID,
+  }) : null, [lease, repository])
+
+  if (!saver) {
+    return (
+      <SafeAreaView style={styles.safeArea}>
+        <View style={styles.container}>
+          <Text accessibilityRole="alert" style={styles.error}>Sign in securely before setup.</Text>
+        </View>
+      </SafeAreaView>
+    )
+  }
+  return <OnboardingForm onComplete={async (profile) => {
+    await saver.save(profile)
+    router.replace('/')
+  }} />
+}
+
+export default function OnboardingScreen(props: OnboardingScreenProps) {
+  if (props.onComplete) return <OnboardingForm {...props} onComplete={props.onComplete} />
+  return <ConnectedOnboardingScreen />
 }
 
 const styles = StyleSheet.create({

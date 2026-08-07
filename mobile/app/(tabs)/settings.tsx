@@ -2,9 +2,11 @@ import { router } from 'expo-router'
 import { Pressable, StyleSheet, Text } from 'react-native'
 
 import { Screen } from '../../src/components/Screen'
+import { useAuthActions } from '../../src/auth/AuthProvider'
 import { colors, MIN_TOUCH_TARGET, spacing, typography } from '../../src/theme/tokens'
 
 export default function SettingsScreen() {
+  const { signOut } = useAuthActions()
   return (
     <Screen contentContainerStyle={styles.screen} scroll>
       <Text accessibilityRole="header" style={styles.heading}>Settings</Text>
@@ -15,9 +17,12 @@ export default function SettingsScreen() {
       <Text style={styles.section}>Privacy & account</Text>
       <Pressable accessibilityRole="button" onPress={() => router.push('/settings/ai' as never)} style={styles.row}><Text style={styles.label}>AI & consent</Text></Pressable>
       <Pressable accessibilityRole="button" onPress={() => router.push('/settings/sync' as never)} style={styles.row}><Text style={styles.label}>Sync diagnostics</Text></Pressable>
+      <Pressable accessibilityRole="button" onPress={() => router.push('/security/mfa' as never)} style={styles.row}><Text style={styles.label}>Authenticator security</Text></Pressable>
       <Pressable accessibilityRole="button" onPress={() => router.push('/privacy' as never)} style={styles.row}><Text style={styles.label}>Privacy policy & support</Text></Pressable>
       <Pressable accessibilityRole="button" onPress={() => router.push('/settings/delete-data' as never)} style={styles.row}><Text style={styles.danger}>Delete local data</Text></Pressable>
       <Pressable accessibilityRole="button" onPress={() => router.push('/settings/delete-account' as never)} style={styles.row}><Text style={styles.danger}>Delete account</Text></Pressable>
+      <Pressable accessibilityRole="button" onPress={() => void signOut('local')} style={styles.row}><Text style={styles.label}>Sign out on this device</Text></Pressable>
+      <Pressable accessibilityRole="button" onPress={() => void signOut('global')} style={styles.row}><Text style={styles.danger}>Sign out on all devices</Text></Pressable>
     </Screen>
   )
 }
