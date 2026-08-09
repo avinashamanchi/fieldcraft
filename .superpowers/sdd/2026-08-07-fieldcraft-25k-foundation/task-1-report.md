@@ -154,3 +154,39 @@ Text-transport verification under Node 22:
   includes preserved release work and is not labeled an exact-commit count.
 - Mobile TypeScript and Expo lint passed with no diagnostics.
 - Root and mobile `npm audit --audit-level=high`: zero vulnerabilities.
+
+## Final lifecycle review follow-up
+
+The release review found that local erasure retries were retained only in a
+process-local `WeakMap`, a same-owner repository delete epoch did not revoke an
+issued lease, initial-pull rejection escaped hydration, onboarding retries
+could change content, completed cloud onboarding remained overwritable, recent
+AAL2 was not enforced by account deletion, and TOTP enrollment was not usable
+or safely recoverable.
+
+- Pending owner erasure is now journaled in SecureStore before provider
+  sign-out. Startup drains the journal before any owner can hydrate, and the
+  marker is removed only after idempotent local deletion succeeds.
+- Immutable leases capture the repository delete epoch and are revoked when a
+  same-owner delete begins. Both initial-pull promise failure paths now render
+  the existing local-data failure state instead of hanging.
+- Onboarding retry retains the exact object and timestamp; the RPC is
+  create-once after immutable receipt replay, so a late device cannot replace a
+  completed profile.
+- The SQL AAL helper requires an `aal2` JWT with a TOTP AMR timestamp no older
+  than 15 minutes. Account deletion verifies that helper with the caller token
+  before privileged deletes and distinguishes AAL denial from provider outage.
+- TOTP enrollment renders the provider QR image plus selectable secret and URI,
+  locks duplicate enrollment, and journals only this device's pending factor so
+  recovery cannot remove another device's unverified factor.
+
+Final dirty-worktree verification under Node 22:
+
+- Full mobile Jest: 538/538 passed across 46 suites.
+- Edge Deno tests: 13/13 passed.
+- PGlite: 38/38 passed.
+- TypeScript and Expo lint passed.
+- Root audit reported zero vulnerabilities. The mobile audit newly reports the
+  two `image-size` parser advisories through Metro; every published version
+  through 2.0.2 is affected, so there is no fixed override to apply yet and the
+  audit tool's forced Expo downgrade is not a valid remediation.

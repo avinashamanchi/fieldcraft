@@ -61,7 +61,7 @@ export const ProductRouteBoundary = ({ children }: PropsWithChildren) => {
   const auth = useAuth()
   const lease = useAuthenticatedOwnerLease()
   const { owner, repository } = useFieldCraftData()
-  const segments = useSegments()
+  const segments: readonly string[] = useSegments()
   const routeRoot = String(segments[0] ?? '')
   const routeLeaf = String(segments[1] ?? '')
   const publicRoute = routeRoot === 'privacy' || (
