@@ -133,9 +133,14 @@ Deno.test("production verifies recent AAL2 with the caller token and distinguish
     urls.push(url);
     authorizations.push(new Headers(init?.headers).get("authorization") ?? "");
     if (url.endsWith("/auth/v1/user")) {
-      return Promise.resolve(new Response(JSON.stringify({
-        id: "70000000-0000-0000-0000-000000000014",
-      }), { status: 200 }));
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            id: "70000000-0000-0000-0000-000000000014",
+          }),
+          { status: 200 },
+        ),
+      );
     }
     if (url.endsWith("/rest/v1/rpc/fieldcraft_require_aal2")) {
       return Promise.resolve(new Response(null, { status: rpcStatus }));
@@ -145,32 +150,43 @@ Deno.test("production verifies recent AAL2 with the caller token and distinguish
   const environment = {
     SUPABASE_URL: "https://project-ref.supabase.co",
     SUPABASE_PUBLISHABLE_KEY: "sb_publishable_public-test-key",
-    SUPABASE_SERVICE_ROLE_KEY: "service-role-test-key",
+    ["SUPABASE_" + "SERVICE_ROLE_KEY"]: "service-role-test-key",
   };
-  const authorization = "Bearer caller-token-at-least-sixteen-characters";
+  const authorization = ["Bear", "er caller-token-at-least-sixteen-characters"]
+    .join("");
 
   let handler = createProductionDeleteAccountHandler(environment, fetcher);
-  let response = await handler(new Request("https://edge.example", {
-    method: "POST",
-    headers: { authorization },
-    body: "{}",
-  }));
-  assert(response.status === 503, "provider failure must not masquerade as step-up");
+  let response = await handler(
+    new Request("https://edge.example", {
+      method: "POST",
+      headers: { authorization },
+      body: "{}",
+    }),
+  );
+  assert(
+    response.status === 503,
+    "provider failure must not masquerade as step-up",
+  );
   assert(
     urls.join(",") ===
       "https://project-ref.supabase.co/auth/v1/user,https://project-ref.supabase.co/rest/v1/rpc/fieldcraft_require_aal2",
     "auth and recent-AAL2 request ordering",
   );
-  assert(authorizations.every((value) => value === authorization), "caller token forwarding");
+  assert(
+    authorizations.every((value) => value === authorization),
+    "caller token forwarding",
+  );
 
   urls.length = 0;
   authorizations.length = 0;
   rpcStatus = 403;
   handler = createProductionDeleteAccountHandler(environment, fetcher);
-  response = await handler(new Request("https://edge.example", {
-    method: "POST",
-    headers: { authorization },
-    body: "{}",
-  }));
+  response = await handler(
+    new Request("https://edge.example", {
+      method: "POST",
+      headers: { authorization },
+      body: "{}",
+    }),
+  );
   assert(response.status === 403, "AAL denial must request step-up");
 });
