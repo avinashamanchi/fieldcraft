@@ -2,6 +2,13 @@ import type { ConfigContext, ExpoConfig } from 'expo/config'
 
 export default function appConfig(_context: ConfigContext): ExpoConfig {
   void _context
+  const revenueCatAppleApiKey = process.env.EXPO_PUBLIC_REVENUECAT_APPLE_API_KEY?.trim() ?? ''
+  if (
+    process.env.EAS_BUILD_PROFILE === 'production' &&
+    !/^appl_[A-Za-z0-9_-]{8,}$/.test(revenueCatAppleApiKey)
+  ) {
+    throw new Error('EXPO_PUBLIC_REVENUECAT_APPLE_API_KEY is required for production builds')
+  }
 
   return {
     name: 'FieldCraft',

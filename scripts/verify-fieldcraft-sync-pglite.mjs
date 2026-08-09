@@ -295,6 +295,7 @@ try {
   await db.exec(await readMigration('202608030003_fieldcraft_sync_changes.sql'))
   await db.exec(await readMigration('202608060004_fieldcraft_ai_rate_limits.sql'))
   await db.exec(await readMigration('202608070001_fieldcraft_identity_security.sql'))
+  await db.exec(await readMigration('202608070002_fieldcraft_entitlements.sql'))
   // Supabase grants its service role platform-level table and sequence access.
   // Model that runtime privilege here without changing production migrations or
   // granting user-facing RPCs that the migration intentionally withholds.
@@ -1390,6 +1391,318 @@ try {
         throw new Error('authenticated onboarding replay changed its immutable receipt')
       }
     })
+  })
+
+  await verify('entitlement RPC grants and direct-table privileges are least-authority', async () => {
+    const privileges = await db.query(`
+      select
+        has_function_privilege('anon', 'public.get_my_entitlement()', 'execute') as anon_get,
+        has_function_privilege('authenticated', 'public.get_my_entitlement()', 'execute') as owner_get,
+        has_function_privilege('service_role', 'public.get_my_entitlement()', 'execute') as service_get,
+        has_function_privilege('authenticated', 'public.reserve_feature_admission(uuid,text)', 'execute') as owner_reserve,
+        has_function_privilege('service_role', 'public.reserve_feature_admission(uuid,text)', 'execute') as service_reserve,
+        has_function_privilege('authenticated', 'public.apply_revenuecat_event(text,uuid,text,text,text,boolean,timestamptz,timestamptz,text)', 'execute') as owner_apply,
+        has_function_privilege('service_role', 'public.apply_revenuecat_event(text,uuid,text,text,text,boolean,timestamptz,timestamptz,text)', 'execute') as service_apply,
+        has_table_privilege('authenticated', 'public.subscription_entitlements', 'select') as owner_table,
+        has_table_privilege('authenticated', 'public.feature_admissions', 'insert') as owner_admission_table
+    `)
+    const row = privileges.rows[0]
+    if (
+      row?.anon_get !== false || row?.owner_get !== true || row?.service_get !== false ||
+      row?.owner_reserve !== true || row?.service_reserve !== false ||
+      row?.owner_apply !== false || row?.service_apply !== true ||
+      row?.owner_table !== false || row?.owner_admission_table !== false
+    ) throw new Error(`entitlement privileges were ${JSON.stringify(row ?? null)}`)
+  })
+
+  await verify('RevenueCat events are atomic, ordered, terminal-aware, and query-time expired', async () => {
+    const entitlementOwner = '81000000-0000-4000-8000-000000000001'
+    await db.query('insert into auth.users (id, email) values ($1, $2)', [
+      entitlementOwner,
+      'entitlement-owner@example.test',
+    ])
+    const apply = async ({
+      hash,
+      status,
+      providerAt,
+      eventType,
+      expiresAt = '2099-01-01T00:00:00.000Z',
+      active = true,
+    }) => withRole('service_role', () => db.query(`
+      select public.apply_revenuecat_event(
+        $1, $2, 'fieldcraft_pro_monthly', 'SANDBOX', $3, $4, $5, $6, $7
+      ) as outcome
+    `, [hash, entitlementOwner, status, active, expiresAt, providerAt, eventType]))
+
+    const activeHash = '1'.repeat(64)
+    let result = await apply({
+      hash: activeHash,
+      status: 'active',
+      providerAt: '2026-08-09T00:00:00.000Z',
+      eventType: 'INITIAL_PURCHASE',
+    })
+    if (result.rows[0]?.outcome !== 'applied') throw new Error('purchase was not applied')
+    result = await apply({
+      hash: activeHash,
+      status: 'active',
+      providerAt: '2026-08-09T00:00:00.000Z',
+      eventType: 'INITIAL_PURCHASE',
+    })
+    if (result.rows[0]?.outcome !== 'duplicate') throw new Error('duplicate was not stable')
+    result = await apply({
+      hash: '2'.repeat(64),
+      status: 'expired',
+      providerAt: '2026-08-08T00:00:00.000Z',
+      eventType: 'EXPIRATION',
+      active: false,
+    })
+    if (result.rows[0]?.outcome !== 'stale') throw new Error('older expiration overwrote state')
+    result = await apply({
+      hash: '3'.repeat(64),
+      status: 'refunded',
+      providerAt: '2026-08-09T00:00:00.000Z',
+      eventType: 'REFUND',
+      active: false,
+    })
+    if (result.rows[0]?.outcome !== 'applied') throw new Error('equal timestamp refund lost precedence')
+    result = await apply({
+      hash: '4'.repeat(64),
+      status: 'cancelled',
+      providerAt: '2026-08-10T00:00:00.000Z',
+      eventType: 'CANCELLATION',
+      active: true,
+    })
+    if (result.rows[0]?.outcome !== 'stale') throw new Error('terminal refund was resurrected')
+    result = await apply({
+      hash: '5'.repeat(64),
+      status: 'active',
+      providerAt: '2026-08-11T00:00:00.000Z',
+      eventType: 'INITIAL_PURCHASE',
+    })
+    if (result.rows[0]?.outcome !== 'applied') throw new Error('new purchase did not reactivate')
+
+    await db.query(`select set_config('request.jwt.claim.sub', $1, false)`, [entitlementOwner])
+    const current = await withRole('authenticated', () => db.query(
+      'select public.get_my_entitlement() as entitlement',
+    ))
+    if (current.rows[0]?.entitlement?.state !== 'pro') {
+      throw new Error(`current entitlement was ${JSON.stringify(current.rows[0]?.entitlement)}`)
+    }
+
+    await apply({
+      hash: '6'.repeat(64),
+      status: 'active',
+      providerAt: '2026-08-12T00:00:00.000Z',
+      eventType: 'RENEWAL',
+      expiresAt: '2000-01-01T00:00:00.000Z',
+    })
+    const expired = await withRole('authenticated', () => db.query(
+      'select public.get_my_entitlement() as entitlement',
+    ))
+    if (expired.rows[0]?.entitlement?.state !== 'free') {
+      throw new Error(`query-time expiry returned ${JSON.stringify(expired.rows[0]?.entitlement)}`)
+    }
+
+    const missingOwner = '81000000-0000-4000-8000-000000000099'
+    await withRole('service_role', () => expectSqlState(
+      () => db.query(`
+        select public.apply_revenuecat_event(
+          $1, $2, 'fieldcraft_pro_monthly', 'SANDBOX', 'active', true,
+          '2099-01-01T00:00:00Z', '2026-08-13T00:00:00Z', 'INITIAL_PURCHASE'
+        )
+      `, ['7'.repeat(64), missingOwner]),
+      '23503',
+    ))
+    const failedReceipt = await db.query(
+      'select count(*)::int as count from public.revenuecat_event_receipts where event_id_hash = $1',
+      ['7'.repeat(64)],
+    )
+    if (failedReceipt.rows[0]?.count !== 0) throw new Error('failed event retained a receipt')
+  })
+
+  await verify('feature admissions enforce free boundaries and survive later expiry for one replay-safe write', async () => {
+    const admissionOwner = '82000000-0000-4000-8000-000000000001'
+    await db.query('insert into auth.users (id, email) values ($1, $2)', [
+      admissionOwner,
+      'admission-owner@example.test',
+    ])
+    await db.query(`select set_config('request.jwt.claim.sub', $1, false)`, [admissionOwner])
+    for (let index = 0; index < 10; index += 1) {
+      const suffix = String(index + 1).padStart(12, '0')
+      await withRole('authenticated', () => db.query(`
+        select public.apply_entity_mutation(
+          $1, 'client', 'create', $2, null, $3::jsonb
+        )
+      `, [
+        `82100000-0000-4000-8000-${suffix}`,
+        `82200000-0000-4000-8000-${suffix}`,
+        JSON.stringify({ name: `Client ${index + 1}` }),
+      ]))
+    }
+    const deniedMutation = '82300000-0000-4000-8000-000000000001'
+    const denied = await withRole('authenticated', () => db.query(
+      `select public.reserve_feature_admission($1, 'create-client') as admission`,
+      [deniedMutation],
+    ))
+    if (
+      denied.rows[0]?.admission?.allowed !== false ||
+      denied.rows[0]?.admission?.reason !== 'FREE_LIMIT' ||
+      denied.rows[0]?.admission?.limit !== 10
+    ) throw new Error(`free decision was ${JSON.stringify(denied.rows[0]?.admission)}`)
+    await withRole('authenticated', () => expectSqlState(
+      () => db.query(`
+        select public.apply_entity_mutation(
+          $1, 'client', 'create', $2, null, $3::jsonb
+        )
+      `, [
+        deniedMutation,
+        '82400000-0000-4000-8000-000000000001',
+        JSON.stringify({ name: 'Denied client' }),
+      ]),
+      '42501',
+    ))
+
+    await withRole('service_role', () => db.query(`
+      select public.apply_revenuecat_event(
+        $1, $2, 'fieldcraft_pro_monthly', 'SANDBOX', 'active', true,
+        '2099-01-01T00:00:00Z', '2026-08-09T00:00:00Z', 'INITIAL_PURCHASE'
+      )
+    `, ['8'.repeat(64), admissionOwner]))
+    const allowedMutation = '82300000-0000-4000-8000-000000000002'
+    const allowed = await withRole('authenticated', () => db.query(
+      `select public.reserve_feature_admission($1, 'create-client') as admission`,
+      [allowedMutation],
+    ))
+    if (allowed.rows[0]?.admission?.allowed !== true) {
+      throw new Error(`Pro decision was ${JSON.stringify(allowed.rows[0]?.admission)}`)
+    }
+
+    await withRole('service_role', () => db.query(`
+      select public.apply_revenuecat_event(
+        $1, $2, 'fieldcraft_pro_monthly', 'SANDBOX', 'expired', false,
+        '2099-01-01T00:00:00Z', '2026-08-10T00:00:00Z', 'EXPIRATION'
+      )
+    `, ['9'.repeat(64), admissionOwner]))
+    const entityId = '82400000-0000-4000-8000-000000000002'
+    const first = await withRole('authenticated', () => db.query(`
+      select public.apply_entity_mutation(
+        $1, 'client', 'create', $2, null, $3::jsonb
+      ) as response
+    `, [allowedMutation, entityId, JSON.stringify({ name: 'Admitted client' })]))
+    const replay = await withRole('authenticated', () => db.query(`
+      select public.apply_entity_mutation(
+        $1, 'client', 'create', $2, null, $3::jsonb
+      ) as response
+    `, [allowedMutation, entityId, JSON.stringify({ name: 'Changed replay' })]))
+    if (JSON.stringify(first.rows[0]?.response) !== JSON.stringify(replay.rows[0]?.response)) {
+      throw new Error('admitted mutation replay changed its receipt')
+    }
+    await withRole('authenticated', () => expectSqlStateIn(
+      () => db.query(`
+        select public.apply_entity_mutation(
+          $1, 'client', 'create', $2, null, $3::jsonb
+        )
+      `, [
+        allowedMutation,
+        '82400000-0000-4000-8000-000000000003',
+        JSON.stringify({ name: 'Second business write' }),
+      ]),
+      ['22023', '42501'],
+    ))
+    const retained = await db.query(`
+      select allowed, used_at is not null as used,
+        retained_until >= created_at + interval '400 days' as retained
+      from public.feature_admissions
+      where user_id = $1 and mutation_id = $2 and feature = 'create-client'
+    `, [admissionOwner, allowedMutation])
+    if (
+      retained.rows[0]?.allowed !== true ||
+      retained.rows[0]?.used !== true ||
+      retained.rows[0]?.retained !== true
+    ) throw new Error(`retained admission was ${JSON.stringify(retained.rows[0] ?? null)}`)
+  })
+
+  await verify('closed jobs and draft invoices cannot bypass free limits by changing status', async () => {
+    const owner = '82000000-0000-4000-8000-000000000001'
+    const clientId = '82200000-0000-4000-8000-000000000001'
+    await db.query(`select set_config('request.jwt.claim.sub', $1, false)`, [owner])
+    for (let index = 0; index < 3; index += 1) {
+      const suffix = String(index + 1).padStart(12, '0')
+      await withRole('authenticated', () => db.query(`
+        select public.apply_entity_mutation(
+          $1, 'job', 'create', $2, null, $3::jsonb
+        )
+      `, [
+        `82500000-0000-4000-8000-${suffix}`,
+        `82600000-0000-4000-8000-${suffix}`,
+        JSON.stringify({ clientId, title: `Open job ${index + 1}`, tradeType: 'General', status: 'Scheduled' }),
+      ]))
+    }
+    const closedJob = '82600000-0000-4000-8000-000000000004'
+    await withRole('authenticated', () => db.query(`
+      select public.apply_entity_mutation(
+        '82500000-0000-4000-8000-000000000004', 'job', 'create', $1, null,
+        $2::jsonb
+      )
+    `, [closedJob, JSON.stringify({ clientId, title: 'Closed job', tradeType: 'General', status: 'Invoiced' })]))
+    await withRole('authenticated', () => expectSqlState(
+      () => db.query(`
+        select public.apply_entity_mutation(
+          '82500000-0000-4000-8000-000000000005', 'job', 'update', $1, 1,
+          '{"status":"Scheduled"}'::jsonb
+        )
+      `, [closedJob]),
+      '42501',
+    ))
+
+    for (let index = 0; index < 5; index += 1) {
+      const suffix = String(index + 1).padStart(12, '0')
+      await withRole('authenticated', () => db.query(`
+        select public.apply_entity_mutation(
+          $1, 'invoice', 'create', $2, null, $3::jsonb
+        )
+      `, [
+        `82700000-0000-4000-8000-${suffix}`,
+        `82800000-0000-4000-8000-${suffix}`,
+        JSON.stringify({
+          clientId,
+          number: `LIMIT-${index + 1}`,
+          lineItems: [{ description: 'Labor', type: 'labor', quantity: 1000, unitPriceCents: 100 }],
+          subtotalCents: 100,
+          taxBasisPoints: 0,
+          taxCents: 0,
+          totalCents: 100,
+          paymentTerms: 'Due on receipt',
+          status: 'Sent',
+        }),
+      ]))
+    }
+    const draftInvoice = '82800000-0000-4000-8000-000000000006'
+    await withRole('authenticated', () => db.query(`
+      select public.apply_entity_mutation(
+        '82700000-0000-4000-8000-000000000006', 'invoice', 'create', $1, null,
+        $2::jsonb
+      )
+    `, [draftInvoice, JSON.stringify({
+      clientId,
+      number: 'LIMIT-DRAFT',
+      lineItems: [{ description: 'Labor', type: 'labor', quantity: 1000, unitPriceCents: 100 }],
+      subtotalCents: 100,
+      taxBasisPoints: 0,
+      taxCents: 0,
+      totalCents: 100,
+      paymentTerms: 'Due on receipt',
+      status: 'Draft',
+    })]))
+    await withRole('authenticated', () => expectSqlState(
+      () => db.query(`
+        select public.apply_entity_mutation(
+          '82700000-0000-4000-8000-000000000007', 'invoice', 'update', $1, 1,
+          '{"status":"Sent"}'::jsonb
+        )
+      `, [draftInvoice]),
+      '42501',
+    ))
   })
 
   await verify('authenticated direct DML is isolated to owner reads and cannot bypass RPC writes', async () => {

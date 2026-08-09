@@ -2,7 +2,7 @@ begin;
 
 create extension if not exists pgtap with schema extensions;
 
-select plan(30);
+select plan(37);
 
 insert into auth.users (id, email)
 values
@@ -192,6 +192,59 @@ select throws_ok(
        '{"name":"Too much minimum stock","unit":"each","minStockThousandths":10001}'
      ) $$,
   '22023', null, 'inventory RPC rejects minimum stock above the Task 2 limit'
+);
+
+reset role;
+set local role service_role;
+select is(
+  public.apply_revenuecat_event(
+    repeat('a', 64), '50000000-0000-0000-0000-000000000005',
+    'fieldcraft_pro_monthly', 'SANDBOX', 'active', true,
+    '2099-01-01T00:00:00Z', '2026-08-09T00:00:00Z', 'INITIAL_PURCHASE'
+  ),
+  'applied',
+  'first RevenueCat purchase is applied atomically'
+);
+select is(
+  public.apply_revenuecat_event(
+    repeat('a', 64), '50000000-0000-0000-0000-000000000005',
+    'fieldcraft_pro_monthly', 'SANDBOX', 'active', true,
+    '2099-01-01T00:00:00Z', '2026-08-09T00:00:00Z', 'INITIAL_PURCHASE'
+  ),
+  'duplicate',
+  'RevenueCat retry returns duplicate'
+);
+select is(
+  (select count(*) from public.revenuecat_event_receipts where event_id_hash = repeat('a', 64)),
+  1::bigint,
+  'duplicate event stores one receipt'
+);
+select is(
+  public.apply_revenuecat_event(
+    repeat('b', 64), '50000000-0000-0000-0000-000000000005',
+    'fieldcraft_pro_monthly', 'SANDBOX', 'expired', false,
+    '2026-08-08T00:00:00Z', '2026-08-08T00:00:00Z', 'EXPIRATION'
+  ),
+  'stale',
+  'older expiration cannot overwrite a newer purchase'
+);
+select is(
+  (select status from public.subscription_entitlements where user_id = '50000000-0000-0000-0000-000000000005'),
+  'active',
+  'stale event preserves the active entitlement row'
+);
+select throws_ok(
+  $$ select public.apply_revenuecat_event(
+       repeat('c', 64), '50000000-0000-4000-8000-000000000099',
+       'fieldcraft_pro_monthly', 'SANDBOX', 'active', true,
+       '2099-01-01T00:00:00Z', '2026-08-10T00:00:00Z', 'INITIAL_PURCHASE'
+     ) $$,
+  '23503', null, 'missing owner rolls back the event transaction'
+);
+select is(
+  (select count(*) from public.revenuecat_event_receipts where event_id_hash = repeat('c', 64)),
+  0::bigint,
+  'failed RevenueCat transaction leaves no receipt'
 );
 
 select * from finish();

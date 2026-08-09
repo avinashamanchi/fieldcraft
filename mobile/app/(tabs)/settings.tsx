@@ -3,10 +3,12 @@ import { Pressable, StyleSheet, Text } from 'react-native'
 
 import { Screen } from '../../src/components/Screen'
 import { useAuthActions } from '../../src/auth/AuthProvider'
+import { useSubscription } from '../../src/billing/SubscriptionProvider'
 import { colors, MIN_TOUCH_TARGET, spacing, typography } from '../../src/theme/tokens'
 
 export default function SettingsScreen() {
   const { signOut } = useAuthActions()
+  const { entitlement } = useSubscription()
   return (
     <Screen contentContainerStyle={styles.screen} scroll>
       <Text accessibilityRole="header" style={styles.heading}>Settings</Text>
@@ -14,6 +16,10 @@ export default function SettingsScreen() {
       <Pressable accessibilityRole="button" onPress={() => router.push('/settings/services')} style={styles.row}><Text style={styles.label}>Services</Text></Pressable>
       <Pressable accessibilityRole="button" onPress={() => router.push('/settings/inventory')} style={styles.row}><Text style={styles.label}>Inventory</Text></Pressable>
       <Pressable accessibilityRole="button" onPress={() => router.push('/settings/business-logo' as never)} style={styles.row}><Text style={styles.label}>Business logo</Text></Pressable>
+      <Text style={styles.section}>Plan</Text>
+      <Pressable accessibilityRole="button" onPress={() => router.push('/subscription' as never)} style={styles.row}>
+        <Text style={styles.label}>{entitlement.state === 'pro' ? 'FieldCraft Pro — verified' : 'FieldCraft plan & purchases'}</Text>
+      </Pressable>
       <Text style={styles.section}>Privacy & account</Text>
       <Pressable accessibilityRole="button" onPress={() => router.push('/settings/ai' as never)} style={styles.row}><Text style={styles.label}>AI & consent</Text></Pressable>
       <Pressable accessibilityRole="button" onPress={() => router.push('/settings/sync' as never)} style={styles.row}><Text style={styles.label}>Sync diagnostics</Text></Pressable>

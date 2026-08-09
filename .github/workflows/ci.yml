@@ -61,4 +61,7 @@ jobs:
       - run: npm run test:supabase-pglite
       - run: deno fmt --check supabase/functions
       - run: deno lint supabase/functions
-      - run: deno test supabase/functions/fieldcraft-ai/index_test.ts supabase/functions/delete-account/index_test.ts
+      - name: Run dynamic deno test function set
+        run: npm run test:supabase-functions
+      - name: Run dynamic deno check function set
+        run: npm run check:supabase-functions

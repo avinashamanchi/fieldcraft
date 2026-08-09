@@ -2,7 +2,7 @@ begin;
 
 create extension if not exists pgtap with schema extensions;
 
-select plan(40);
+select plan(50);
 
 insert into auth.users (id, email)
 values
@@ -135,6 +135,44 @@ select results_eq(
   $$ select id from public.invoices where id = '3d000000-0000-0000-0000-000000000003' $$,
   $$ values ('3d000000-0000-0000-0000-000000000003'::uuid) $$,
   'RPC-created invoice is owner readable'
+);
+
+select throws_ok($$ select * from public.subscription_entitlements $$, '42501', null, 'entitlements reject direct owner reads');
+select throws_ok($$ select * from public.revenuecat_event_receipts $$, '42501', null, 'RevenueCat receipts reject direct owner reads');
+select throws_ok($$ select * from public.feature_admissions $$, '42501', null, 'feature admissions reject direct owner reads');
+select throws_ok(
+  $$ insert into public.subscription_entitlements (
+       user_id, entitlement, product_id, environment, status, provider_active,
+       expires_at, provider_event_at, event_rank
+     ) values (
+       auth.uid(), 'pro', 'fieldcraft_pro_monthly', 'SANDBOX', 'active', true,
+       now() + interval '1 month', now(), 1
+     ) $$,
+  '42501', null, 'authenticated users cannot forge entitlements'
+);
+select is(public.get_my_entitlement() ->> 'state', 'free', 'owner entitlement RPC defaults to Free');
+select is(
+  public.reserve_feature_admission(
+    '3e000000-0000-4000-8000-000000000003', 'export-account'
+  ) ->> 'allowed',
+  'true',
+  'downgrade-safe export admission remains allowed'
+);
+select ok(
+  has_function_privilege('authenticated', 'public.get_my_entitlement()', 'execute'),
+  'authenticated may execute get_my_entitlement'
+);
+select ok(
+  has_function_privilege('authenticated', 'public.reserve_feature_admission(uuid,text)', 'execute'),
+  'authenticated may execute feature admission'
+);
+select ok(
+  not has_function_privilege('authenticated', 'public.apply_revenuecat_event(text,uuid,text,text,text,boolean,timestamptz,timestamptz,text)', 'execute'),
+  'authenticated cannot apply RevenueCat events'
+);
+select ok(
+  has_function_privilege('service_role', 'public.apply_revenuecat_event(text,uuid,text,text,text,boolean,timestamptz,timestamptz,text)', 'execute'),
+  'service role alone may apply RevenueCat events'
 );
 
 select * from finish();

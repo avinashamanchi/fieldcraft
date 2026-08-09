@@ -1,6 +1,7 @@
 import { router, Stack, useSegments } from 'expo-router'
 import { ActivityIndicator, StyleSheet, Text, View } from 'react-native'
 import { useEffect, useState, type PropsWithChildren } from 'react'
+import Constants, { ExecutionEnvironment } from 'expo-constants'
 import 'react-native-gesture-handler'
 import 'react-native-reanimated'
 
@@ -12,6 +13,20 @@ import {
 import { DataProvider, useFieldCraftData } from '../src/data/DataProvider'
 import { SQLiteFieldCraftRepository } from '../src/data/sqliteRepository'
 import { SyncProvider } from '../src/data/SyncProvider'
+import { EntitlementStore } from '../src/billing/entitlementStore'
+import { AdmissionControlledFieldCraftRepository } from '../src/billing/featureAdmission'
+import {
+  SubscriptionCoordinator,
+  SubscriptionProvider,
+} from '../src/billing/SubscriptionProvider'
+import {
+  createNativePurchasesPort,
+  createRevenueCatClient,
+} from '../src/billing/revenueCatClient'
+import {
+  createFeatureAdmissionGateway,
+  createServerEntitlementGateway,
+} from '../src/data/supabaseGateway'
 import { InvoiceSessionProvider } from '../src/features/invoices/invoiceSession'
 import { OnboardingGate } from '../src/features/onboarding/OnboardingGate'
 import { colors } from '../src/theme/tokens'
@@ -116,14 +131,47 @@ const InvoiceSessionBoundary = ({ children }: PropsWithChildren) => {
 }
 
 export default function RootLayout() {
-  const [repository] = useState(() => new SQLiteFieldCraftRepository())
+  const [resources] = useState(() => {
+    const store = new EntitlementStore()
+    const client = createRevenueCatClient({
+      apiKey: process.env.EXPO_PUBLIC_REVENUECAT_APPLE_API_KEY ?? '',
+      purchases: createNativePurchasesPort(),
+      isExpoGo: Constants.executionEnvironment === ExecutionEnvironment.StoreClient,
+    })
+    return {
+      repository: new AdmissionControlledFieldCraftRepository({
+        entitlementStore: store,
+        gateway: createFeatureAdmissionGateway(),
+      }),
+      store,
+      coordinator: new SubscriptionCoordinator(
+        client,
+        createServerEntitlementGateway(),
+        store,
+      ),
+    }
+  })
+  const repository = resources.repository
+  const [authLifecycle] = useState(() => ({
+    initialize: (ownerId: string) => repository.initialize(ownerId),
+    deactivateOwner: () => {
+      resources.coordinator.invalidateBeforeTeardown()
+      repository.deactivateOwner()
+    },
+    clearOwner: (ownerId: string) => repository.clearOwner(ownerId),
+    hasCompletedInitialPull: (ownerId: string) => repository.hasCompletedInitialPull(ownerId),
+    waitForInitialPull: (ownerId: string) => repository.waitForInitialPull(ownerId),
+    ownerBoundary: repository.ownerBoundary,
+  }))
   return (
-    <AuthProvider dataLifecycle={repository}>
-      <RepositoryProviders repository={repository}>
-        <View style={styles.root}>
-          <Stack screenOptions={{ headerShown: false }} />
-        </View>
-      </RepositoryProviders>
+    <AuthProvider dataLifecycle={authLifecycle}>
+      <SubscriptionProvider coordinator={resources.coordinator} store={resources.store}>
+        <RepositoryProviders repository={repository}>
+          <View style={styles.root}>
+            <Stack screenOptions={{ headerShown: false }} />
+          </View>
+        </RepositoryProviders>
+      </SubscriptionProvider>
     </AuthProvider>
   )
 }

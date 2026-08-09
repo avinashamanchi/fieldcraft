@@ -13,6 +13,8 @@
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "check:supabase-boundary": "node scripts/check-supabase-migration-boundary.mjs",
+    "check:supabase-functions": "node -e \"const fs=require('node:fs');const tests=fs.globSync('supabase/functions/*/index_test.ts').map(p=>p.split('/').at(-2)).sort();const code=fs.globSync('supabase/functions/*/index.ts').map(p=>p.split('/').at(-2)).sort();if(!code.length||JSON.stringify(tests)!==JSON.stringify(code)){console.error('Every Supabase function must have an index and index_test');process.exit(1)}\" && deno check supabase/functions/*/index.ts",
+    "test:supabase-functions": "node -e \"const fs=require('node:fs');const tests=fs.globSync('supabase/functions/*/index_test.ts').map(p=>p.split('/').at(-2)).sort();const code=fs.globSync('supabase/functions/*/index.ts').map(p=>p.split('/').at(-2)).sort();if(!tests.length||JSON.stringify(tests)!==JSON.stringify(code)){console.error('Every Supabase function must have an index and index_test');process.exit(1)}\" && deno test supabase/functions/*/index_test.ts",
     "test:supabase-pglite": "node scripts/verify-fieldcraft-sync-pglite.mjs",
     "scan:secrets": "node scripts/scan-secrets.mjs",
     "preview": "vite preview"

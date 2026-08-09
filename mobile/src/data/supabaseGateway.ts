@@ -1,5 +1,8 @@
 import { getSupabaseClient } from '../auth/supabase'
+import type { FeatureAdmissionGateway } from '../billing/featureAdmission'
+import type { ServerEntitlementGateway } from '../billing/SubscriptionProvider'
 import { OnboardingProfileV1Schema } from '../domain/entities'
+import type { Feature, FeatureDecision } from '../domain/monetization'
 import type { EntityName, MutationEnvelope } from '../domain/sync'
 import type { CloudRowEnvelope, InvoiceBundlePayload } from './repository'
 import { parsePostgresTimestamp } from './postgresTimestamp'
@@ -914,6 +917,108 @@ export const createSupabaseGateway = (
           active = false
           void channel.unsubscribe()
         },
+      }
+    },
+  }
+}
+
+const entitlementState = (
+  value: unknown,
+  expectedOwnerId: string,
+): Awaited<ReturnType<ServerEntitlementGateway['get']>> => {
+  const data = asRecord(value)
+  const ownerId = requireString(data, 'owner_id')
+  if (ownerId !== expectedOwnerId) throw new RemoteGatewayError('invalid-response')
+  const state = requireString(data, 'state')
+  if (state === 'free') return { ownerId, state }
+  if (state !== 'pro') throw new RemoteGatewayError('invalid-response')
+  const productId = requireString(data, 'product_id')
+  if (productId !== 'fieldcraft_pro_monthly' && productId !== 'fieldcraft_pro_annual') {
+    throw new RemoteGatewayError('invalid-response')
+  }
+  return {
+    ownerId,
+    state,
+    productId,
+    expiresAt: requireCanonicalMillisecondTimestamp(data, 'expires_at'),
+  }
+}
+
+export const createServerEntitlementGateway = (
+  suppliedClient?: SupabaseGatewayClient,
+  options: SupabaseGatewayOptions = {},
+): ServerEntitlementGateway => {
+  const deadlineMs = options.deadlineMs ?? DEFAULT_DEADLINE_MS
+  return {
+    async get(lease) {
+      const client = suppliedClient ?? getSupabaseClient() as unknown as SupabaseGatewayClient
+      const reply = await callProvider(
+        () => client.rpc('get_my_entitlement', {}),
+        new AbortController().signal,
+        deadlineMs,
+      )
+      return entitlementState(reply.data, lease.ownerId)
+    },
+  }
+}
+
+const FEATURE_NAMES = new Set<Feature>([
+  'create-client',
+  'create-open-job',
+  'issue-document',
+  'stripe-payment-link',
+  'scheduled-reminder',
+  'revenue-dashboard',
+  'edit-existing-record',
+  'record-payment',
+  'export-account',
+  'delete-account',
+])
+
+const admissionDecision = (data: RawRecord): FeatureDecision => {
+  const allowed = requireBoolean(data, 'allowed')
+  if (allowed) return { allowed: true }
+  const reason = requireString(data, 'reason')
+  if (reason !== 'FREE_LIMIT' && reason !== 'PRO_REQUIRED' && reason !== 'ENTITLEMENT_STALE') {
+    throw new RemoteGatewayError('invalid-response')
+  }
+  const limit = data.limit === null || data.limit === undefined
+    ? undefined
+    : requireInteger(data, 'limit')
+  return { allowed: false, reason, ...(limit === undefined ? {} : { limit }) }
+}
+
+export const createFeatureAdmissionGateway = (
+  suppliedClient?: SupabaseGatewayClient,
+  options: SupabaseGatewayOptions = {},
+): FeatureAdmissionGateway => {
+  const deadlineMs = options.deadlineMs ?? DEFAULT_DEADLINE_MS
+  return {
+    async reserve(lease, mutationId, feature) {
+      const client = suppliedClient ?? getSupabaseClient() as unknown as SupabaseGatewayClient
+      const reply = await callProvider(
+        () => client.rpc('reserve_feature_admission', {
+          p_mutation_id: mutationId,
+          p_feature: feature,
+        }),
+        new AbortController().signal,
+        deadlineMs,
+      )
+      const data = asRecord(reply.data)
+      const ownerId = requireString(data, 'owner_id')
+      const echoedMutationId = requireString(data, 'mutation_id')
+      const echoedFeature = requireString(data, 'feature') as Feature
+      if (
+        ownerId !== lease.ownerId ||
+        echoedMutationId !== mutationId ||
+        echoedFeature !== feature ||
+        !FEATURE_NAMES.has(echoedFeature)
+      ) throw new RemoteGatewayError('invalid-response')
+      return {
+        ownerId,
+        mutationId: echoedMutationId,
+        feature: echoedFeature,
+        decision: admissionDecision(data),
       }
     },
   }

@@ -49,8 +49,10 @@ jobs:
           npm run test:supabase-pglite
           deno fmt --check supabase/functions
           deno lint supabase/functions
-          deno test supabase/functions/fieldcraft-ai/index_test.ts supabase/functions/delete-account/index_test.ts
-          deno check supabase/functions/fieldcraft-ai/index.ts supabase/functions/delete-account/index.ts
+          # Dynamic deno test set; the script rejects missing function tests.
+          npm run test:supabase-functions
+          # Dynamic deno check set over every discovered function entrypoint.
+          npm run check:supabase-functions
           npm run scan:secrets
 
       - name: Create content-free evidence
