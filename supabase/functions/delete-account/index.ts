@@ -6,6 +6,7 @@ type Dependencies = {
   authenticateRequest(
     authorization: string | null,
   ): Promise<{ userId: string }>;
+  requireRecentAal2(authorization: string): Promise<void>;
   deleteLogo(userId: string): Promise<void>;
   deleteUser(userId: string): Promise<void>;
   log(entry: { requestId: string; status: number; publicCode: string }): void;
@@ -61,9 +62,8 @@ export const createDeleteAccountHandler =
         publicCode = "method-not-allowed";
         return json(status, { error: publicCode, requestId }, cors);
       }
-      const identity = await dependencies.authenticateRequest(
-        request.headers.get("authorization"),
-      );
+      const authorization = request.headers.get("authorization");
+      const identity = await dependencies.authenticateRequest(authorization);
       let body: unknown;
       try {
         body = JSON.parse(await readBoundedBody(request, 1024));
@@ -80,6 +80,8 @@ export const createDeleteAccountHandler =
         publicCode = "invalid-request";
         return json(status, { error: publicCode, requestId }, cors);
       }
+      if (!authorization) throw new Error("unauthorized");
+      await dependencies.requireRecentAal2(authorization);
       await dependencies.deleteLogo(identity.userId);
       await dependencies.deleteUser(identity.userId);
       return json(200, { requestId, status: "deleted" }, cors);
@@ -87,6 +89,9 @@ export const createDeleteAccountHandler =
       if (cause instanceof Error && cause.message === "unauthorized") {
         status = 401;
         publicCode = "unauthorized";
+      } else if (cause instanceof Error && cause.message === "aal2-required") {
+        status = 403;
+        publicCode = "recent-aal2-required";
       } else {
         status = 503;
         publicCode = "temporarily-unavailable";
@@ -105,6 +110,7 @@ const required = (environment: Record<string, string>, key: string): string => {
 
 export const createProductionDeleteAccountHandler = (
   environment: Record<string, string>,
+  fetcher: typeof fetch = fetch,
 ) => {
   const supabaseUrl = required(environment, "SUPABASE_URL").replace(/\/$/, "");
   const publishableKey = environment.SUPABASE_ANON_KEY?.trim() ||
@@ -122,9 +128,27 @@ export const createProductionDeleteAccountHandler = (
         ).filter(Boolean),
     ),
     authenticateRequest: (authorization) =>
-      authenticate(authorization, { supabaseUrl, publishableKey }),
+      authenticate(authorization, { supabaseUrl, publishableKey, fetcher }),
+    async requireRecentAal2(authorization) {
+      const response = await fetcher(
+        `${supabaseUrl}/rest/v1/rpc/fieldcraft_require_aal2`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: authorization,
+            apikey: publishableKey,
+            "Content-Type": "application/json",
+          },
+          body: "{}",
+        },
+      );
+      if (response.status === 401 || response.status === 403) {
+        throw new Error("aal2-required");
+      }
+      if (!response.ok) throw new Error("aal2-check-failed");
+    },
     async deleteLogo(userId) {
-      const response = await fetch(
+      const response = await fetcher(
         `${supabaseUrl}/storage/v1/object/business-logos/${
           encodeURIComponent(userId)
         }/logo.jpg`,
@@ -135,7 +159,7 @@ export const createProductionDeleteAccountHandler = (
       }
     },
     async deleteUser(userId) {
-      const response = await fetch(
+      const response = await fetcher(
         `${supabaseUrl}/auth/v1/admin/users/${encodeURIComponent(userId)}`,
         { method: "DELETE", headers: adminHeaders },
       );

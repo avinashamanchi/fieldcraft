@@ -18,6 +18,10 @@ import {
   type AuthService,
   type AuthSession,
 } from './authService'
+import {
+  getOwnerErasureRegistry,
+  type OwnerErasureRegistry,
+} from './ownerErasureRegistry'
 import { getRecentAal2Guard, type RecentAal2Guard } from './requireAal2'
 
 export type AuthState =
@@ -34,7 +38,7 @@ export type AuthDataLifecycle = {
   hasCompletedInitialPull?(ownerId: string): Promise<boolean>
   waitForInitialPull?(ownerId: string): Promise<void>
   ownerBoundary?: {
-    getSnapshot(): { ownerId: string | null }
+    getSnapshot(): { ownerId: string | null; deleteEpoch?: number }
     subscribe?(listener: () => void): () => void
   }
 }
@@ -64,9 +68,10 @@ type AuthProviderProps = PropsWithChildren<{
   linking?: LinkingLifecycle
   replaceRoute?: (route: SafeAuthRoute) => void
   aal2Guard?: RecentAal2Guard
+  erasureRegistry?: OwnerErasureRegistry
 }>
 
-type LifecycleBlock = 'refresh' | 'subscription'
+type LifecycleBlock = 'erasure' | 'refresh' | 'subscription'
 type OwnerClear = {
   status: 'pending' | 'failed'
   promise: Promise<void>
@@ -74,6 +79,7 @@ type OwnerClear = {
 type SessionRevocationOptions = {
   clearOwner: boolean
   nextState?: AuthState
+  durableIntent?: Promise<void>
 }
 type PendingMfaVerification = {
   ownerId: string
@@ -271,14 +277,17 @@ export const AuthProvider = ({
   linking = Linking,
   replaceRoute = defaultReplaceRoute,
   aal2Guard = getRecentAal2Guard(),
+  erasureRegistry = getOwnerErasureRegistry(),
   children,
 }: AuthProviderProps) => {
   const [state, setState] = useState<AuthState>({ status: 'initializing' })
   const [ownerLease, setOwnerLease] = useState<AuthenticatedOwnerLease | null>(null)
   const ownerLeaseRef = useRef<AuthenticatedOwnerLease | null>(null)
+  const ownerLeaseBoundaryRef = useRef<{ ownerId: string; deleteEpoch: number } | null>(null)
   const service = useMemo(() => suppliedService ?? getAuthService(), [suppliedService])
   const lifecycleBlocks = useRef(new Set<LifecycleBlock>())
   const restoreSession = useRef<() => void>(() => {})
+  const signOutSession = useRef<(scope: 'local' | 'global') => Promise<void>>(async () => {})
   const revokeSession = useRef<(options: SessionRevocationOptions) => Promise<void>>(
     async ({ nextState }) => {
       dataLifecycle.deactivateOwner()
@@ -292,21 +301,13 @@ export const AuthProvider = ({
     throw new Error('A current authenticated owner lease is required.')
   })
   const actions = useMemo(() => ({
-    async signOut(scope: 'local' | 'global' = 'local') {
-      const clearing = revokeSession.current({
-        clearOwner: true,
-        nextState: { status: 'signedOut' },
-      })
-      const providerSignOut = service.signOut(scope)
-      const [clearResult, providerResult] = await Promise.allSettled([clearing, providerSignOut])
-      if (clearResult.status === 'rejected') throw clearResult.reason
-      if (providerResult.status === 'rejected') throw providerResult.reason
-    },
+    signOut: (scope: 'local' | 'global' = 'local') => signOutSession.current(scope),
     verifyMfaChallenge: (challenge: () => Promise<void>, verifiedAt?: number) =>
       verifyMfaChallenge.current(challenge, verifiedAt),
-  }), [service])
+  }), [])
 
   useEffect(() => {
+    lifecycleBlocks.current.add('erasure')
     let disposed = false
     let generation = 0
     let targetOwnerId: string | null = null
@@ -366,6 +367,11 @@ export const AuthProvider = ({
     const publishLease = (ownerId: string): AuthenticatedOwnerLease | null => {
       if (disposed) return null
       const next = Object.freeze({ ownerId, sessionGeneration, repositoryRevision })
+      const boundarySnapshot = dataLifecycle.ownerBoundary?.getSnapshot()
+      ownerLeaseBoundaryRef.current = {
+        ownerId,
+        deleteEpoch: boundarySnapshot?.deleteEpoch ?? 0,
+      }
       ownerLeaseRef.current = next
       aal2Guard.updateLease(next)
       setOwnerLease(next)
@@ -376,6 +382,7 @@ export const AuthProvider = ({
       cancelMfaVerification()
       aal2Guard.clear()
       aal2Guard.updateLease(null)
+      ownerLeaseBoundaryRef.current = null
       ownerLeaseRef.current = null
       if (!disposed) setOwnerLease(null)
     }
@@ -388,13 +395,19 @@ export const AuthProvider = ({
       if (!disposed) setState({ status: 'storageError', message })
     }
 
-    const startOwnerClear = (ownerId: string, retryFailed: boolean): Promise<void> => {
+    const startOwnerClear = (
+      ownerId: string,
+      retryFailed: boolean,
+      durableIntent?: Promise<void>,
+    ): Promise<void> => {
       const existing = ownerClears.get(ownerId)
       if (existing && (existing.status === 'pending' || !retryFailed)) return existing.promise
 
       const record: OwnerClear = { status: 'pending', promise: Promise.resolve() }
       const clearing = Promise.resolve()
+        .then(() => durableIntent ?? erasureRegistry.mark(ownerId))
         .then(() => dataLifecycle.clearOwner(ownerId))
+        .then(() => erasureRegistry.clear(ownerId))
         .then(() => {
           advanceRepositoryRevision()
           if (ownerClears.get(ownerId) === record) ownerClears.delete(ownerId)
@@ -418,10 +431,11 @@ export const AuthProvider = ({
     const revokeOwnerSession = ({
       clearOwner,
       nextState,
+      durableIntent,
     }: SessionRevocationOptions): Promise<void> => {
       const priorOwnerId = capturePriorOwner()
       const clearing = clearOwner && priorOwnerId
-        ? startOwnerClear(priorOwnerId, true)
+        ? startOwnerClear(priorOwnerId, true, durableIntent)
         : Promise.resolve()
       generation += 1
       targetOwnerId = null
@@ -436,6 +450,21 @@ export const AuthProvider = ({
       })
     }
     revokeSession.current = revokeOwnerSession
+    signOutSession.current = async (scope) => {
+      const priorOwnerId = capturePriorOwner()
+      const durableIntent = priorOwnerId
+        ? erasureRegistry.mark(priorOwnerId)
+        : Promise.resolve()
+      const clearing = revokeOwnerSession({
+        clearOwner: true,
+        nextState: { status: 'signedOut' },
+        durableIntent,
+      })
+      const providerSignOut = durableIntent.then(() => service.signOut(scope))
+      const [clearResult, providerResult] = await Promise.allSettled([clearing, providerSignOut])
+      if (clearResult.status === 'rejected') throw clearResult.reason
+      if (providerResult.status === 'rejected') throw providerResult.reason
+    }
 
     verifyMfaChallenge.current = (challenge, verifiedAt = Date.now()) => {
       const startingLease = ownerLeaseRef.current
@@ -482,14 +511,17 @@ export const AuthProvider = ({
       })
     }
 
-    const failOwnerLifecycle = (currentGeneration: number) => {
+    const failOwnerLifecycle = (
+      currentGeneration: number,
+      message = LOCAL_DATA_MESSAGE,
+    ) => {
       if (currentGeneration !== generation) return
       targetOwnerId = null
       activeOwnerId = null
       advanceRepositoryRevision()
       invalidateLease()
       dataLifecycle.deactivateOwner()
-      showStorageError(LOCAL_DATA_MESSAGE)
+      showStorageError(message)
     }
 
     const clearPreviousOwner = async (ownerId: string, currentGeneration: number) => {
@@ -629,20 +661,28 @@ export const AuthProvider = ({
         return
       }
       activeOwnerId = user.id
-      if (
-        dataLifecycle.hasCompletedInitialPull &&
-        dataLifecycle.waitForInitialPull &&
-        !(await dataLifecycle.hasCompletedInitialPull(user.id))
-      ) {
-        await dataLifecycle.waitForInitialPull(user.id)
+      try {
         if (
-          disposed ||
-          lifecycleBlocks.current.size > 0 ||
-          currentGeneration !== generation ||
-          targetOwnerId !== user.id
+          dataLifecycle.hasCompletedInitialPull &&
+          dataLifecycle.waitForInitialPull &&
+          !(await dataLifecycle.hasCompletedInitialPull(user.id))
         ) {
-          return
+          await dataLifecycle.waitForInitialPull(user.id)
+          if (
+            disposed ||
+            lifecycleBlocks.current.size > 0 ||
+            currentGeneration !== generation ||
+            targetOwnerId !== user.id
+          ) {
+            return
+          }
         }
+      } catch (error) {
+        if (__DEV__) {
+          console.error('[FieldCraft boot] Initial cloud hydration failed.', error)
+        }
+        failOwnerLifecycle(currentGeneration, localDataDiagnosticMessage(error))
+        return
       }
       const nextLease = publishLease(user.id)
       if (event === 'MFA_CHALLENGE_VERIFIED' && nextLease) recordMfaEventLease(nextLease)
@@ -693,7 +733,23 @@ export const AuthProvider = ({
         })
     }
     restoreSession.current = restore
-    restore()
+    void erasureRegistry
+      .list()
+      .then(async (ownerIds) => {
+        for (const ownerId of ownerIds) {
+          await startOwnerClear(ownerId, true)
+          if (disposed) return
+        }
+        if (disposed) return
+        lifecycleBlocks.current.delete('erasure')
+        restore()
+      })
+      .catch((error: unknown) => {
+        if (__DEV__) {
+          console.error('[FieldCraft boot] Pending local-data erasure failed.', error)
+        }
+        failOwnerLifecycle(generation, localDataDiagnosticMessage(error))
+      })
 
     return () => {
       cancelMfaVerification()
@@ -701,11 +757,15 @@ export const AuthProvider = ({
       generation += 1
       aal2Guard.clear()
       aal2Guard.updateLease(null)
+      ownerLeaseBoundaryRef.current = null
       ownerLeaseRef.current = null
       restoreSession.current = () => {}
       revokeSession.current = async ({ nextState }) => {
         dataLifecycle.deactivateOwner()
         if (nextState) setState(nextState)
+      }
+      signOutSession.current = async () => {
+        throw new Error(SESSION_LIFECYCLE_MESSAGE)
       }
       verifyMfaChallenge.current = async () => {
         throw new Error('A current authenticated owner lease is required.')
@@ -713,14 +773,23 @@ export const AuthProvider = ({
       unsubscribe()
       dataLifecycle.deactivateOwner()
     }
-  }, [aal2Guard, dataLifecycle, service])
+  }, [aal2Guard, dataLifecycle, erasureRegistry, service])
 
   useEffect(() => {
     const boundary = dataLifecycle.ownerBoundary
     if (!boundary?.subscribe) return undefined
     const validateBoundary = () => {
       const lease = ownerLeaseRef.current
-      if (lease && boundary.getSnapshot().ownerId !== lease.ownerId) {
+      const capturedBoundary = ownerLeaseBoundaryRef.current
+      const currentBoundary = boundary.getSnapshot()
+      if (
+        lease &&
+        (
+          currentBoundary.ownerId !== lease.ownerId ||
+          capturedBoundary?.ownerId !== lease.ownerId ||
+          (currentBoundary.deleteEpoch ?? 0) !== (capturedBoundary?.deleteEpoch ?? 0)
+        )
+      ) {
         void revokeSession.current({ clearOwner: false })
       }
     }

@@ -29,6 +29,7 @@ type TextFieldProps = {
   onChangeText(value: string): void
   maxLength: number
   keyboardType?: 'default' | 'decimal-pad'
+  disabled?: boolean
 }
 
 const TextField = ({
@@ -38,11 +39,13 @@ const TextField = ({
   onChangeText,
   maxLength,
   keyboardType = 'default',
+  disabled = false,
 }: TextFieldProps) => (
   <View style={styles.field}>
     <Text style={styles.label}>{label}</Text>
     <TextInput
       accessibilityLabel={accessibilityLabel}
+      editable={!disabled}
       keyboardType={keyboardType}
       maxLength={maxLength}
       onChangeText={onChangeText}
@@ -78,50 +81,59 @@ const OnboardingForm = ({
   const [paymentTerms, setPaymentTerms] = useState('')
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
+  const [retryPending, setRetryPending] = useState(false)
   const submissionLocked = useRef(false)
+  const retainedProfile = useRef<OnboardingProfileV1 | null>(null)
 
   const submit = async () => {
     if (submissionLocked.current) return
     submissionLocked.current = true
     setSubmitting(true)
     setError('')
-    const tradeType = trade.trim()
-    const selectedPaymentTerms = paymentTerms.trim()
-    const hourlyRateCents = scaledDecimal(rate, 2)
-    const taxBasisPoints = scaledDecimal(tax, 2)
-    const profile: OnboardingProfileV1 = {
-      displayName: name.trim(),
-      businessName: businessName.trim(),
-      tradeType: tradeType as TradeType,
-      hourlyRateCents: hourlyRateCents ?? -1,
-      taxBasisPoints: taxBasisPoints ?? -1,
-      paymentTerms: selectedPaymentTerms as PaymentTerms,
-      countryCode: 'US',
-      currency: 'USD',
-      timeZone,
-      onboardingVersion: 1,
-      onboardingCompletedAt: now(),
-    }
-    if (
-      profile.displayName.length < 1 || profile.displayName.length > 100 ||
-      profile.businessName.length < 1 || profile.businessName.length > 120 ||
-      !TRADES.includes(profile.tradeType) ||
-      !PAYMENT_TERMS.includes(profile.paymentTerms) ||
-      !Number.isSafeInteger(profile.hourlyRateCents) ||
-      profile.hourlyRateCents <= 0 || profile.hourlyRateCents > 100_000_000 ||
-      !Number.isSafeInteger(profile.taxBasisPoints) ||
-      profile.taxBasisPoints < 0 || profile.taxBasisPoints > 10_000 ||
-      timeZone.length < 1 || timeZone.length > 100
-    ) {
-      setError('Check each field and enter values within the shown limits.')
-      submissionLocked.current = false
-      setSubmitting(false)
-      return
+    let profile = retainedProfile.current
+    if (!profile) {
+      const tradeType = trade.trim()
+      const selectedPaymentTerms = paymentTerms.trim()
+      const hourlyRateCents = scaledDecimal(rate, 2)
+      const taxBasisPoints = scaledDecimal(tax, 2)
+      profile = {
+        displayName: name.trim(),
+        businessName: businessName.trim(),
+        tradeType: tradeType as TradeType,
+        hourlyRateCents: hourlyRateCents ?? -1,
+        taxBasisPoints: taxBasisPoints ?? -1,
+        paymentTerms: selectedPaymentTerms as PaymentTerms,
+        countryCode: 'US',
+        currency: 'USD',
+        timeZone,
+        onboardingVersion: 1,
+        onboardingCompletedAt: now(),
+      }
+      if (
+        profile.displayName.length < 1 || profile.displayName.length > 100 ||
+        profile.businessName.length < 1 || profile.businessName.length > 120 ||
+        !TRADES.includes(profile.tradeType) ||
+        !PAYMENT_TERMS.includes(profile.paymentTerms) ||
+        !Number.isSafeInteger(profile.hourlyRateCents) ||
+        profile.hourlyRateCents <= 0 || profile.hourlyRateCents > 100_000_000 ||
+        !Number.isSafeInteger(profile.taxBasisPoints) ||
+        profile.taxBasisPoints < 0 || profile.taxBasisPoints > 10_000 ||
+        timeZone.length < 1 || timeZone.length > 100
+      ) {
+        setError('Check each field and enter values within the shown limits.')
+        submissionLocked.current = false
+        setSubmitting(false)
+        return
+      }
+      retainedProfile.current = profile
     }
     try {
       await onComplete(profile)
+      retainedProfile.current = null
+      setRetryPending(false)
     } catch {
-      setError('Unable to save your profile. Please try again.')
+      setRetryPending(true)
+      setError('Your exact setup attempt was retained. Retry the secure save when ready.')
     } finally {
       submissionLocked.current = false
       setSubmitting(false)
@@ -133,12 +145,12 @@ const OnboardingForm = ({
       <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
         <Text accessibilityRole="header" style={styles.title}>Set up FieldCraft</Text>
         <Text style={styles.subtitle}>Add only the basics needed for jobs and invoices.</Text>
-        <TextField accessibilityLabel="Your name" label="Your name" maxLength={100} onChangeText={setName} value={name} />
-        <TextField accessibilityLabel="Business name" label="Business name" maxLength={120} onChangeText={setBusinessName} value={businessName} />
-        <TextField accessibilityLabel="Trade" label="Trade" maxLength={80} onChangeText={setTrade} value={trade} />
-        <TextField accessibilityLabel="Hourly rate" keyboardType="decimal-pad" label="Hourly rate" maxLength={12} onChangeText={setRate} value={rate} />
-        <TextField accessibilityLabel="Tax percent" keyboardType="decimal-pad" label="Tax percent" maxLength={6} onChangeText={setTax} value={tax} />
-        <TextField accessibilityLabel="Payment terms" label="Payment terms" maxLength={40} onChangeText={setPaymentTerms} value={paymentTerms} />
+        <TextField accessibilityLabel="Your name" disabled={retryPending} label="Your name" maxLength={100} onChangeText={setName} value={name} />
+        <TextField accessibilityLabel="Business name" disabled={retryPending} label="Business name" maxLength={120} onChangeText={setBusinessName} value={businessName} />
+        <TextField accessibilityLabel="Trade" disabled={retryPending} label="Trade" maxLength={80} onChangeText={setTrade} value={trade} />
+        <TextField accessibilityLabel="Hourly rate" disabled={retryPending} keyboardType="decimal-pad" label="Hourly rate" maxLength={12} onChangeText={setRate} value={rate} />
+        <TextField accessibilityLabel="Tax percent" disabled={retryPending} keyboardType="decimal-pad" label="Tax percent" maxLength={6} onChangeText={setTax} value={tax} />
+        <TextField accessibilityLabel="Payment terms" disabled={retryPending} label="Payment terms" maxLength={40} onChangeText={setPaymentTerms} value={paymentTerms} />
         {error ? (
           <Text accessibilityLiveRegion="assertive" accessibilityRole="alert" style={styles.error}>
             {error}
@@ -150,7 +162,9 @@ const OnboardingForm = ({
           onPress={() => void submit()}
           style={[styles.primaryButton, submitting && styles.disabled]}
         >
-          <Text style={styles.primaryButtonText}>{submitting ? 'Saving…' : 'Finish setup'}</Text>
+          <Text style={styles.primaryButtonText}>
+            {submitting ? 'Saving…' : retryPending ? 'Retry secure save' : 'Finish setup'}
+          </Text>
         </Pressable>
       </ScrollView>
     </SafeAreaView>

@@ -61,9 +61,26 @@ language plpgsql
 security invoker
 set search_path = ''
 as $$
+declare
+  v_latest_totp_at numeric;
+  v_now numeric := extract(epoch from clock_timestamp());
 begin
   if coalesce(auth.jwt() ->> 'aal', 'aal1') <> 'aal2' then
     raise exception using errcode = '42501', message = 'AAL2_REQUIRED';
+  end if;
+  if jsonb_typeof(auth.jwt() -> 'amr') <> 'array' then
+    raise exception using errcode = '42501', message = 'RECENT_AAL2_REQUIRED';
+  end if;
+  select max((entry.value ->> 'timestamp')::numeric)
+  into v_latest_totp_at
+  from jsonb_array_elements(auth.jwt() -> 'amr') as entry(value)
+  where entry.value ->> 'method' = 'totp'
+    and jsonb_typeof(entry.value -> 'timestamp') = 'number';
+  if v_latest_totp_at is null
+    or v_latest_totp_at > v_now
+    or v_now - v_latest_totp_at > 900
+  then
+    raise exception using errcode = '42501', message = 'RECENT_AAL2_REQUIRED';
   end if;
 end;
 $$;
@@ -181,6 +198,19 @@ begin
       raise exception 'stored onboarding receipt identity is invalid' using errcode = '22023';
     end if;
     return v_response;
+  end if;
+
+  -- Onboarding is a create-once transition. The immutable receipt above is
+  -- the sole replay path; another device cannot use a fresh mutation to
+  -- rewrite a profile that has already crossed the completion boundary.
+  perform 1
+  from public.profiles as profile
+  where profile.id = v_user_id
+    and profile.onboarding_version = 1
+    and profile.onboarding_complete = true
+  for update;
+  if found then
+    raise exception 'onboarding is already complete' using errcode = '23505';
   end if;
 
   v_previous_mutation_id := current_setting('fieldcraft.mutation_id', true);

@@ -969,6 +969,31 @@ try {
       '42501',
     ))
     await db.exec(`select set_config('request.jwt.claims', '{"aal":"aal2"}', false)`)
+    await withRole('authenticated', () => expectSqlState(
+      () => db.query('select public.fieldcraft_require_aal2()'),
+      '42501',
+    ))
+
+    const nowSeconds = Math.floor(Date.now() / 1000)
+    const staleClaims = JSON.stringify({
+      aal: 'aal2',
+      amr: [{ method: 'totp', timestamp: nowSeconds - 901 }],
+    })
+    await db.query(`select set_config('request.jwt.claims', $1, false)`, [staleClaims])
+    await withRole('authenticated', () => expectSqlState(
+      () => db.query('select public.fieldcraft_require_aal2()'),
+      '42501',
+    ))
+
+    const recentClaims = JSON.stringify({
+      aal: 'aal2',
+      amr: [
+        { method: 'totp', timestamp: nowSeconds - 1_800 },
+        { method: 'password', timestamp: nowSeconds },
+        { method: 'totp', timestamp: nowSeconds - 30 },
+      ],
+    })
+    await db.query(`select set_config('request.jwt.claims', $1, false)`, [recentClaims])
     await withRole('authenticated', () => db.query('select public.fieldcraft_require_aal2()'))
   })
 
@@ -1036,6 +1061,59 @@ try {
       Number(profileChange?.payload?.onboarding_version) !== 1
     ) {
       throw new Error(`onboarding pull was ${JSON.stringify(profileChange ?? null)}`)
+    }
+  })
+
+  await verify('a fresh or late-device onboarding mutation cannot overwrite a completed profile', async () => {
+    const lateMutationId = '7a000000-0000-4000-8000-000000000099'
+    const completedAt = '2026-08-07T18:01:00.000Z'
+    const profileBefore = await db.query(
+      'select to_jsonb(profile) as profile from public.profiles as profile where id = $1',
+      [ownerId],
+    )
+    const receiptsBefore = await db.query(
+      'select count(*)::int as count from public.mutation_receipts where user_id = $1',
+      [ownerId],
+    )
+    const payload = {
+      id: ownerId,
+      ownerId,
+      displayName: 'Late Device Override',
+      businessName: 'Should Never Persist',
+      tradeType: 'General',
+      hourlyRateCents: 1,
+      taxBasisPoints: 0,
+      paymentTerms: 'Due on receipt',
+      countryCode: 'US',
+      currency: 'USD',
+      timeZone: 'UTC',
+      onboardingVersion: 1,
+      onboardingCompletedAt: completedAt,
+      version: 0,
+      createdAt: completedAt,
+      updatedAt: completedAt,
+      syncState: 'pending',
+    }
+    await expectSqlState(
+      () => db.query(
+        'select public.save_fieldcraft_onboarding($1, $2::jsonb)',
+        [lateMutationId, JSON.stringify(payload)],
+      ),
+      '23505',
+    )
+    const after = await db.query(`
+      select
+        (select to_jsonb(profile) from public.profiles as profile where id = $1) as profile,
+        (select count(*)::int from public.mutation_receipts where user_id = $1) as receipts,
+        (select count(*)::int from public.mutation_receipts
+          where user_id = $1 and mutation_id = $2) as late_receipts
+    `, [ownerId, lateMutationId])
+    if (
+      JSON.stringify(after.rows[0]?.profile) !== JSON.stringify(profileBefore.rows[0]?.profile) ||
+      after.rows[0]?.receipts !== receiptsBefore.rows[0]?.count ||
+      after.rows[0]?.late_receipts !== 0
+    ) {
+      throw new Error(`late onboarding changed durable state ${JSON.stringify(after.rows[0])}`)
     }
   })
 
@@ -1232,16 +1310,21 @@ try {
   })
 
   await verify('authenticated onboarding accepts code-point maxima and timestamp endpoints', async () => {
-    await db.exec(`select set_config('request.jwt.claim.sub', '${ownerId}', false)`)
     const endpoints = [
       '0001-01-01T00:00:00.000Z',
       '9999-12-31T23:59:59.999Z',
     ]
     for (const [index, completedAt] of endpoints.entries()) {
+      const endpointOwnerId = `70000000-0000-4000-8000-${String(index + 80).padStart(12, '0')}`
+      await db.query('insert into auth.users (id, email) values ($1, $2)', [
+        endpointOwnerId,
+        `endpoint-${index}@example.test`,
+      ])
+      await db.query(`select set_config('request.jwt.claim.sub', $1, false)`, [endpointOwnerId])
       const mutationId = `7d000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`
       const payload = {
-        id: ownerId,
-        ownerId,
+        id: endpointOwnerId,
+        ownerId: endpointOwnerId,
         displayName: '😀'.repeat(100),
         businessName: '😀'.repeat(120),
         tradeType: 'General',
@@ -1275,8 +1358,8 @@ try {
   await verify('authenticated onboarding applies and replays under owner RLS', async () => {
     const completedAt = '2026-08-07T18:00:00.000Z'
     const payload = {
-      id: ownerId,
-      ownerId,
+      id: secondOwnerId,
+      ownerId: secondOwnerId,
       displayName: 'Role Tested Owner',
       businessName: 'Role Tested Business',
       tradeType: 'General',
@@ -1293,7 +1376,7 @@ try {
       updatedAt: completedAt,
       syncState: 'pending',
     }
-    await db.exec(`select set_config('request.jwt.claim.sub', '${ownerId}', false)`)
+    await db.exec(`select set_config('request.jwt.claim.sub', '${secondOwnerId}', false)`)
     await withRole('authenticated', async () => {
       const first = await db.query(
         'select public.save_fieldcraft_onboarding($1, $2::jsonb) as response',

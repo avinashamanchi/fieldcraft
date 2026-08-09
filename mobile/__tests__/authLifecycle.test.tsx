@@ -1,6 +1,17 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native'
+import * as SecureStore from 'expo-secure-store'
 import type { PropsWithChildren } from 'react'
 import { Text } from 'react-native'
+
+jest.mock('expo-secure-store', () => {
+  const values = new Map<string, string>()
+  return {
+    __values: values,
+    getItemAsync: jest.fn(async (key: string) => values.get(key) ?? null),
+    setItemAsync: jest.fn(async (key: string, value: string) => { values.set(key, value) }),
+    deleteItemAsync: jest.fn(async (key: string) => { values.delete(key) }),
+  }
+})
 
 import {
   AuthProvider,
@@ -33,6 +44,13 @@ import type { OnboardingProfileV1 } from '../src/domain/entities'
 
 const CANONICAL_OWNER = '123e4567-e89b-12d3-a456-426614174000'
 const SECOND_CANONICAL_OWNER = '223e4567-e89b-12d3-a456-426614174000'
+const secureStoreValues = (SecureStore as typeof SecureStore & {
+  __values: Map<string, string>
+}).__values
+
+beforeEach(() => {
+  secureStoreValues.clear()
+})
 
 const verifiedSession = (userId: string, email = `${userId}@example.com`): AuthSession => ({
   user: {
@@ -154,9 +172,13 @@ class FakeDataLifecycle implements AuthDataLifecycle {
 
 class ObservableDataLifecycle extends FakeDataLifecycle {
   private boundaryOwnerId: string | null = null
+  private boundaryDeleteEpoch = 0
   private readonly boundaryListeners = new Set<() => void>()
   readonly ownerBoundary = {
-    getSnapshot: () => ({ ownerId: this.boundaryOwnerId }),
+    getSnapshot: () => ({
+      ownerId: this.boundaryOwnerId,
+      deleteEpoch: this.boundaryDeleteEpoch,
+    }),
     subscribe: (listener: () => void) => {
       this.boundaryListeners.add(listener)
       return () => this.boundaryListeners.delete(listener)
@@ -165,6 +187,11 @@ class ObservableDataLifecycle extends FakeDataLifecycle {
 
   private publishBoundary(ownerId: string | null) {
     this.boundaryOwnerId = ownerId
+    for (const listener of this.boundaryListeners) listener()
+  }
+
+  beginSameOwnerDelete(): void {
+    this.boundaryDeleteEpoch += 1
     for (const listener of this.boundaryListeners) listener()
   }
 
@@ -182,12 +209,16 @@ class ObservableDataLifecycle extends FakeDataLifecycle {
 class FirstPullDataLifecycle extends FakeDataLifecycle {
   private readonly hydratedOwners = new Set<string>()
   private readonly waiters = new Map<string, (() => void)[]>()
+  hasCompletedFailure: unknown = null
+  waitFailure: unknown = null
 
   async hasCompletedInitialPull(ownerId: string): Promise<boolean> {
+    if (this.hasCompletedFailure) throw this.hasCompletedFailure
     return this.hydratedOwners.has(ownerId)
   }
 
   waitForInitialPull(ownerId: string): Promise<void> {
+    if (this.waitFailure) return Promise.reject(this.waitFailure)
     if (this.hydratedOwners.has(ownerId)) return Promise.resolve()
     return new Promise<void>((resolve) => {
       this.waiters.set(ownerId, [...(this.waiters.get(ownerId) ?? []), resolve])
@@ -296,6 +327,33 @@ it('keeps first-login cached app data unhydrated until a full cloud pull, then p
   revisit.unmount()
 })
 
+it.each(['hasCompletedInitialPull', 'waitForInitialPull'] as const)(
+  'fails closed when %s rejects instead of leaving hydration pending',
+  async (failurePoint) => {
+    const consoleError = jest.spyOn(console, 'error').mockImplementation(() => {})
+    const service = new FakeAuthService()
+    service.session = verifiedSession(CANONICAL_OWNER)
+    const dataLifecycle = new FirstPullDataLifecycle()
+    const failure = new Error('initial pull provider-secret')
+    if (failurePoint === 'hasCompletedInitialPull') dataLifecycle.hasCompletedFailure = failure
+    else dataLifecycle.waitFailure = failure
+
+    const view = renderProvider(service, dataLifecycle)
+
+    await waitFor(() => expect(readState()).toMatchObject({
+      status: 'storageError',
+      message: expect.stringContaining('Local data could not be prepared securely.'),
+    }))
+    expect(dataLifecycle.activeOwnerId).toBeNull()
+    expect(consoleError).toHaveBeenCalledWith(
+      '[FieldCraft boot] Initial cloud hydration failed.',
+      failure,
+    )
+    consoleError.mockRestore()
+    view.unmount()
+  },
+)
+
 it('rejects noncanonical session owners and preserves auth events and sign-out scope', async () => {
   const signOut = jest.fn().mockResolvedValue({ data: {}, error: null })
   const callbacks: Array<(event: string, session: never) => void> = []
@@ -395,6 +453,24 @@ it('invalidates the owner lease when the initialized repository resets outside a
   view.unmount()
 })
 
+it('invalidates the owner lease when the current repository begins a same-owner delete epoch', async () => {
+  const service = new FakeAuthService()
+  service.session = verifiedSession(CANONICAL_OWNER)
+  const dataLifecycle = new ObservableDataLifecycle()
+  const view = render(
+    <AuthProvider appState={new FakeAppState()} dataLifecycle={dataLifecycle} service={service}>
+      <LeaseProbe />
+    </AuthProvider>,
+  )
+  await waitFor(() => expect(observedLease?.ownerId).toBe(CANONICAL_OWNER))
+
+  act(() => dataLifecycle.beginSameOwnerDelete())
+
+  await waitFor(() => expect(observedLease).toBeNull())
+  expect(dataLifecycle.activeOwnerId).toBeNull()
+  view.unmount()
+})
+
 it('never reissues the same owner lease tuple after an auth-provider relaunch', async () => {
   const service = new FakeAuthService()
   service.session = verifiedSession(CANONICAL_OWNER)
@@ -438,9 +514,68 @@ it('invalidates repository access before a local or global provider sign-out can
 
   expect(observedLease).toBeNull()
   expect(dataLifecycle.calls.at(-1)).toBe('deactivate')
-  expect(service.signOut).toHaveBeenCalledWith('global')
+  await waitFor(() => expect(service.signOut).toHaveBeenCalledWith('global'))
   finishSignOut()
   await signingOut
+  view.unmount()
+})
+
+it('durably records owner erasure before provider sign-out and clears the record after local deletion', async () => {
+  const markGate = deferred()
+  const ordering: string[] = []
+  const erasureRegistry = {
+    async list(): Promise<readonly string[]> { return [] },
+    async mark(ownerId: string): Promise<void> {
+      ordering.push(`mark:${ownerId}`)
+      await markGate.promise
+    },
+    async clear(ownerId: string): Promise<void> {
+      ordering.push(`journal-clear:${ownerId}`)
+    },
+  }
+  const service = new FakeAuthService()
+  service.session = verifiedSession(CANONICAL_OWNER)
+  service.signOut = jest.fn(async () => { ordering.push('provider-sign-out') })
+  const dataLifecycle = new FakeDataLifecycle()
+  const originalClear = dataLifecycle.clearOwner.bind(dataLifecycle)
+  dataLifecycle.clearOwner = async (ownerId: string) => {
+    ordering.push(`local-clear:${ownerId}`)
+    await originalClear(ownerId)
+  }
+  const view = render(
+    <AuthProvider
+      appState={new FakeAppState()}
+      dataLifecycle={dataLifecycle}
+      erasureRegistry={erasureRegistry}
+      service={service}
+    >
+      <LeaseProbe />
+    </AuthProvider>,
+  )
+  await waitFor(() => expect(observedLease?.ownerId).toBe(CANONICAL_OWNER))
+
+  let signingOut!: Promise<void>
+  act(() => { signingOut = observedSignOut!('global') })
+
+  expect(observedLease).toBeNull()
+  await waitFor(() => expect(ordering).toEqual([`mark:${CANONICAL_OWNER}`]))
+  expect(service.signOut).not.toHaveBeenCalled()
+
+  await act(async () => {
+    markGate.resolve(undefined)
+    await signingOut
+  })
+  expect(ordering).toEqual(expect.arrayContaining([
+    `local-clear:${CANONICAL_OWNER}`,
+    'provider-sign-out',
+    `journal-clear:${CANONICAL_OWNER}`,
+  ]))
+  expect(ordering.indexOf(`mark:${CANONICAL_OWNER}`)).toBeLessThan(
+    ordering.indexOf('provider-sign-out'),
+  )
+  expect(ordering.indexOf(`local-clear:${CANONICAL_OWNER}`)).toBeLessThan(
+    ordering.indexOf(`journal-clear:${CANONICAL_OWNER}`),
+  )
   view.unmount()
 })
 
@@ -564,6 +699,45 @@ it('retains failed owner clears across remount and drains them before hydrating 
   expect(dataLifecycle.calls.slice(callsBeforeRemount)).not.toContain(
     `initialize:${SECOND_CANONICAL_OWNER}`,
   )
+
+  await act(async () => {
+    clearGate.resolve(undefined)
+    await Promise.resolve()
+  })
+  await waitFor(() => expect(observedLease?.ownerId).toBe(SECOND_CANONICAL_OWNER))
+  second.unmount()
+})
+
+it('drains a durable failed erasure after an app-process restart before hydrating another owner', async () => {
+  const firstService = new FakeAuthService()
+  firstService.session = verifiedSession(CANONICAL_OWNER)
+  const firstData = new FakeDataLifecycle()
+  firstData.clearFailures.add(CANONICAL_OWNER)
+  const first = render(
+    <AuthProvider appState={new FakeAppState()} dataLifecycle={firstData} service={firstService}>
+      <StateProbe />
+      <LeaseProbe />
+    </AuthProvider>,
+  )
+  await waitFor(() => expect(observedLease?.ownerId).toBe(CANONICAL_OWNER))
+  act(() => firstService.emit(null, 'INVALID_SESSION'))
+  await waitFor(() => expect(readState()).toMatchObject({ status: 'storageError' }))
+  first.unmount()
+
+  const clearGate = deferred()
+  const secondService = new FakeAuthService()
+  secondService.session = verifiedSession(SECOND_CANONICAL_OWNER)
+  const secondData = new FakeDataLifecycle()
+  secondData.clearers.set(CANONICAL_OWNER, clearGate.promise)
+  const second = render(
+    <AuthProvider appState={new FakeAppState()} dataLifecycle={secondData} service={secondService}>
+      <StateProbe />
+      <LeaseProbe />
+    </AuthProvider>,
+  )
+
+  await waitFor(() => expect(secondData.calls).toContain(`clear:${CANONICAL_OWNER}`))
+  expect(secondData.calls).not.toContain(`initialize:${SECOND_CANONICAL_OWNER}`)
 
   await act(async () => {
     clearGate.resolve(undefined)
@@ -1080,9 +1254,7 @@ it('retains an outstanding owner-clear gate across provider remount', async () =
 
   service.session = verifiedSession('owner-remount')
   const second = renderProvider(service, dataLifecycle)
-  await waitFor(() =>
-    expect(readState()).toMatchObject({ userId: 'owner-remount', hydrated: false }),
-  )
+  await waitFor(() => expect(readState()).toEqual({ status: 'initializing' }))
   expect(
     dataLifecycle.calls.filter((call) => call === 'initialize:owner-remount'),
   ).toHaveLength(1)
@@ -1556,4 +1728,34 @@ it('submits the complete bounded onboarding profile once on a duplicate tap', as
     'tradeType',
   ].sort())
   await act(async () => finish())
+})
+
+it('retries the exact retained onboarding payload and completion timestamp after failure', async () => {
+  const onComplete = jest.fn<Promise<void>, [OnboardingProfileV1]>()
+    .mockRejectedValueOnce(new Error('offline'))
+    .mockResolvedValueOnce(undefined)
+  const now = jest.fn()
+    .mockReturnValueOnce('2026-08-07T18:00:00.000Z')
+    .mockReturnValueOnce('2026-08-07T18:05:00.000Z')
+  render(<OnboardingScreen onComplete={onComplete} now={now} timeZone="America/Los_Angeles" />)
+  fireEvent.changeText(screen.getByLabelText('Your name'), 'Avi Builder')
+  fireEvent.changeText(screen.getByLabelText('Business name'), 'FieldCraft Plumbing')
+  fireEvent.changeText(screen.getByLabelText('Trade'), 'Plumbing')
+  fireEvent.changeText(screen.getByLabelText('Hourly rate'), '125.50')
+  fireEvent.changeText(screen.getByLabelText('Tax percent'), '8.75')
+  fireEvent.changeText(screen.getByLabelText('Payment terms'), 'Net 30')
+
+  fireEvent.press(screen.getByRole('button', { name: 'Finish setup' }))
+  await waitFor(() => expect(screen.getByRole('alert').props.children).toContain(
+    'exact setup attempt was retained',
+  ))
+  expect(screen.getByLabelText('Your name').props.editable).toBe(false)
+
+  fireEvent.press(screen.getByRole('button', { name: 'Retry secure save' }))
+  await waitFor(() => expect(onComplete).toHaveBeenCalledTimes(2))
+
+  expect(onComplete.mock.calls[1][0]).toEqual(onComplete.mock.calls[0][0])
+  expect(onComplete.mock.calls[1][0]).toBe(onComplete.mock.calls[0][0])
+  expect(onComplete.mock.calls[1][0].onboardingCompletedAt).toBe('2026-08-07T18:00:00.000Z')
+  expect(now).toHaveBeenCalledTimes(1)
 })
