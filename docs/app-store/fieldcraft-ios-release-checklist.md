@@ -65,8 +65,12 @@ Observed warnings/limitations: Vite reported a web chunk above 500 kB after mini
 - [ ] App Store Connect app record and matching bundle ID `com.avinashamanchi.fieldcraft`.
 - [ ] Production archive built with Xcode 26+ and iOS 26 SDK+ (requirement recheck observed 2026-08-06; recheck again on build day).
 - [ ] Required-reason API/privacy manifest report passes for the archive.
-- [ ] Export compliance and current age-rating questionnaire completed.
+- [ ] Export compliance and Apple's updated age-rating questionnaire completed for the exact submitted version.
 - [ ] App Privacy including Purchase History, support URL, privacy URL, Terms of Use, description, keywords, review notes, and private review account completed.
+- [ ] Accessibility Nutrition Label answers are based on the signed-device VoiceOver, Voice Control, Larger Text, contrast, and Reduce Motion results above; no unverified support is claimed.
+- [ ] Product page name, icon, subtitle, description, promotional text, keywords, and 1–10 screenshots are complete, accurate, localized where offered, and contain no placeholder or private data.
+- [ ] Required device capabilities and every generated Info.plist usage description match the exact archive and are exercised on a current iOS 26 device.
+- [ ] Mac with Apple silicon and Apple Vision Pro availability are explicitly disabled for v1 unless the exact signed iPhone build is separately tested and supported there.
 - [ ] Primary language, SKU, seller/copyright, categories, content rights, storefront availability, and Digital Services Act status completed by the account holder.
 - [ ] Monthly and annual subscription localizations, durations, price points, availability, review details, and review screenshots completed.
 - [ ] iPhone 6.9-inch screenshot set captured from the signed build and validated without alpha.
