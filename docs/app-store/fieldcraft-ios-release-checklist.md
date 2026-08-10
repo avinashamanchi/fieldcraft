@@ -1,10 +1,10 @@
 # FieldCraft iOS release checklist
 
-Last updated: 2026-08-09. `PASS` means directly observed evidence for the current scoped candidate. `BLOCKED` means credentials, provider state, hardware, a missing local tool, or App Store Connect are still required. Blank boxes are not complete.
+Last updated: 2026-08-10. `PASS` means directly observed evidence for the current scoped candidate. `BLOCKED` means credentials, provider state, hardware, a missing local tool, or App Store Connect are still required. Blank boxes are not complete.
 
 ## Local implementation and CI
 
-- [x] Candidate parent SHA is `93bd314`; the scoped release/migration diff is verified below and must be identified by its resulting Git commit before any upload.
+- [x] The implementation baseline through `3a92881` is identified; this checklist refresh is documentation-only and no upload is inferred.
 - [x] Root tests, typecheck, lint, web build, and redacted secret scan passed under Node 22.
 - [x] Mobile Jest, typecheck, lint, Expo Doctor, and iOS export passed under Node 22.
 - [x] Supabase migration boundary and 42 PGlite database checks passed; the mobile suite includes a real SQLite grammar test for every migration.
@@ -23,12 +23,12 @@ Last updated: 2026-08-09. `PASS` means directly observed evidence for the curren
 
 | Gate | Observed result |
 |---|---|
-| Runtime | Node `22.22.0` used through the pinned local runner; workflows pin Node `22.22.0` |
-| Root tests | 3 files, 19 tests passed |
-| Mobile tests | 50 suites, 572 tests passed |
+| Runtime | Node `22.23.2` used for the fresh local gates; workflows retain their pinned Node 22 runner |
+| Root tests | 3 files, 22 tests passed |
+| Mobile tests | 50 suites, 579 tests passed |
 | Database | Migration boundary and 42 PGlite checks passed; Node's real SQLite parser accepted the complete mobile migration chain |
 | Edge | Not rerun locally because Deno is unavailable; dynamic CI gates remain mandatory before release |
-| Expo | Doctor 18/18; the exact staged snapshot exported its iOS bundle from 955 modules without an ignored local demo environment |
+| Expo | Doctor 18/18; the exact staged snapshot exported its iOS bundle from 1,749 modules with a 7.3 MB Hermes bundle without an ignored local demo environment |
 | Security | Root production audit: 0; the strict mobile gate accepted only the 12 transitive Expo/Metro findings rooted in the two reviewed advisories and rejects any new high/critical advisory; tracked/export secret scan passed; exact icon: 1024×1024 PNG, RGB, no alpha |
 | Workflows | Release-readiness remains manual-only and has no deploy/submit command; YAML parse is part of the final scoped snapshot gate |
 
@@ -53,7 +53,7 @@ Observed warnings/limitations: Vite reported a web chunk above 500 kB after mini
 - [ ] EAS public environment contains the production Supabase URL/publishable key; no service-role/provider secret is present in the app or web bundles.
 - [ ] Account deletion removes the authenticated user, owner-scoped logo, synced records, local cache, outbox, conflicts, session, consent, and temporary artifacts.
 - [ ] Published privacy/terms/support pages exactly match production collection, retention, processors, deletion behavior, and product limits.
-- [ ] Anonymous release check on 2026-08-09 returned HTTP 404 for Privacy, Terms, and Support; all three must return HTTPS 200 before submission.
+- [ ] Anonymous release check on 2026-08-10 returned HTTP 404 for Privacy, Terms, and Support; all three must return HTTPS 200 before submission.
 - [ ] App Store privacy answers match the final production binary and deployed services.
 - [ ] RevenueCat App Store app, `FieldCraft Pro` subscription group, exact products, `pro` entitlement, `default` offering, webhook secret, and restore-transfer behavior are configured and directly verified.
 
@@ -76,4 +76,4 @@ Observed warnings/limitations: Vite reported a web chunk above 500 kB after mini
 
 ## Current stop condition
 
-Local release engineering can continue without credentials. EAS reported `Not logged in` on 2026-08-09, Deno is unavailable, and this Mac has Command Line Tools rather than full Xcode (CocoaPods 1.17.0 alone is insufficient). Deployment, signed-device native validation, sandbox purchases, TestFlight, and App Store submission stop until the user personally completes Supabase, RevenueCat, Expo, and Apple account prompts. No credential should be pasted into chat, source, shell history, CI logs, or this checklist.
+Local release engineering can continue without credentials. EAS reported `Not logged in` on 2026-08-09, Deno remains unavailable on 2026-08-10, and this Mac has Command Line Tools rather than full Xcode (CocoaPods 1.17.0 alone is insufficient). Deployment, signed-device native validation, sandbox purchases, TestFlight, and App Store submission stop until the user personally completes Supabase, RevenueCat, Expo, and Apple account prompts. No credential should be pasted into chat, source, shell history, CI logs, or this checklist.
