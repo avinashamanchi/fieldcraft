@@ -11,6 +11,8 @@ describe('redacted secret scanner', () => {
     ['fixture.json', '{"GROQ_API_KEY":"gsk_123456789012345678901234"}', 'provider-api-key'],
     ['fixture.yaml', 'SUPABASE_SERVICE_ROLE_KEY: service_role_12345678901234567890', 'private-env-assignment'],
     ['fixture.sh', 'export AI_RATE_LIMIT_HMAC_SECRET=abcdef0123456789abcdef0123456789', 'private-env-assignment'],
+    ['fixture.env', 'REVENUECAT_WEBHOOK_SECRET=authorization-secret-value-123456789', 'private-env-assignment'],
+    ['fixture.env', 'REVENUECAT_WEBHOOK_SIGNING_SECRET=signing-secret-value-1234567890123', 'private-env-assignment'],
     ['fixture.txt', 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456', 'bearer-token'],
   ])('reports only path, rule, and count for %s', (path, value, expectedRule) => {
     const findings = scanSecretText(path, value)

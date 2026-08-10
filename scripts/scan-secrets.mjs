@@ -23,7 +23,7 @@ export const SECRET_RULES = [
   { id: 'jwt-token', pattern: /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g },
   {
     id: 'private-env-assignment',
-    pattern: /\b(?:GROQ_API_KEY|OPENAI_API_KEY|SUPABASE_SERVICE_ROLE_KEY|AI_RATE_LIMIT_HMAC_SECRET|EXPO_TOKEN|APPLE_APP_SPECIFIC_PASSWORD)\b[ \t]*[:=][ \t]*["']?(?!\$\{|process\.env|Deno\.env|<|REDACTED\b|replace-me\b)[A-Za-z0-9._~+\/-]{12,}/g,
+    pattern: /\b(?:GROQ_API_KEY|OPENAI_API_KEY|SUPABASE_SERVICE_ROLE_KEY|AI_RATE_LIMIT_HMAC_SECRET|REVENUECAT_WEBHOOK_SECRET|REVENUECAT_WEBHOOK_SIGNING_SECRET|EXPO_TOKEN|APPLE_APP_SPECIFIC_PASSWORD)\b[ \t]*[:=][ \t]*["']?(?!\$\{|process\.env|Deno\.env|<|REDACTED\b|replace-me\b)[A-Za-z0-9._~+\/-]{12,}/g,
   },
 ]
 
