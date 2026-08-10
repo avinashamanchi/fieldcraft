@@ -1,15 +1,14 @@
 # FieldCraft iOS screenshot matrix
 
-Official Apple screenshot specifications rechecked 2026-08-06. App Store Connect accepts 1–10 screenshots per device size, in PNG/JPEG without alpha.
+Official Apple screenshot specifications rechecked 2026-08-09. App Store Connect accepts 1–10 screenshots per device size, in PNG/JPEG without alpha.
 
-## Required device sets for the current universal build
+## Required device set for the first iPhone-only build
 
 | Set | Accepted portrait pixels | Status | Required scenes |
 |---|---:|---|---|
 | iPhone 6.9-inch | 1260×2736, 1290×2796, or 1320×2868 | Not captured | Dashboard; local job entry; invoice review; jobs/offline state; privacy controls |
-| iPad 13-inch | 2064×2752 or 2048×2732 | Not captured | Dashboard; local job entry; invoice review; jobs/offline state; privacy controls |
 
-If iPhone 6.9-inch images are not supplied, Apple currently requires the 6.5-inch set (1284×2778 or 1242×2688). FieldCraft will supply 6.9-inch rather than rely on scaling. Because `supportsTablet` is true, the 13-inch iPad set is required.
+If iPhone 6.9-inch images are not supplied, Apple currently requires the 6.5-inch set (1284×2778 or 1242×2688). FieldCraft will supply 6.9-inch rather than rely on scaling. The first release sets `supportsTablet` to false because an iPad layout and physical-device matrix have not been validated. iPad support can be enabled in a later tested version.
 
 ## Capture rules
 
@@ -30,3 +29,5 @@ If iPhone 6.9-inch images are not supplied, Apple currently requires the 6.5-inc
 5. `Privacy choices in the app` — AI consent, sync diagnostics, deletion, and policy links.
 
 Every final image remains blocked until it is captured from the signed build and visually reviewed at exact pixel dimensions.
+
+Keep each overlay to one short benefit in plain customer language. At App Store thumbnail size, the headline and real product screen must remain understandable without reading the long description.

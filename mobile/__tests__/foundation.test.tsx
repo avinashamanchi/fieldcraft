@@ -5,6 +5,8 @@ import RootLayout, { ProductRouteBoundary } from '../app/_layout'
 import appConfig from '../app.config'
 import { colors } from '../src/theme/tokens'
 
+const easConfig = require('../eas.json')
+
 let mockAuthState: { status: string; userId?: string; email?: string; hydrated?: boolean; message?: string } = { status: 'signedOut' }
 let mockSegments: string[] = ['(tabs)']
 let mockLease: { ownerId: string; sessionGeneration: number; repositoryRevision: number } | null = null
@@ -65,6 +67,26 @@ it('uses the exact FieldCraft iOS identity', () => {
   expect(config.scheme).toBe('fieldcraft')
   expect(config.ios?.bundleIdentifier).toBe('com.avinashamanchi.fieldcraft')
   expect(config.ios?.buildNumber).toBe('1')
+  expect(config.ios?.usesAppleSignIn).toBe(false)
+  expect(config.ios?.supportsTablet).toBe(false)
+  expect(config.ios?.infoPlist?.ITSAppUsesNonExemptEncryption).toBe(false)
+  expect(config.updates).toEqual({ enabled: false })
+  expect(config.extra).toMatchObject({
+    privacyPolicyUrl: 'https://avinashamanchi.github.io/fieldcraft/privacy.html',
+    supportUrl: 'https://avinashamanchi.github.io/fieldcraft/support.html',
+    termsOfUseUrl: 'https://avinashamanchi.github.io/fieldcraft/terms.html',
+  })
+})
+
+it('uses remote build-number auto-increment without submission credentials', () => {
+  expect(easConfig.cli).toMatchObject({ appVersionSource: 'remote', requireCommit: true })
+  expect(easConfig.build.production).toEqual({
+    distribution: 'store',
+    autoIncrement: true,
+    ios: { image: 'auto' },
+  })
+  expect(easConfig).not.toHaveProperty('submit')
+  expect(JSON.stringify(easConfig)).not.toMatch(/appleId|ascApiKey|password/i)
 })
 
 it('mounts the native root', () => {

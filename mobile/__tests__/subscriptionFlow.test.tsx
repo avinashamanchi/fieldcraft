@@ -1,4 +1,5 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react-native'
+import { Linking } from 'react-native'
 import type { AuthenticatedOwnerLease } from '../src/auth/AuthProvider'
 import SubscriptionScreen from '../app/subscription'
 import {
@@ -185,6 +186,7 @@ describe('SubscriptionScreen', () => {
   })
 
   it('renders StoreKit prices, renewal terms, and working purchase controls', async () => {
+    const openURL = jest.spyOn(Linking, 'openURL').mockResolvedValue(true)
     const purchase = jest.fn(async () => 'cancelled' as const)
     const restore = jest.fn(async () => providerPro)
     const manage = jest.fn(async () => {})
@@ -215,8 +217,11 @@ describe('SubscriptionScreen', () => {
     await waitFor(() => expect(restore).toHaveBeenCalledTimes(1))
     fireEvent.press(screen.getByText('Manage subscription with Apple'))
     await waitFor(() => expect(manage).toHaveBeenCalledTimes(1))
-    fireEvent.press(screen.getByText('Privacy, terms & support'))
-    expect(mockRouterPush).toHaveBeenCalledWith('/privacy')
+    fireEvent.press(screen.getByText('Privacy Policy'))
+    fireEvent.press(screen.getByText('Terms of Use'))
+    expect(openURL).toHaveBeenNthCalledWith(1, 'https://avinashamanchi.github.io/fieldcraft/privacy.html')
+    expect(openURL).toHaveBeenNthCalledWith(2, 'https://avinashamanchi.github.io/fieldcraft/terms.html')
+    openURL.mockRestore()
   })
 
   it('explains that Expo Go cannot purchase or grant Pro', async () => {

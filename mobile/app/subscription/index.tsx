@@ -1,10 +1,13 @@
 import { useEffect } from 'react'
 import { router } from 'expo-router'
-import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native'
+import { ActivityIndicator, Linking, Pressable, StyleSheet, Text, View } from 'react-native'
 
 import { useSubscription } from '../../src/billing/SubscriptionProvider'
 import { Screen } from '../../src/components/Screen'
 import { colors, MIN_TOUCH_TARGET, spacing, typography } from '../../src/theme/tokens'
+
+const PRIVACY_URL = 'https://avinashamanchi.github.io/fieldcraft/privacy.html'
+const TERMS_URL = 'https://avinashamanchi.github.io/fieldcraft/terms.html'
 
 export default function SubscriptionScreen() {
   const subscription = useSubscription()
@@ -62,8 +65,11 @@ export default function SubscriptionScreen() {
       <Pressable accessibilityRole="button" disabled={subscription.busy} onPress={() => void subscription.manage()} style={styles.secondary}>
         <Text style={styles.secondaryText}>Manage subscription with Apple</Text>
       </Pressable>
-      <Pressable accessibilityRole="link" onPress={() => router.push('/privacy' as never)} style={styles.secondary}>
-        <Text style={styles.secondaryText}>Privacy, terms & support</Text>
+      <Pressable accessibilityRole="link" onPress={() => { void Linking.openURL(PRIVACY_URL) }} style={styles.secondary}>
+        <Text style={styles.secondaryText}>Privacy Policy</Text>
+      </Pressable>
+      <Pressable accessibilityRole="link" onPress={() => { void Linking.openURL(TERMS_URL) }} style={styles.secondary}>
+        <Text style={styles.secondaryText}>Terms of Use</Text>
       </Pressable>
     </Screen>
   )

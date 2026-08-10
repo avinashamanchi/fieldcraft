@@ -24,7 +24,7 @@ export default function SettingsScreen() {
       <Pressable accessibilityRole="button" onPress={() => router.push('/settings/ai' as never)} style={styles.row}><Text style={styles.label}>AI & consent</Text></Pressable>
       <Pressable accessibilityRole="button" onPress={() => router.push('/settings/sync' as never)} style={styles.row}><Text style={styles.label}>Sync diagnostics</Text></Pressable>
       <Pressable accessibilityRole="button" onPress={() => router.push('/security/mfa' as never)} style={styles.row}><Text style={styles.label}>Authenticator security</Text></Pressable>
-      <Pressable accessibilityRole="button" onPress={() => router.push('/privacy' as never)} style={styles.row}><Text style={styles.label}>Privacy policy & support</Text></Pressable>
+      <Pressable accessibilityRole="button" onPress={() => router.push('/privacy' as never)} style={styles.row}><Text style={styles.label}>Privacy, terms & support</Text></Pressable>
       <Pressable accessibilityRole="button" onPress={() => router.push('/settings/delete-data' as never)} style={styles.row}><Text style={styles.danger}>Delete local data</Text></Pressable>
       <Pressable accessibilityRole="button" onPress={() => router.push('/settings/delete-account' as never)} style={styles.row}><Text style={styles.danger}>Delete account</Text></Pressable>
       <Pressable accessibilityRole="button" onPress={() => void signOut('local')} style={styles.row}><Text style={styles.label}>Sign out on this device</Text></Pressable>

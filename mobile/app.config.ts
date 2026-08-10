@@ -18,13 +18,16 @@ export default function appConfig(_context: ConfigContext): ExpoConfig {
     orientation: 'portrait',
     scheme: 'fieldcraft',
     userInterfaceStyle: 'automatic',
+    updates: { enabled: false },
     newArchEnabled: true,
     ios: {
       bundleIdentifier: 'com.avinashamanchi.fieldcraft',
       buildNumber: '1',
       icon: './assets/icon.png',
-      supportsTablet: true,
+      supportsTablet: false,
+      usesAppleSignIn: false,
       infoPlist: {
+        ITSAppUsesNonExemptEncryption: false,
         NSMicrophoneUsageDescription: 'FieldCraft uses the microphone only while you record a job description for an editable invoice draft.',
         NSSpeechRecognitionUsageDescription: 'FieldCraft converts your spoken job description into editable text on this device.',
         NSCameraUsageDescription: 'FieldCraft uses the camera only when you choose to scan a receipt on this device.',
@@ -40,6 +43,11 @@ export default function appConfig(_context: ConfigContext): ExpoConfig {
     ],
     experiments: {
       typedRoutes: true,
+    },
+    extra: {
+      privacyPolicyUrl: 'https://avinashamanchi.github.io/fieldcraft/privacy.html',
+      supportUrl: 'https://avinashamanchi.github.io/fieldcraft/support.html',
+      termsOfUseUrl: 'https://avinashamanchi.github.io/fieldcraft/terms.html',
     },
   }
 }

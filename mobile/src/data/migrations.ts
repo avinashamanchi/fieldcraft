@@ -160,6 +160,7 @@ const VERSION_FOUR_SCHEMA = `
     UNION SELECT owner_id FROM metadata
     UNION SELECT owner_id FROM sync_bootstrap_records
   ) AS owners
+  WHERE true
   ON CONFLICT(owner_id, key) DO UPDATE SET value = excluded.value;
 
   UPDATE outbox

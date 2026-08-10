@@ -1,36 +1,43 @@
 # FieldCraft iOS release checklist
 
-Last updated: 2026-08-06. `PASS` means directly observed evidence. `BLOCKED` means credentials, provider state, hardware, or App Store Connect are still required. Blank boxes are not complete.
+Last updated: 2026-08-09. `PASS` means directly observed evidence for the current scoped candidate. `BLOCKED` means credentials, provider state, hardware, a missing local tool, or App Store Connect are still required. Blank boxes are not complete.
 
 ## Local implementation and CI
 
-- [x] Verified implementation SHA: `2b51a4eff9814f91612159788e478ce3cd0da35c`.
-- [x] Fresh no-hardlink clone was clean before and after verification, including native prebuild.
-- [x] Root clean install, tests, typecheck, lint, web build, and redacted secret scan passed.
-- [x] Mobile clean install, Jest, typecheck, lint, Expo Doctor, and iOS export passed.
-- [x] Supabase migration boundary, PGlite, Deno format/lint/tests/check passed.
+- [x] Candidate parent SHA is `93bd314`; the scoped release/migration diff is verified below and must be identified by its resulting Git commit before any upload.
+- [x] Root tests, typecheck, lint, web build, and redacted secret scan passed under Node 22.
+- [x] Mobile Jest, typecheck, lint, Expo Doctor, and iOS export passed under Node 22.
+- [x] Supabase migration boundary and 42 PGlite database checks passed; the mobile suite includes a real SQLite grammar test for every migration.
+- [ ] Deno format, lint, Edge tests, and Edge entrypoint checks for this candidate. `BLOCKED: Deno is not installed on this Mac; CI retains these gates.`
 - [x] CI, deploy, release-readiness, and Maestro YAML parsed; release readiness is manual-only and has no deploy/submit command.
-- [x] Root and mobile audits reported zero vulnerabilities at the verified SHA.
+- [x] Root production dependency audit reported zero vulnerabilities.
+- [ ] Mobile production dependency audit is clear. The 2026-08-09 audit reports 12 high transitive findings from `image-size@1.2.1` through Expo/Metro; every published `image-size` version through 2.0.2 is currently covered, and npm proposes only breaking Expo/React Native downgrades. Do not force that remediation.
 - [x] 1024×1024 opaque RGB icon validated and configured.
+- [x] First release is explicitly iPhone-only; the unverified iPad target and 13-inch screenshot obligation were removed from the v1 configuration.
+- [x] Authentication is email/password only; no third-party or social login is offered, and the iOS config explicitly declares that Sign in with Apple is not used.
+- [x] Production EAS profile uses store distribution, the SDK-selected Xcode image, remote build-number auto-increment, and contains no submission credentials.
+- [x] Production builds fail closed without a RevenueCat Apple public SDK key; FieldCraft Pro uses the exact monthly/annual products and StoreKit-localized prices, provides restore/manage controls, and never grants Pro in Expo Go.
+- [x] The paywall and in-app legal screen expose separate Privacy Policy and Terms of Use controls. Public drafts disclose Apple/RevenueCat purchase processing, Free limits, renewal/cancellation, downgrade behavior, and that account deletion does not cancel an Apple subscription.
 
 ### Observed clean-clone evidence
 
 | Gate | Observed result |
 |---|---|
-| Runtime | Node `v22.23.2`; workflows pin Node `22.22.0` |
+| Runtime | Node `22.22.0` used through the pinned local runner; workflows pin Node `22.22.0` |
 | Root tests | 3 files, 19 tests passed |
-| Mobile tests | 43 suites, 364 tests passed |
-| Database | 27 PGlite checks passed |
-| Edge | 9 files formatted/linted; 11 tests passed; both production entry points passed `deno check` |
-| Expo | Doctor 18/18; iOS bundle exported from 1,699 modules; native iOS project prebuild passed without tracked changes |
-| Security | Root and mobile npm audit: 0; tracked/bundle secret scan passed; exact icon: 1024×1024 PNG, RGB, no alpha |
-| Workflows | Four YAML files parsed successfully; final clone had no tracked diff |
+| Mobile tests | 50 suites, 572 tests passed |
+| Database | Migration boundary and 42 PGlite checks passed; Node's real SQLite parser accepted the complete mobile migration chain |
+| Edge | Not rerun locally because Deno is unavailable; dynamic CI gates remain mandatory before release |
+| Expo | Doctor 18/18; the exact staged snapshot exported its iOS bundle from 955 modules without an ignored local demo environment |
+| Security | Root production audit: 0; mobile production audit: 12 high transitive Expo/Metro findings recorded above; tracked/export secret scan passed; exact icon: 1024×1024 PNG, RGB, no alpha |
+| Workflows | Release-readiness remains manual-only and has no deploy/submit command; YAML parse is part of the final scoped snapshot gate |
 
-Observed non-fatal warnings: Vite reported a web chunk above 500 kB after minification; npm reported deprecated transitive test/build packages and install-script approval notices. These did not create audit findings. Full Xcode and CocoaPods are not installed on this Mac, so a Swift/Pods compile and signed archive were not run.
+Observed warnings/limitations: Vite reported a web chunk above 500 kB after minification; Node labels its built-in SQLite API experimental; the mobile audit risk is recorded above. CocoaPods 1.17.0 is installed, but the selected developer directory is Command Line Tools and no usable full Xcode archive proof exists, so a Swift/Pods compile and signed archive were not run.
 
 ## iPhone and accessibility
 
-- [ ] Expo Go checkpoint observed by the user: authentication/mock path, quick local invoice, review/save, navigation, lists, cached/offline behavior, settings, privacy, and supported PDF/share behavior.
+- [x] Expo Go launch and dashboard were observed by the user after the real SQLite migration parser defect was corrected on 2026-08-07.
+- [ ] Quick local invoice, review/save, navigation, lists, cached/offline behavior, settings, privacy, and supported PDF/share behavior on a physical iPhone.
 - [ ] 200% Dynamic Type observed on a physical iPhone without lost controls or clipped required text.
 - [ ] VoiceOver reading order, names, values, alerts, modal behavior, and focus restoration observed.
 - [ ] Reduce Motion behavior observed.
@@ -45,22 +52,28 @@ Observed non-fatal warnings: Vite reported a web chunk above 500 kB after minifi
 - [ ] Functions deploy and synthetic consented requests pass with content-free logs.
 - [ ] EAS public environment contains the production Supabase URL/publishable key; no service-role/provider secret is present in the app or web bundles.
 - [ ] Account deletion removes the authenticated user, owner-scoped logo, synced records, local cache, outbox, conflicts, session, consent, and temporary artifacts.
-- [ ] Published privacy/support pages exactly match production collection, retention, processors, and deletion behavior.
+- [ ] Published privacy/terms/support pages exactly match production collection, retention, processors, deletion behavior, and product limits.
+- [ ] Anonymous release check on 2026-08-09 returned HTTP 404 for Privacy, Terms, and Support; all three must return HTTPS 200 before submission.
 - [ ] App Store privacy answers match the final production binary and deployed services.
+- [ ] RevenueCat App Store app, `FieldCraft Pro` subscription group, exact products, `pro` entitlement, `default` offering, webhook secret, and restore-transfer behavior are configured and directly verified.
 
 ## Apple/TestFlight/App Review
 
 - [ ] Active Apple Developer membership and agreements.
+- [ ] Paid Apps agreement, tax, and banking setup completed for subscriptions.
+- [ ] If enrolling as an organization, its D-U-N-S record is validated. D-U-N-S is not an individual-enrollment requirement.
 - [ ] App Store Connect app record and matching bundle ID `com.avinashamanchi.fieldcraft`.
 - [ ] Production archive built with Xcode 26+ and iOS 26 SDK+ (requirement recheck observed 2026-08-06; recheck again on build day).
 - [ ] Required-reason API/privacy manifest report passes for the archive.
 - [ ] Export compliance and current age-rating questionnaire completed.
-- [ ] App Privacy, support URL, privacy URL, description, keywords, review notes, and private review account completed.
-- [ ] iPhone 6.9-inch and iPad 13-inch screenshot sets captured from the signed build and validated without alpha.
+- [ ] App Privacy including Purchase History, support URL, privacy URL, Terms of Use, description, keywords, review notes, and private review account completed.
+- [ ] Primary language, SKU, seller/copyright, categories, content rights, storefront availability, and Digital Services Act status completed by the account holder.
+- [ ] Monthly and annual subscription localizations, durations, price points, availability, review details, and review screenshots completed.
+- [ ] iPhone 6.9-inch screenshot set captured from the signed build and validated without alpha.
 - [ ] TestFlight processing succeeds and physical-device matrix passes on that exact build.
 - [ ] App Review submission succeeds.
 - [ ] App status is actually `Ready for Distribution`/published in App Store Connect. An upload, processing email, or TestFlight build is not publication.
 
 ## Current stop condition
 
-Local release engineering can continue without credentials. Deployment, signed-device native validation, TestFlight, and App Store submission stop until the user personally completes Supabase, Expo, and Apple account prompts. No credential should be pasted into chat, source, shell history, CI logs, or this checklist.
+Local release engineering can continue without credentials. EAS reported `Not logged in` on 2026-08-09, Deno is unavailable, and this Mac has Command Line Tools rather than full Xcode (CocoaPods 1.17.0 alone is insufficient). Deployment, signed-device native validation, sandbox purchases, TestFlight, and App Store submission stop until the user personally completes Supabase, RevenueCat, Expo, and Apple account prompts. No credential should be pasted into chat, source, shell history, CI logs, or this checklist.
