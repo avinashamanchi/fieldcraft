@@ -5,7 +5,13 @@ const assert = (condition: unknown, message: string) => {
 };
 
 const TEST_SECRET = "webhook-test-secret-at-least-32-bytes";
+const TEST_SIGNING_SECRET = "signing-test-secret-at-least-32-bytes";
+const TEST_NOW_MS = 1_786_233_600_000;
 const bearer = (token = TEST_SECRET) => ["Bearer", token].join(" ");
+const verifiedSignature = {
+  verifySignature: (_raw: Uint8Array, _header: string | null) =>
+    Promise.resolve(true),
+};
 
 const event = (overrides: Record<string, unknown> = {}) => ({
   api_version: "1.0",
@@ -40,6 +46,7 @@ Deno.test("rejects wrong authorization, oversized bodies, duplicate keys, and ma
   const handler = createRevenueCatWebhookHandler({
     secret: TEST_SECRET,
     appId: "app_fieldcraft",
+    ...verifiedSignature,
     apply: () => {
       calls += 1;
       return Promise.resolve("applied");
@@ -77,6 +84,7 @@ Deno.test("normalizes supported lifecycle events and returns only bounded outcom
   const handler = createRevenueCatWebhookHandler({
     secret: TEST_SECRET,
     appId: "app_fieldcraft",
+    ...verifiedSignature,
     apply: (value) => {
       applied.push(value);
       return Promise.resolve("applied");
@@ -102,6 +110,7 @@ Deno.test("maps refund, expiration, cancellation, billing retry, grace, and rene
   const handler = createRevenueCatWebhookHandler({
     secret: TEST_SECRET,
     appId: "app_fieldcraft",
+    ...verifiedSignature,
     apply: (value) => {
       statuses.push(String(value.status));
       return Promise.resolve("applied");
@@ -128,6 +137,7 @@ Deno.test("accepts bounded RevenueCat aliases and current lifecycle fields but r
   const handler = createRevenueCatWebhookHandler({
     secret: TEST_SECRET,
     appId: "app_fieldcraft",
+    ...verifiedSignature,
     apply: () => {
       calls += 1;
       return Promise.resolve("applied");
@@ -151,6 +161,7 @@ Deno.test("accepts bounded RevenueCat aliases and current lifecycle fields but r
     is_trial_conversion: false,
     new_product_id: null,
     experiments: [],
+    future_bounded_field: { enabled: true },
   });
   assert(
     (await handler(request(JSON.stringify(lifecycle)))).status === 200,
@@ -177,6 +188,7 @@ Deno.test("applies the ten-second cap to slow request bodies as well as SQL", as
   const handler = createRevenueCatWebhookHandler({
     secret: TEST_SECRET,
     appId: "app_fieldcraft",
+    ...verifiedSignature,
     deadlineMs: 5,
     apply: () => Promise.resolve("applied"),
   });
@@ -189,4 +201,84 @@ Deno.test("applies the ten-second cap to slow request bodies as well as SQL", as
     body,
   });
   assert((await handler(slow)).status === 504, "whole-request deadline");
+});
+
+Deno.test("requires a valid raw-body RevenueCat signature before applying an event", async () => {
+  let calls = 0;
+  const handler = createRevenueCatWebhookHandler({
+    secret: TEST_SECRET,
+    appId: "app_fieldcraft",
+    ...{
+      verifySignature: (
+        _raw: Uint8Array,
+        signature: string | null,
+      ) => Promise.resolve(signature === "valid-test-signature"),
+    },
+    apply: () => {
+      calls += 1;
+      return Promise.resolve("applied");
+    },
+  });
+  const raw = JSON.stringify(event());
+  const forged = request(raw);
+  const valid = new Request("https://edge.example/revenuecat-webhook", {
+    method: "POST",
+    headers: {
+      authorization: bearer(),
+      "content-type": "application/json",
+      "x-revenuecat-webhook-signature": "valid-test-signature",
+    },
+    body: raw,
+  });
+  assert((await handler(forged)).status === 401, "missing signature");
+  assert((await handler(valid)).status === 200, "valid signature");
+  assert(calls === 1, "forged event reached SQL");
+});
+
+Deno.test("verifies RevenueCat HMAC over the exact body and rejects tampering and replay", async () => {
+  const loaded = await import("./index.ts") as unknown as {
+    verifyRevenueCatSignature?: (
+      raw: Uint8Array,
+      header: string | null,
+      secret: string,
+      nowMs: number,
+    ) => Promise<boolean>;
+  };
+  assert(
+    typeof loaded.verifyRevenueCatSignature === "function",
+    "HMAC verifier is missing",
+  );
+  const verify = loaded.verifyRevenueCatSignature!;
+  const raw = JSON.stringify(event());
+  const rawBytes = new TextEncoder().encode(raw);
+  const timestamp = String(TEST_NOW_MS / 1000);
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(TEST_SIGNING_SECRET),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const digest = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(`${timestamp}.${raw}`),
+  );
+  const signature = [...new Uint8Array(digest)].map((byte) =>
+    byte.toString(16).padStart(2, "0")
+  ).join("");
+  const header = `t=${timestamp},v1=${signature}`;
+  assert(await verify(rawBytes, header, TEST_SIGNING_SECRET, TEST_NOW_MS), "valid HMAC");
+  assert(
+    !(await verify(new TextEncoder().encode(`${raw} `), header, TEST_SIGNING_SECRET, TEST_NOW_MS)),
+    "tampered body",
+  );
+  assert(
+    !(await verify(rawBytes, header, TEST_SIGNING_SECRET, TEST_NOW_MS + 301_000)),
+    "stale delivery",
+  );
+  assert(
+    !(await verify(rawBytes, `t=${timestamp},v1=not-hex`, TEST_SIGNING_SECRET, TEST_NOW_MS)),
+    "malformed signature",
+  );
 });

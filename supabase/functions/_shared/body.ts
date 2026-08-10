@@ -1,8 +1,8 @@
-export const readBoundedBody = async (
+export const readBoundedBodyBytes = async (
   response: Response | Request,
   maximumBytes: number,
-): Promise<string> => {
-  if (!response.body) return "";
+): Promise<Uint8Array> => {
+  if (!response.body) return new Uint8Array();
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -22,5 +22,13 @@ export const readBoundedBody = async (
     joined.set(chunk, offset);
     offset += chunk.byteLength;
   }
-  return new TextDecoder("utf-8", { fatal: true }).decode(joined);
+  return joined;
 };
+
+export const readBoundedBody = async (
+  response: Response | Request,
+  maximumBytes: number,
+): Promise<string> =>
+  new TextDecoder("utf-8", { fatal: true }).decode(
+    await readBoundedBodyBytes(response, maximumBytes),
+  );

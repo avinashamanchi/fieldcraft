@@ -1,4 +1,4 @@
-import { readBoundedBody } from "../_shared/body.ts";
+import { readBoundedBody, readBoundedBodyBytes } from "../_shared/body.ts";
 import { type SafeLogEntry, writeSafeLog } from "../_shared/observability.ts";
 
 const MAX_BODY_BYTES = 64 * 1024;
@@ -21,50 +21,6 @@ const TYPES = new Set([
   "REFUND",
   "REVOKE",
 ]);
-const EVENT_FIELDS = new Set([
-  "id",
-  "type",
-  "app_user_id",
-  "original_app_user_id",
-  "aliases",
-  "app_id",
-  "product_id",
-  "entitlement_ids",
-  "environment",
-  "event_timestamp_ms",
-  "expiration_at_ms",
-  "purchased_at_ms",
-  "store",
-  "is_family_share",
-  "country_code",
-  "currency",
-  "price",
-  "price_in_purchased_currency",
-  "period_type",
-  "presented_offering_id",
-  "transaction_id",
-  "original_transaction_id",
-  "entitlement_id",
-  "cancel_reason",
-  "expiration_reason",
-  "tax_percentage",
-  "commission_percentage",
-  "subscriber_attributes",
-  "experiments",
-  "takehome_percentage",
-  "offer_code",
-  "renewal_number",
-  "metadata",
-  "discount_percentage",
-  "discount_amount",
-  "discount_identifier",
-  "quantity",
-  "grace_period_expiration_at_ms",
-  "auto_resume_at_ms",
-  "is_trial_conversion",
-  "new_product_id",
-]);
-
 type JsonRecord = Record<string, unknown>;
 
 export type NormalizedRevenueCatEvent = Readonly<{
@@ -95,6 +51,10 @@ type Dependencies = Readonly<{
     value: NormalizedRevenueCatEvent,
     signal: AbortSignal,
   ): Promise<Outcome>;
+  verifySignature(
+    rawBody: Uint8Array,
+    signatureHeader: string | null,
+  ): Promise<boolean>;
   log?(entry: SafeLogEntry): void;
   now?: () => number;
 }>;
@@ -234,6 +194,12 @@ const exactFields = (
   ) throw new Error("invalid-request");
 };
 
+const requireFields = (value: JsonRecord, required: readonly string[]) => {
+  if (required.some((key) => !(key in value))) {
+    throw new Error("invalid-request");
+  }
+};
+
 const text = (value: unknown, maximum: number): string => {
   if (typeof value !== "string" || value.length < 1 || value.length > maximum) {
     throw new Error("invalid-request");
@@ -289,6 +255,65 @@ const constantTimeSecret = async (
   return difference === 0;
 };
 
+const bytesToHex = (value: ArrayBuffer): string =>
+  [...new Uint8Array(value)].map((byte) =>
+    byte.toString(16).padStart(2, "0")
+  ).join("");
+
+const constantTimeHex = (left: string, right: string): boolean => {
+  let difference = left.length === right.length ? 0 : 1;
+  const maximum = Math.max(left.length, right.length);
+  for (let index = 0; index < maximum; index += 1) {
+    difference |= (left.charCodeAt(index) || 0) ^ (right.charCodeAt(index) || 0);
+  }
+  return difference === 0;
+};
+
+export const verifyRevenueCatSignature = async (
+  rawBody: Uint8Array,
+  signatureHeader: string | null,
+  signingSecret: string,
+  nowMs: number,
+  toleranceSeconds = 300,
+): Promise<boolean> => {
+  if (
+    !signatureHeader || signingSecret.length < 32 || signingSecret.length > 256 ||
+    !Number.isFinite(nowMs) || !Number.isSafeInteger(toleranceSeconds) ||
+    toleranceSeconds < 0 || toleranceSeconds > 900
+  ) return false;
+  const fields = new Map<string, string>();
+  for (const component of signatureHeader.split(",")) {
+    const separator = component.indexOf("=");
+    if (separator < 1) return false;
+    const key = component.slice(0, separator).trim();
+    const value = component.slice(separator + 1).trim();
+    if (!key || !value || fields.has(key)) return false;
+    fields.set(key, value);
+  }
+  const timestamp = fields.get("t") ?? "";
+  const supplied = fields.get("v1") ?? "";
+  if (!/^[1-9][0-9]{0,12}$/.test(timestamp) || !/^[0-9a-f]{64}$/.test(supplied)) {
+    return false;
+  }
+  const seconds = Number(timestamp);
+  if (!Number.isSafeInteger(seconds) || Math.abs(nowMs / 1000 - seconds) > toleranceSeconds) {
+    return false;
+  }
+  const prefix = new TextEncoder().encode(`${timestamp}.`);
+  const signedPayload = new Uint8Array(prefix.byteLength + rawBody.byteLength);
+  signedPayload.set(prefix, 0);
+  signedPayload.set(rawBody, prefix.byteLength);
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(signingSecret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const computed = bytesToHex(await crypto.subtle.sign("HMAC", key, signedPayload));
+  return constantTimeHex(computed, supplied);
+};
+
 const statusFor = (eventType: string): NormalizedRevenueCatEvent["status"] => {
   if (
     ["INITIAL_PURCHASE", "RENEWAL", "UNCANCELLATION", "PRODUCT_CHANGE"]
@@ -319,7 +344,7 @@ const normalize = async (
   );
   if (envelope.api_version !== "1.0") throw new Error("invalid-request");
   const event = record(envelope.event);
-  exactFields(event, [
+  requireFields(event, [
     "id",
     "type",
     "app_user_id",
@@ -331,7 +356,7 @@ const normalize = async (
     "environment",
     "event_timestamp_ms",
     "expiration_at_ms",
-  ], EVENT_FIELDS);
+  ]);
   const eventId = text(event.id, 128);
   const eventType = text(event.type, 40);
   const ownerId = text(event.app_user_id, 36);
@@ -424,14 +449,32 @@ export const createRevenueCatWebhookHandler = (dependencies: Dependencies) => {
       if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
         throw new Error("body-too-large");
       }
-      let raw: string;
+      let rawBytes: Uint8Array;
       try {
-        raw = await withinDeadline(readBoundedBody(request, MAX_BODY_BYTES));
+        rawBytes = await withinDeadline(
+          readBoundedBodyBytes(request, MAX_BODY_BYTES),
+        );
       } catch (cause) {
         if (
           cause instanceof Error &&
           (cause.message === "body-too-large" || cause.message === "deadline")
         ) throw cause;
+        throw new Error("invalid-request");
+      }
+      if (
+        !(await withinDeadline(dependencies.verifySignature(
+          rawBytes,
+          request.headers.get("x-revenuecat-webhook-signature"),
+        )))
+      ) {
+        status = 401;
+        publicCode = "unauthorized";
+        return response(status, { error: publicCode, requestId });
+      }
+      let raw: string;
+      try {
+        raw = new TextDecoder("utf-8", { fatal: true }).decode(rawBytes);
+      } catch {
         throw new Error("invalid-request");
       }
       const parsed = new StrictJsonParser(raw).parse();
@@ -496,12 +539,23 @@ export const createProductionRevenueCatWebhookHandler = (
   fetcher: typeof fetch = fetch,
 ) => {
   const secret = required(environment, "REVENUECAT_WEBHOOK_SECRET");
+  const signingSecret = required(
+    environment,
+    "REVENUECAT_WEBHOOK_SIGNING_SECRET",
+  );
   const appId = required(environment, "REVENUECAT_APP_ID");
   const supabaseUrl = required(environment, "SUPABASE_URL").replace(/\/$/, "");
   const serviceRoleKey = required(environment, "SUPABASE_SERVICE_ROLE_KEY");
   return createRevenueCatWebhookHandler({
     secret,
     appId,
+    verifySignature: (rawBody, signatureHeader) =>
+      verifyRevenueCatSignature(
+        rawBody,
+        signatureHeader,
+        signingSecret,
+        Date.now(),
+      ),
     async apply(value, signal) {
       const result = await fetcher(
         `${supabaseUrl}/rest/v1/rpc/apply_revenuecat_event`,
