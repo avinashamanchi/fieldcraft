@@ -8,6 +8,8 @@ import { colors, MIN_TOUCH_TARGET, spacing, typography } from '../../src/theme/t
 
 const PRIVACY_URL = 'https://avinashamanchi.github.io/fieldcraft/privacy.html'
 const TERMS_URL = 'https://avinashamanchi.github.io/fieldcraft/terms.html'
+const SUPPORT_URL = 'https://avinashamanchi.github.io/fieldcraft/support.html'
+const APPLE_PURCHASE_SUPPORT_URL = 'https://reportaproblem.apple.com/'
 
 export default function SubscriptionScreen() {
   const subscription = useSubscription()
@@ -70,6 +72,12 @@ export default function SubscriptionScreen() {
       </Pressable>
       <Pressable accessibilityRole="link" onPress={() => { void Linking.openURL(TERMS_URL) }} style={styles.secondary}>
         <Text style={styles.secondaryText}>Terms of Use</Text>
+      </Pressable>
+      <Pressable accessibilityRole="link" onPress={() => { void Linking.openURL(SUPPORT_URL) }} style={styles.secondary}>
+        <Text style={styles.secondaryText}>FieldCraft Support</Text>
+      </Pressable>
+      <Pressable accessibilityRole="link" onPress={() => { void Linking.openURL(APPLE_PURCHASE_SUPPORT_URL) }} style={styles.secondary}>
+        <Text style={styles.secondaryText}>Apple purchase and refund help</Text>
       </Pressable>
     </Screen>
   )

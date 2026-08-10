@@ -4,8 +4,18 @@ import type { AuthenticatedOwnerLease } from '../src/auth/AuthProvider'
 import { createMfaService } from '../src/auth/mfaService'
 import { createRecentAal2Guard } from '../src/auth/requireAal2'
 import MfaScreen from '../app/security/mfa'
+import StepUpScreen from '../app/security/step-up'
 
 const mockVerifyMfaChallenge = jest.fn(async (challenge: () => Promise<void>) => challenge())
+const mockRouterPush = jest.fn()
+
+jest.mock('expo-router', () => ({
+  router: {
+    back: jest.fn(),
+    push: (...args: unknown[]) => mockRouterPush(...args),
+  },
+  useLocalSearchParams: () => ({ operation: 'delete-account' }),
+}))
 
 jest.mock('../src/auth/AuthProvider', () => ({
   useAuthenticatedOwnerLease: () => Object.freeze({
@@ -247,4 +257,38 @@ it('rejects malformed TOTP codes before contacting Supabase', async () => {
     code: 'INVALID_TOTP_CODE',
   })
   expect(challenge).not.toHaveBeenCalled()
+})
+
+it('offers authenticator setup when a required step-up has no verified factor', async () => {
+  const service = {
+    enrollTotp: jest.fn(),
+    cleanupUnverifiedTotp: jest.fn(),
+    listVerifiedTotp: jest.fn().mockResolvedValue([]),
+    verifyEnrollment: jest.fn(),
+    stepUp: jest.fn(),
+    unenroll: jest.fn(),
+  }
+
+  render(<StepUpScreen service={service} />)
+
+  const setup = await screen.findByRole('button', { name: 'Set up authenticator' })
+  fireEvent.press(setup)
+  expect(mockRouterPush).toHaveBeenCalledWith('/security/mfa')
+  expect(screen.getByText(/return to Delete account and try again/i)).toBeTruthy()
+})
+
+it('does not mistake a factor lookup failure for a missing authenticator', async () => {
+  const service = {
+    enrollTotp: jest.fn(),
+    cleanupUnverifiedTotp: jest.fn(),
+    listVerifiedTotp: jest.fn().mockRejectedValue(new Error('offline')),
+    verifyEnrollment: jest.fn(),
+    stepUp: jest.fn(),
+    unenroll: jest.fn(),
+  }
+
+  render(<StepUpScreen service={service} />)
+
+  expect(await screen.findByRole('button', { name: 'Try again' })).toBeTruthy()
+  expect(screen.queryByRole('button', { name: 'Set up authenticator' })).toBeNull()
 })

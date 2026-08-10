@@ -17,7 +17,10 @@ Last updated: 2026-08-10. `PASS` means directly observed evidence for the curren
 - [x] Authentication is email/password only; no third-party or social login is offered, and the iOS config explicitly declares that Sign in with Apple is not used.
 - [x] Production EAS profile uses store distribution, the SDK-selected Xcode image, remote build-number auto-increment, and contains no submission credentials.
 - [x] Production builds fail closed without a RevenueCat Apple public SDK key; FieldCraft Pro uses the exact monthly/annual products and StoreKit-localized prices, provides restore/manage controls, and never grants Pro in Expo Go.
-- [x] The paywall and in-app legal screen expose separate Privacy Policy and Terms of Use controls. Public drafts disclose Apple/RevenueCat purchase processing, Free limits, renewal/cancellation, downgrade behavior, and that account deletion does not cancel an Apple subscription.
+- [x] The paywall and in-app legal screen expose separate Privacy Policy, Terms of Use, Support, Apple subscription-management, and official Apple purchase/refund-help controls. Public drafts disclose Apple/RevenueCat purchase processing, Free limits, renewal/cancellation, downgrade behavior, and that account deletion does not cancel an Apple subscription.
+- [x] `apple-review-guideline-applicability.md` records every Apple Safety, Performance, Business, Design, and Legal family as implemented, externally gated, or not applicable; absent UGC, Kids, gambling, VPN, MDM, social login, Apple Pay, and downloaded-code features cannot be silently added after review.
+- [x] Delete Account checks the recent-authenticator guard before any destructive request, routes to the delete-account step-up screen, and offers authenticator setup when no verified factor exists; the server independently enforces recent AAL2.
+- [x] A production-only Expo config plugin strips development Bonjour/local-network discovery declarations, disables arbitrary ATS loads, and removes localhost transport exceptions from the generated release Info.plist.
 
 ### Observed clean-clone evidence
 
@@ -25,7 +28,7 @@ Last updated: 2026-08-10. `PASS` means directly observed evidence for the curren
 |---|---|
 | Runtime | Node `22.23.2` used for the fresh local gates; workflows retain their pinned Node 22 runner |
 | Root tests | 3 files, 22 tests passed |
-| Mobile tests | 50 suites, 579 tests passed |
+| Mobile tests | 50 suites, 583 tests passed |
 | Database | Migration boundary and 42 PGlite checks passed; Node's real SQLite parser accepted the complete mobile migration chain |
 | Edge | Not rerun locally because Deno is unavailable; dynamic CI gates remain mandatory before release |
 | Expo | Doctor 18/18; the exact staged snapshot exported its iOS bundle from 1,749 modules with a 7.3 MB Hermes bundle without an ignored local demo environment |
@@ -56,6 +59,7 @@ Observed warnings/limitations: Vite reported a web chunk above 500 kB after mini
 - [ ] Anonymous release check on 2026-08-10 returned HTTP 404 for Privacy, Terms, and Support; all three must return HTTPS 200 before submission.
 - [ ] App Store privacy answers match the final production binary and deployed services.
 - [ ] RevenueCat App Store app, `FieldCraft Pro` subscription group, exact products, `pro` entitlement, `default` offering, webhook secret, and restore-transfer behavior are configured and directly verified.
+- [ ] Reviewer account stays active for the entire review window, uses synthetic data, reaches all account-based features, and has exact onboarding/MFA/recovery instructions in App Review Information.
 
 ## Apple/TestFlight/App Review
 
@@ -73,6 +77,8 @@ Observed warnings/limitations: Vite reported a web chunk above 500 kB after mini
 - [ ] Mac with Apple silicon and Apple Vision Pro availability are explicitly disabled for v1 unless the exact signed iPhone build is separately tested and supported there.
 - [ ] Primary language, SKU, seller/copyright, categories, content rights, storefront availability, and Digital Services Act status completed by the account holder.
 - [ ] Monthly and annual subscription localizations, durations, price points, availability, review details, and review screenshots completed.
+- [ ] Optional offer codes, win-back offers, promoted IAP, Family Sharing, and alternative digital payments remain disabled unless their separate configuration and signed tests are complete.
+- [ ] Review Notes explicitly distinguish Apple-IAP digital Pro capacity from customer invoice/payment records for real-world trade services.
 - [ ] iPhone 6.9-inch screenshot set captured from the signed build and validated without alpha.
 - [ ] TestFlight processing succeeds and physical-device matrix passes on that exact build.
 - [ ] App Review submission succeeds.

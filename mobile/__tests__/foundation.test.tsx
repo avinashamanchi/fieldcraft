@@ -6,6 +6,9 @@ import appConfig from '../app.config'
 import { colors } from '../src/theme/tokens'
 
 const easConfig = require('../eas.json')
+const { stripDevelopmentNetworkKeys } = require('../plugins/withReleaseNetworkPolicy.cjs') as {
+  stripDevelopmentNetworkKeys: (value: Record<string, unknown>) => Record<string, unknown>
+}
 
 let mockAuthState: { status: string; userId?: string; email?: string; hydrated?: boolean; message?: string } = { status: 'signedOut' }
 let mockSegments: string[] = ['(tabs)']
@@ -71,10 +74,27 @@ it('uses the exact FieldCraft iOS identity', () => {
   expect(config.ios?.supportsTablet).toBe(false)
   expect(config.ios?.infoPlist?.ITSAppUsesNonExemptEncryption).toBe(false)
   expect(config.updates).toEqual({ enabled: false })
+  expect(config.plugins).toContain('./plugins/withReleaseNetworkPolicy.cjs')
   expect(config.extra).toMatchObject({
     privacyPolicyUrl: 'https://avinashamanchi.github.io/fieldcraft/privacy.html',
     supportUrl: 'https://avinashamanchi.github.io/fieldcraft/support.html',
     termsOfUseUrl: 'https://avinashamanchi.github.io/fieldcraft/terms.html',
+  })
+})
+
+it('enforces HTTPS-only transport and removes development discovery from release plists', () => {
+  expect(stripDevelopmentNetworkKeys({
+    NSBonjourServices: ['_expo._tcp'],
+    NSLocalNetworkUsageDescription: 'Development server discovery',
+    NSAppTransportSecurity: {
+      NSAllowsArbitraryLoads: true,
+      NSAllowsArbitraryLoadsForMedia: true,
+      NSAllowsArbitraryLoadsInWebContent: true,
+      NSAllowsLocalNetworking: true,
+      NSExceptionDomains: { localhost: { NSExceptionAllowsInsecureHTTPLoads: true } },
+    },
+  })).toEqual({
+    NSAppTransportSecurity: { NSAllowsArbitraryLoads: false },
   })
 })
 

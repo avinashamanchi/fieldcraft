@@ -219,8 +219,12 @@ describe('SubscriptionScreen', () => {
     await waitFor(() => expect(manage).toHaveBeenCalledTimes(1))
     fireEvent.press(screen.getByText('Privacy Policy'))
     fireEvent.press(screen.getByText('Terms of Use'))
+    fireEvent.press(screen.getByText('FieldCraft Support'))
+    fireEvent.press(screen.getByText('Apple purchase and refund help'))
     expect(openURL).toHaveBeenNthCalledWith(1, 'https://avinashamanchi.github.io/fieldcraft/privacy.html')
     expect(openURL).toHaveBeenNthCalledWith(2, 'https://avinashamanchi.github.io/fieldcraft/terms.html')
+    expect(openURL).toHaveBeenNthCalledWith(3, 'https://avinashamanchi.github.io/fieldcraft/support.html')
+    expect(openURL).toHaveBeenNthCalledWith(4, 'https://reportaproblem.apple.com/')
     openURL.mockRestore()
   })
 

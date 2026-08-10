@@ -12,15 +12,17 @@ import { tempArtifactRegistry } from '../../src/files/tempArtifactRegistry'
 import { useInvoiceSession } from '../../src/features/invoices/invoiceSession'
 import { getDeleteAccountClient } from '../../src/privacy/deleteAccount'
 import { clearLocalAuthentication, deleteLocalData, type DeleteOutcome } from '../../src/privacy/deleteLocalData'
+import { requireRecentAal2 } from '../../src/auth/requireAal2'
 import { colors, radius, spacing, typography } from '../../src/theme/tokens'
 
 type DeleteAccountControlProps = {
   deleteCloud(): Promise<void>
   deleteLocal(): Promise<DeleteOutcome>
   onComplete?: () => void
+  requireRecentVerification?: () => void
 }
 
-export const DeleteAccountControl = ({ deleteCloud, deleteLocal, onComplete }: DeleteAccountControlProps) => {
+export const DeleteAccountControl = ({ deleteCloud, deleteLocal, onComplete, requireRecentVerification = () => {} }: DeleteAccountControlProps) => {
   const [phrase, setPhrase] = useState('')
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState<string | null>(null)
@@ -34,6 +36,16 @@ export const DeleteAccountControl = ({ deleteCloud, deleteLocal, onComplete }: D
     if (mounted.current) { setBusy(true); setMessage(null) }
     try {
       if (!cloudDeleted.current) {
+        try {
+          requireRecentVerification()
+        } catch (error) {
+          if (error && typeof error === 'object' && 'code' in error && error.code === 'STEP_UP_REQUIRED') {
+            if (mounted.current) setMessage('Please verify with your authenticator, then return and press Delete my account again.')
+            router.push('/security/step-up?operation=delete-account' as never)
+            return
+          }
+          throw error
+        }
         await deleteCloud()
         cloudDeleted.current = true
       }
@@ -90,6 +102,7 @@ export default function DeleteAccountScreen() {
         deleteCloud={() => getDeleteAccountClient().deleteAccount()}
         deleteLocal={clearLocal}
         onComplete={() => router.replace('/(auth)/login')}
+        requireRecentVerification={() => { requireRecentAal2('delete-account') }}
       />
     </Screen>
   )

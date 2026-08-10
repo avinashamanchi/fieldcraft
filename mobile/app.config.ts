@@ -83,6 +83,7 @@ export default function appConfig(_context: ConfigContext): ExpoConfig {
       'expo-secure-store',
       ['expo-splash-screen', { backgroundColor: '#1A1A1A', image: './assets/icon.png', imageWidth: 160, resizeMode: 'contain' }],
       ['expo-build-properties', { ios: { deploymentTarget: '15.1' } }],
+      './plugins/withReleaseNetworkPolicy.cjs',
     ],
     experiments: {
       typedRoutes: true,

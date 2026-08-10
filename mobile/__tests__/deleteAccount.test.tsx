@@ -1,7 +1,16 @@
 import { act, fireEvent, render, screen } from '@testing-library/react-native'
 
 import { DeleteAccountControl } from '../app/settings/delete-account'
+import { StepUpRequiredError } from '../src/auth/requireAal2'
 import { createDeleteAccountClient } from '../src/privacy/deleteAccount'
+
+const mockRouterPush = jest.fn()
+jest.mock('expo-router', () => ({
+  router: {
+    push: (...args: unknown[]) => mockRouterPush(...args),
+    replace: jest.fn(),
+  },
+}))
 
 it('requires authenticated HTTPS and maps auth failure without exposing a body', async () => {
   const marker = 'PRIVATE_DELETE_BODY'
@@ -30,4 +39,24 @@ it('requires the exact phrase, suppresses duplicate taps, and reports partial lo
   expect(deleteCloud).toHaveBeenCalledTimes(1)
   await act(async () => { resolveCloud(); await cloud; await Promise.resolve() })
   expect(await screen.findByText(/account was deleted, but local cleanup is incomplete/i)).toBeTruthy()
+})
+
+it('routes to recent authenticator verification before any destructive request', async () => {
+  const deleteCloud = jest.fn(async () => {})
+  const deleteLocal = jest.fn(async () => ({ ok: true as const }))
+  render(
+    <DeleteAccountControl
+      deleteCloud={deleteCloud}
+      deleteLocal={deleteLocal}
+      requireRecentVerification={() => { throw new StepUpRequiredError('delete-account') }}
+    />,
+  )
+
+  fireEvent.changeText(screen.getByTestId('delete-account-phrase'), 'DELETE MY ACCOUNT')
+  await act(async () => { fireEvent.press(screen.getByTestId('confirm-delete-account')) })
+
+  expect(mockRouterPush).toHaveBeenCalledWith('/security/step-up?operation=delete-account')
+  expect(deleteCloud).not.toHaveBeenCalled()
+  expect(deleteLocal).not.toHaveBeenCalled()
+  expect(await screen.findByRole('alert')).toHaveTextContent(/verify with your authenticator/i)
 })

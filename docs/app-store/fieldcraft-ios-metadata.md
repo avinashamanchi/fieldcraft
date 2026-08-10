@@ -1,6 +1,6 @@
 # FieldCraft iOS App Store metadata draft
 
-Last reviewed: 2026-08-09. This is a credential-free draft, not proof of an App Store Connect submission. The first release is iPhone-only; iPad support is deferred until its layout and device matrix are validated.
+Last reviewed: 2026-08-10. This is a credential-free draft, not proof of an App Store Connect submission. The first release is iPhone-only; iPad support is deferred until its layout and device matrix are validated. The complete applicability record is `apple-review-guideline-applicability.md`.
 
 ## Listing
 
@@ -46,13 +46,17 @@ FieldCraft does not guarantee savings, revenue, payment, delivery, tax treatment
 ## Review notes
 
 - A provider-owned temporary review account must be supplied privately in App Store Connect; never add it to this repository.
+- Keep that review account active for the full review window, pre-complete onboarding with synthetic business data, and include any MFA/recovery steps plus a direct support contact in App Review Information.
+- Reviewer path: sign in with the private review account; create a client and job; use **Quick local job note** or typed invoice entry; review and save; open Settings for AI consent, privacy, sync, subscription, local deletion, and account deletion.
 - Manual local job and invoice entry works without AI. The `Quick local job note` flow creates an editable deterministic draft on device.
 - Optional AI is off until the signed-in user explicitly grants consent. Requests pass through authenticated Supabase functions; no provider key is shipped in the app.
 - Apple Speech and Vision require the native FieldCraft development/App Store build and cannot be validated in Expo Go. Typed invoice and expense entry remains available.
 - The app does not send invoices automatically and does not claim the iOS share sheet delivered a document.
 - Cloud sync and account deletion require the release operator's configured Supabase project.
 - Authentication uses email and password only. FieldCraft offers no social or third-party login provider.
-- The paywall exposes Restore Purchases, Apple subscription management, Privacy Policy, and Terms of Use. Deleting a FieldCraft account does not cancel an Apple subscription.
+- The paywall exposes Restore Purchases, Apple subscription management, Privacy Policy, Terms of Use, FieldCraft Support, and Apple's purchase/refund-help page. Apple determines refund eligibility. Deleting a FieldCraft account does not cancel an Apple subscription.
+- `fieldcraft_pro_monthly` and `fieldcraft_pro_annual` unlock digital FieldCraft capacity and therefore use Apple IAP only. Invoice/payment records concern the user's real-world trade services; they do not unlock app features and are not an alternative checkout for Pro.
+- Offer codes, win-back offers, promoted IAP, Family Sharing, and alternative digital payments are disabled for v1 unless separately configured, documented, and tested in the exact signed candidate.
 
 ## App Privacy draft for App Store Connect
 
