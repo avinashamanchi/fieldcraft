@@ -75,16 +75,29 @@ describe('FieldCraft downgrade-safe monetization policy', () => {
 describe('FieldCraft production purchase configuration', () => {
   const originalProfile = process.env.EAS_BUILD_PROFILE
   const originalKey = process.env.EXPO_PUBLIC_REVENUECAT_APPLE_API_KEY
+  const originalSupabaseUrl = process.env.EXPO_PUBLIC_SUPABASE_URL
+  const originalSupabaseKey = process.env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY
 
   afterEach(() => {
     if (originalProfile === undefined) delete process.env.EAS_BUILD_PROFILE
     else process.env.EAS_BUILD_PROFILE = originalProfile
     if (originalKey === undefined) delete process.env.EXPO_PUBLIC_REVENUECAT_APPLE_API_KEY
     else process.env.EXPO_PUBLIC_REVENUECAT_APPLE_API_KEY = originalKey
+    if (originalSupabaseUrl === undefined) delete process.env.EXPO_PUBLIC_SUPABASE_URL
+    else process.env.EXPO_PUBLIC_SUPABASE_URL = originalSupabaseUrl
+    if (originalSupabaseKey === undefined) delete process.env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY
+    else process.env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY = originalSupabaseKey
   })
 
-  it('fails a production build without a valid public RevenueCat iOS key', () => {
+  const configureValidProduction = () => {
     process.env.EAS_BUILD_PROFILE = 'production'
+    process.env.EXPO_PUBLIC_REVENUECAT_APPLE_API_KEY = 'appl_public_fieldcraft_example'
+    process.env.EXPO_PUBLIC_SUPABASE_URL = 'https://project-ref.supabase.co'
+    process.env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_fieldcraft_example'
+  }
+
+  it('fails a production build without a valid public RevenueCat iOS key', () => {
+    configureValidProduction()
     delete process.env.EXPO_PUBLIC_REVENUECAT_APPLE_API_KEY
     expect(() => appConfig({ config: {} } as never)).toThrow('EXPO_PUBLIC_REVENUECAT_APPLE_API_KEY')
     process.env.EXPO_PUBLIC_REVENUECAT_APPLE_API_KEY = 'not-a-public-ios-key'
@@ -92,8 +105,25 @@ describe('FieldCraft production purchase configuration', () => {
   })
 
   it('accepts the public iOS key format without embedding any provider secret', () => {
-    process.env.EAS_BUILD_PROFILE = 'production'
-    process.env.EXPO_PUBLIC_REVENUECAT_APPLE_API_KEY = 'appl_public_fieldcraft_example'
+    configureValidProduction()
     expect(() => appConfig({ config: {} } as never)).not.toThrow()
+  })
+
+  it.each([
+    ['missing URL', undefined, 'sb_publishable_fieldcraft_example'],
+    ['insecure URL', 'http://project-ref.supabase.co', 'sb_publishable_fieldcraft_example'],
+    ['URL with credentials', 'https://user:pass@project-ref.supabase.co', 'sb_publishable_fieldcraft_example'],
+    ['placeholder URL', 'https://your-project-id.supabase.co', 'sb_publishable_fieldcraft_example'],
+    ['missing key', 'https://project-ref.supabase.co', undefined],
+    ['placeholder key', 'https://project-ref.supabase.co', 'your-anon-key-here'],
+    ['service-role-like key', 'https://project-ref.supabase.co', 'service_role_super_secret_value'],
+  ] as const)('fails a production build for unsafe Supabase configuration: %s', (_label, url, key) => {
+    configureValidProduction()
+    if (url === undefined) delete process.env.EXPO_PUBLIC_SUPABASE_URL
+    else process.env.EXPO_PUBLIC_SUPABASE_URL = url
+    if (key === undefined) delete process.env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY
+    else process.env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY = key
+
+    expect(() => appConfig({ config: {} } as never)).toThrow('FieldCraft Supabase configuration')
   })
 })
