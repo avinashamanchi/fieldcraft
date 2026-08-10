@@ -33,12 +33,14 @@ describe('release workflow contracts', () => {
     expect(workflow).toContain('node-version: 22.22.0')
     for (const command of requiredCommands) expect(workflow).toContain(command)
     for (const command of ['npm run expo:doctor', 'npm run export:ios', 'npm run test:supabase-pglite', 'deno test']) expect(workflow).toContain(command)
+    expect(workflow).toContain('check-mobile-audit.mjs')
   })
 
   it('makes Pages deployment wait for the same three gate classes', () => {
     const workflow = read('.github/workflows/deploy.yml')
     expect(workflow).toContain('needs: [web-gates, mobile-gates, backend-gates]')
     for (const command of requiredCommands) expect(workflow).toContain(command)
+    expect(workflow).toContain('check-mobile-audit.mjs')
   })
 
   it('keeps release readiness manual-only and unable to deploy or submit', () => {
@@ -46,8 +48,18 @@ describe('release workflow contracts', () => {
     expect(workflow).toMatch(/on:\s*\n\s*workflow_dispatch:/)
     expect(workflow).not.toMatch(/\bpush:|pull_request:|deploy-pages|\beas(?:-cli)?\b[^\n]*submit|\bsupabase\b[^\n]*deploy/i)
     for (const command of [...requiredCommands, 'npm run expo:doctor', 'npm run export:ios', 'deno check']) expect(workflow).toContain(command)
+    expect(workflow).toContain('check-mobile-audit.mjs')
     expect(workflow).toContain('deployed=false')
     expect(workflow).toContain('submitted=false')
+  })
+
+  it('allows only the two reviewed Expo parser advisories and fails closed on new severe findings', () => {
+    const auditGate = read('scripts/check-mobile-audit.mjs')
+    expect(auditGate).toContain('1138808')
+    expect(auditGate).toContain('1138809')
+    expect(auditGate).toContain('--audit-level=high')
+    expect(auditGate).toContain('unproven-chain')
+    expect(auditGate).toContain('report.error')
   })
 
   it('keeps the app icon exact, opaque RGB, and configured without project credentials', () => {

@@ -11,7 +11,7 @@ Last updated: 2026-08-09. `PASS` means directly observed evidence for the curren
 - [ ] Deno format, lint, Edge tests, and Edge entrypoint checks for this candidate. `BLOCKED: Deno is not installed on this Mac; CI retains these gates.`
 - [x] CI, deploy, release-readiness, and Maestro YAML parsed; release readiness is manual-only and has no deploy/submit command.
 - [x] Root production dependency audit reported zero vulnerabilities.
-- [ ] Mobile production dependency audit is clear. The 2026-08-09 audit reports 12 high transitive findings from `image-size@1.2.1` through Expo/Metro; every published `image-size` version through 2.0.2 is currently covered, and npm proposes only breaking Expo/React Native downgrades. Do not force that remediation.
+- [x] Mobile CI fails closed on any high/critical advisory except the two explicitly reviewed `image-size` parser advisories (GitHub sources `1138808` and `1138809`) through Expo/Metro. The 2026-08-09 report has 12 transitive findings; npm proposes only breaking Expo/React Native downgrades, so the gate records the exception instead of forcing that remediation.
 - [x] 1024×1024 opaque RGB icon validated and configured.
 - [x] First release is explicitly iPhone-only; the unverified iPad target and 13-inch screenshot obligation were removed from the v1 configuration.
 - [x] Authentication is email/password only; no third-party or social login is offered, and the iOS config explicitly declares that Sign in with Apple is not used.
@@ -29,7 +29,7 @@ Last updated: 2026-08-09. `PASS` means directly observed evidence for the curren
 | Database | Migration boundary and 42 PGlite checks passed; Node's real SQLite parser accepted the complete mobile migration chain |
 | Edge | Not rerun locally because Deno is unavailable; dynamic CI gates remain mandatory before release |
 | Expo | Doctor 18/18; the exact staged snapshot exported its iOS bundle from 955 modules without an ignored local demo environment |
-| Security | Root production audit: 0; mobile production audit: 12 high transitive Expo/Metro findings recorded above; tracked/export secret scan passed; exact icon: 1024×1024 PNG, RGB, no alpha |
+| Security | Root production audit: 0; the strict mobile gate accepted only the 12 transitive Expo/Metro findings rooted in the two reviewed advisories and rejects any new high/critical advisory; tracked/export secret scan passed; exact icon: 1024×1024 PNG, RGB, no alpha |
 | Workflows | Release-readiness remains manual-only and has no deploy/submit command; YAML parse is part of the final scoped snapshot gate |
 
 Observed warnings/limitations: Vite reported a web chunk above 500 kB after minification; Node labels its built-in SQLite API experimental; the mobile audit risk is recorded above. CocoaPods 1.17.0 is installed, but the selected developer directory is Command Line Tools and no usable full Xcode archive proof exists, so a Swift/Pods compile and signed archive were not run.

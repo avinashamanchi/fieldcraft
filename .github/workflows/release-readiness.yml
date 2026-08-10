@@ -41,7 +41,7 @@ jobs:
           npm run lint
           npm run expo:doctor
           npm run export:ios
-          npm audit --audit-level=high
+          node ../scripts/check-mobile-audit.mjs
 
       - name: Backend and Edge dry-run gates
         run: |

@@ -12,7 +12,7 @@ export default function PrivacyScreen() {
     <Screen contentContainerStyle={styles.screen} scroll>
       <Text accessibilityRole="header" style={styles.heading}>Privacy</Text>
       <Text style={styles.copy}>FieldCraft stores an offline working copy on this device and syncs your business records to your Supabase account. Optional AI processing requires consent. Raw audio and receipt images are not uploaded.</Text>
-      <Text style={styles.copy}>FieldCraft does not use ads or tracking, access your contacts or payment-card details, or send customer messages automatically. Apple and RevenueCat process subscription purchase and entitlement information. Review invoices and accounting information yourself.</Text>
+      <Text style={styles.copy}>FieldCraft does not use ads or tracking, access your contacts or payment-card details, or send customer messages automatically. Apple and RevenueCat process subscription purchase and entitlement information for app functionality and subscription analytics. Review invoices and accounting information yourself.</Text>
       <Pressable accessibilityRole="link" onPress={() => { void Linking.openURL(PRIVACY_URL) }} style={styles.link}><Text style={styles.linkText}>Open full privacy policy</Text></Pressable>
       <Pressable accessibilityRole="link" onPress={() => { void Linking.openURL(TERMS_URL) }} style={styles.link}><Text style={styles.linkText}>Open Terms of Use</Text></Pressable>
       <Pressable accessibilityRole="link" onPress={() => { void Linking.openURL(SUPPORT_URL) }} style={styles.link}><Text style={styles.linkText}>Open support page</Text></Pressable>

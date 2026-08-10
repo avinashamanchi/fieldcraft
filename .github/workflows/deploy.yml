@@ -27,6 +27,7 @@ jobs:
       - run: npm run lint
       - run: npm run build
       - run: npm run scan:secrets
+      - run: npm audit --audit-level=high
 
   mobile-gates:
     runs-on: ubuntu-latest
@@ -42,6 +43,7 @@ jobs:
       - run: npm run lint
       - run: npm run expo:doctor
       - run: npm run export:ios
+      - run: node ../scripts/check-mobile-audit.mjs
       - name: Scan exported bundle
         working-directory: .
         run: npm run scan:secrets

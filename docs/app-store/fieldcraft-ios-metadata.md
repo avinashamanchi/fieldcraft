@@ -63,7 +63,7 @@ Confirm this against the deployed production configuration immediately before su
 - Contact information: client/business names, phone numbers, email addresses, and addresses entered by the user; linked to the authenticated account; used for app functionality.
 - User content: jobs, invoices, expenses, notes, service/inventory records, and a selected business logo; linked to the authenticated account; used for app functionality.
 - Identifiers: Supabase account/user ID; linked to the user; used for authentication, security, deletion, and sync.
-- Purchase history: product, entitlement, purchase, and expiration information is linked to the pseudonymous FieldCraft account ID and used for offering, restoring, and verifying Pro through Apple and RevenueCat. Recheck the final SDK manifests and App Store definitions.
+- Purchase history: product, entitlement, purchase, and expiration information is linked to the FieldCraft account ID and used for Analytics and App Functionality, including offering, restoring, and verifying Pro through Apple and RevenueCat. It is not used for tracking. Recheck the final SDK manifests and App Store definitions.
 - Diagnostics/other data: content-free request ID, route, status, rate-limit digest, and coarse latency/security metadata only if retained by the deployed function logs; used for security and app functionality, never tracking.
 - Photos: receipt images stay local and are deleted from FieldCraft temporary storage after processing; the explicitly selected business logo can be uploaded to the account's owner-only Storage path.
 - Audio: raw audio is processed for on-device transcription and is not uploaded by FieldCraft.
