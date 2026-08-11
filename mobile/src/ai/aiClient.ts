@@ -1,4 +1,5 @@
 import { getSupabaseClient } from '../auth/supabase'
+import { validateSupabaseFunctionUrl } from '../network/supabaseFunctionUrl'
 import { aiConsentStore, type AiConsentStore } from './consentStore'
 import { AiRequestSchema, parseAiResponse, type AiRequest, type AiResultFor } from './contracts'
 
@@ -36,15 +37,7 @@ const configuredFunctionUrl = (): string => {
 }
 
 const validateFunctionUrl = (value: string): string => {
-  let url: URL
-  try { url = new URL(value) } catch { throw new Error('FieldCraft AI requires an HTTPS function URL') }
-  if (
-    url.protocol !== 'https:' || url.username || url.password || url.search || url.hash ||
-    !url.pathname.endsWith('/functions/v1/fieldcraft-ai') || /groq/i.test(url.hostname)
-  ) {
-    throw new Error('FieldCraft AI requires a trusted HTTPS function URL')
-  }
-  return url.toString()
+  return validateSupabaseFunctionUrl(value, 'fieldcraft-ai', 'FieldCraft AI requires a trusted HTTPS function URL')
 }
 
 const defaultAccessToken = async (): Promise<string | null> => {

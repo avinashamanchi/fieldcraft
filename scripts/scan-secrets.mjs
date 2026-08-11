@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { existsSync, lstatSync, readFileSync, readdirSync } from 'node:fs'
+import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readFileSync, readdirSync } from 'node:fs'
 import { extname, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -51,6 +51,22 @@ export const scanSecretText = (
   })
 }
 
+const readRegularFile = (absolute) => {
+  let descriptor
+  try {
+    descriptor = openSync(absolute, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+  } catch (error) {
+    if (['ELOOP', 'ENOENT'].includes(error?.code)) return null
+    throw error
+  }
+  try {
+    if (!fstatSync(descriptor).isFile()) return null
+    return readFileSync(descriptor)
+  } finally {
+    closeSync(descriptor)
+  }
+}
+
 const walk = (directory, root) => {
   if (!existsSync(directory)) return []
   const stat = lstatSync(directory)
@@ -72,8 +88,9 @@ export const scanRepository = ({
   const files = [...new Set([...tracked, ...bundleFiles])].filter((path) => !EXACT_EXCLUSIONS.has(path))
   return files.flatMap((path) => {
     const absolute = resolve(root, path)
-    if (!existsSync(absolute) || !lstatSync(absolute).isFile() || !TEXT_EXTENSIONS.has(extname(path).toLocaleLowerCase())) return []
-    const bytes = readFileSync(absolute)
+    if (!TEXT_EXTENSIONS.has(extname(path).toLocaleLowerCase())) return []
+    const bytes = readRegularFile(absolute)
+    if (!bytes) return []
     if (bytes.length > 8 * 1024 * 1024 || bytes.includes(0)) return []
     return scanSecretText(path, bytes.toString('utf8'), { bundleDirectories, publicBundleValues })
   })
