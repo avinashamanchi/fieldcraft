@@ -4,13 +4,14 @@ Last updated: 2026-08-11. `PASS` means directly observed evidence for the curren
 
 ## Local implementation and CI
 
-- [x] The implementation through `f2a4952` was verified in the isolated `codex/app-store-finalization-20260810` worktree; this evidence does not infer deployment, upload, submission, or publication.
+- [x] The current `codex/app-store-finalization-20260810` candidate was verified in its isolated worktree; this evidence does not infer deployment, upload, submission, or publication.
 - [x] Root tests, typecheck, lint, web build, and redacted secret scan passed under Node 22.
 - [x] Mobile Jest, typecheck, lint, Expo Doctor, and iOS export passed under Node 22.
 - [x] Supabase migration boundary and 53 PGlite database checks passed; the mobile suite includes a real SQLite grammar test for every migration.
 - [x] Deno 2.9.5 format and lint checked all 27 Edge TypeScript files; 30 Edge tests passed and all 9 discovered function entrypoints passed `deno check`.
 - [x] CI, deploy, release-readiness, and Maestro YAML parsed; release readiness is manual-only and has no deploy/submit command.
 - [x] Root production dependency audit reported zero vulnerabilities.
+- [x] GitHub Dependabot alerts and automated security fixes are enabled. CodeQL default setup uses the extended query suite for Actions and JavaScript/TypeScript, workflow actions are pinned to immutable commit SHAs, and the release candidate rejects off-domain Supabase function URLs before sending an authorization token.
 - [x] Mobile CI fails closed on any high/critical advisory except the two explicitly reviewed `image-size` parser advisories (GitHub sources `1138808` and `1138809`) through Expo/Metro. The 2026-08-09 report has 12 transitive findings; npm proposes only breaking Expo/React Native downgrades, so the gate records the exception instead of forcing that remediation.
 - [x] 1024×1024 opaque RGB icon validated and configured.
 - [x] First release is explicitly iPhone-only; the unverified iPad target and 13-inch screenshot obligation were removed from the v1 configuration.
@@ -30,12 +31,12 @@ Last updated: 2026-08-11. `PASS` means directly observed evidence for the curren
 | Gate | Observed result |
 |---|---|
 | Runtime | Node `22.23.2` used for the fresh local gates; workflows retain their pinned Node 22 runner |
-| Root tests | 3 files, 23 tests passed |
-| Mobile tests | 62 suites, 617 tests passed |
+| Root tests | 5 files, 25 tests passed |
+| Mobile tests | 62 suites, 618 tests passed |
 | Database | Migration boundary and 53 PGlite checks passed; Node's real SQLite parser accepted the complete mobile migration chain |
 | Edge | Deno 2.9.5 format/lint checked 27 TypeScript files; 30 tests passed; all 9 dynamic function entrypoints passed `deno check` |
 | Expo | Doctor 18/18; the exact checkout exported a 7.5 MB Hermes iOS bundle. Earlier production prebuild evidence with sanitized public test values contained no Bonjour/local-network declarations, arbitrary ATS loads, or localhost transport exception |
-| Security | Root production audit: 0; the strict mobile gate accepted only the 12 transitive Expo/Metro findings rooted in the two reviewed advisories and rejects any new high/critical advisory; tracked/export secret scan passed; exact icon: 1024×1024 PNG, RGB, no alpha |
+| Security | Root production audit: 0; CodeQL extended analysis is enabled for Actions and JavaScript/TypeScript; the strict mobile gate accepted only the 12 transitive Expo/Metro findings rooted in the two reviewed advisories and rejects any new high/critical advisory; tracked/export secret scan passed; exact icon: 1024×1024 PNG, RGB, no alpha |
 | Capacity contracts | Static k6 scenario/evaluator gate passed; no live 1,000-user or 2,500-session success claim is made |
 | Workflows | CI now runs the load-scenario contract gate; release-readiness remains manual-only and has no deploy/submit command |
 
@@ -92,4 +93,4 @@ Observed warnings/limitations: Vite reported a web chunk above 500 kB after mini
 
 ## Current stop condition
 
-The repository-controlled gates through `f2a4952` pass locally. The revised legal pages still require merge/Pages deployment and a fresh public byte comparison. EAS reported `Not logged in` on 2026-08-10, Supabase CLI has no authorized project session, and this Mac has Command Line Tools rather than full Xcode (CocoaPods 1.17.0 alone is insufficient). Provider deployment, live staging load, signed-device native/provider validation, sandbox purchases, TestFlight, and App Store submission stop at authorized Supabase, RevenueCat, Stripe, reminder-provider, Expo, Apple, and hardware prompts. No credential should be pasted into chat, source, shell history, CI logs, or this checklist.
+The repository-controlled gates for the current candidate pass locally. The revised legal pages still require merge/Pages deployment and a fresh public byte comparison. EAS reported `Not logged in` on 2026-08-10, Supabase CLI has no authorized project session, and this Mac has Command Line Tools rather than full Xcode (CocoaPods 1.17.0 alone is insufficient). Provider deployment, live staging load, signed-device native/provider validation, sandbox purchases, TestFlight, and App Store submission stop at authorized Supabase, RevenueCat, Stripe, reminder-provider, Expo, Apple, and hardware prompts. No credential should be pasted into chat, source, shell history, CI logs, or this checklist.
