@@ -268,17 +268,35 @@ Deno.test("verifies RevenueCat HMAC over the exact body and rejects tampering an
     byte.toString(16).padStart(2, "0")
   ).join("");
   const header = `t=${timestamp},v1=${signature}`;
-  assert(await verify(rawBytes, header, TEST_SIGNING_SECRET, TEST_NOW_MS), "valid HMAC");
   assert(
-    !(await verify(new TextEncoder().encode(`${raw} `), header, TEST_SIGNING_SECRET, TEST_NOW_MS)),
+    await verify(rawBytes, header, TEST_SIGNING_SECRET, TEST_NOW_MS),
+    "valid HMAC",
+  );
+  assert(
+    !(await verify(
+      new TextEncoder().encode(`${raw} `),
+      header,
+      TEST_SIGNING_SECRET,
+      TEST_NOW_MS,
+    )),
     "tampered body",
   );
   assert(
-    !(await verify(rawBytes, header, TEST_SIGNING_SECRET, TEST_NOW_MS + 301_000)),
+    !(await verify(
+      rawBytes,
+      header,
+      TEST_SIGNING_SECRET,
+      TEST_NOW_MS + 301_000,
+    )),
     "stale delivery",
   );
   assert(
-    !(await verify(rawBytes, `t=${timestamp},v1=not-hex`, TEST_SIGNING_SECRET, TEST_NOW_MS)),
+    !(await verify(
+      rawBytes,
+      `t=${timestamp},v1=not-hex`,
+      TEST_SIGNING_SECRET,
+      TEST_NOW_MS,
+    )),
     "malformed signature",
   );
 });

@@ -256,15 +256,15 @@ const constantTimeSecret = async (
 };
 
 const bytesToHex = (value: ArrayBuffer): string =>
-  [...new Uint8Array(value)].map((byte) =>
-    byte.toString(16).padStart(2, "0")
-  ).join("");
+  [...new Uint8Array(value)].map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
 
 const constantTimeHex = (left: string, right: string): boolean => {
   let difference = left.length === right.length ? 0 : 1;
   const maximum = Math.max(left.length, right.length);
   for (let index = 0; index < maximum; index += 1) {
-    difference |= (left.charCodeAt(index) || 0) ^ (right.charCodeAt(index) || 0);
+    difference |= (left.charCodeAt(index) || 0) ^
+      (right.charCodeAt(index) || 0);
   }
   return difference === 0;
 };
@@ -277,7 +277,8 @@ export const verifyRevenueCatSignature = async (
   toleranceSeconds = 300,
 ): Promise<boolean> => {
   if (
-    !signatureHeader || signingSecret.length < 32 || signingSecret.length > 256 ||
+    !signatureHeader || signingSecret.length < 32 ||
+    signingSecret.length > 256 ||
     !Number.isFinite(nowMs) || !Number.isSafeInteger(toleranceSeconds) ||
     toleranceSeconds < 0 || toleranceSeconds > 900
   ) return false;
@@ -292,11 +293,16 @@ export const verifyRevenueCatSignature = async (
   }
   const timestamp = fields.get("t") ?? "";
   const supplied = fields.get("v1") ?? "";
-  if (!/^[1-9][0-9]{0,12}$/.test(timestamp) || !/^[0-9a-f]{64}$/.test(supplied)) {
+  if (
+    !/^[1-9][0-9]{0,12}$/.test(timestamp) || !/^[0-9a-f]{64}$/.test(supplied)
+  ) {
     return false;
   }
   const seconds = Number(timestamp);
-  if (!Number.isSafeInteger(seconds) || Math.abs(nowMs / 1000 - seconds) > toleranceSeconds) {
+  if (
+    !Number.isSafeInteger(seconds) ||
+    Math.abs(nowMs / 1000 - seconds) > toleranceSeconds
+  ) {
     return false;
   }
   const prefix = new TextEncoder().encode(`${timestamp}.`);
@@ -310,7 +316,9 @@ export const verifyRevenueCatSignature = async (
     false,
     ["sign"],
   );
-  const computed = bytesToHex(await crypto.subtle.sign("HMAC", key, signedPayload));
+  const computed = bytesToHex(
+    await crypto.subtle.sign("HMAC", key, signedPayload),
+  );
   return constantTimeHex(computed, supplied);
 };
 
