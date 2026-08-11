@@ -1,14 +1,14 @@
 # FieldCraft iOS release checklist
 
-Last updated: 2026-08-10. `PASS` means directly observed evidence for the current scoped candidate. `BLOCKED` means credentials, provider state, hardware, a missing local tool, or App Store Connect are still required. Blank boxes are not complete.
+Last updated: 2026-08-11. `PASS` means directly observed evidence for the current scoped candidate. `BLOCKED` means credentials, provider state, hardware, a missing local tool, or App Store Connect are still required. Blank boxes are not complete.
 
 ## Local implementation and CI
 
-- [x] The current `origin/main` implementation baseline at `273e94e` was verified in a clean finalization worktree; this evidence refresh does not infer an upload or submission.
+- [x] The implementation through `f2a4952` was verified in the isolated `codex/app-store-finalization-20260810` worktree; this evidence does not infer deployment, upload, submission, or publication.
 - [x] Root tests, typecheck, lint, web build, and redacted secret scan passed under Node 22.
 - [x] Mobile Jest, typecheck, lint, Expo Doctor, and iOS export passed under Node 22.
-- [x] Supabase migration boundary and 42 PGlite database checks passed; the mobile suite includes a real SQLite grammar test for every migration.
-- [x] Deno 2.9.5 format and lint checked all 12 Edge files; 20 Edge tests passed and every discovered function entrypoint passed `deno check`.
+- [x] Supabase migration boundary and 53 PGlite database checks passed; the mobile suite includes a real SQLite grammar test for every migration.
+- [x] Deno 2.9.5 format and lint checked all 27 Edge TypeScript files; 30 Edge tests passed and all 9 discovered function entrypoints passed `deno check`.
 - [x] CI, deploy, release-readiness, and Maestro YAML parsed; release readiness is manual-only and has no deploy/submit command.
 - [x] Root production dependency audit reported zero vulnerabilities.
 - [x] Mobile CI fails closed on any high/critical advisory except the two explicitly reviewed `image-size` parser advisories (GitHub sources `1138808` and `1138809`) through Expo/Metro. The 2026-08-09 report has 12 transitive findings; npm proposes only breaking Expo/React Native downgrades, so the gate records the exception instead of forcing that remediation.
@@ -21,6 +21,9 @@ Last updated: 2026-08-10. `PASS` means directly observed evidence for the curren
 - [x] `apple-review-guideline-applicability.md` records every Apple Safety, Performance, Business, Design, and Legal family as implemented, externally gated, or not applicable; absent UGC, Kids, gambling, VPN, MDM, social login, Apple Pay, and downloaded-code features cannot be silently added after review.
 - [x] Delete Account checks the recent-authenticator guard before any destructive request, routes to the delete-account step-up screen, and offers authenticator setup when no verified factor exists; the server independently enforces recent AAL2.
 - [x] A production-only Expo config plugin strips development Bonjour/local-network discovery declarations, disables arbitrary ATS loads, and removes localhost transport exceptions from the generated release Info.plist.
+- [x] Account deletion atomically invalidates new owner writes, revokes active payment links and queued reminders, retries safely, treats Stripe unlinking as best effort, deletes owner cloud/auth data, and clears local repository/outbox/quarantine/conflicts/auth/entitlement/link/reminder/consent/artifact state before removing the durable erasure marker.
+- [x] Operational logging is restricted to content-free allowlisted fields and rotating HMAC owner digests; PostgreSQL rejects raw identity/content dimensions and prunes operational events separately from 400-day idempotency/provider receipts.
+- [x] Versioned k6 staging scenarios define 250 pull RPS plus 100 mutation RPS for 10 minutes, 25 signed webhook RPS for 10 minutes with 20% duplicates, 2,500 realtime sessions for 30 minutes, strict latency/error thresholds, and zero-tolerance isolation/duplicate/lost-ack counters. The local gate validates the scenarios and boundary evaluators only; live staging execution remains blocked.
 
 ### Observed clean-clone evidence
 
@@ -28,12 +31,13 @@ Last updated: 2026-08-10. `PASS` means directly observed evidence for the curren
 |---|---|
 | Runtime | Node `22.23.2` used for the fresh local gates; workflows retain their pinned Node 22 runner |
 | Root tests | 3 files, 23 tests passed |
-| Mobile tests | 50 suites, 583 tests passed |
-| Database | Migration boundary and 42 PGlite checks passed; Node's real SQLite parser accepted the complete mobile migration chain |
-| Edge | Deno 2.9.5 format/lint checked 12 files; 20 tests passed; the dynamic entrypoint set passed `deno check` |
-| Expo | Doctor 18/18; the exact checkout exported a 7.3 MB Hermes iOS bundle. A production prebuild with sanitized public test values contained no Bonjour/local-network declarations, arbitrary ATS loads, or localhost transport exception |
+| Mobile tests | 62 suites, 617 tests passed |
+| Database | Migration boundary and 53 PGlite checks passed; Node's real SQLite parser accepted the complete mobile migration chain |
+| Edge | Deno 2.9.5 format/lint checked 27 TypeScript files; 30 tests passed; all 9 dynamic function entrypoints passed `deno check` |
+| Expo | Doctor 18/18; the exact checkout exported a 7.5 MB Hermes iOS bundle. Earlier production prebuild evidence with sanitized public test values contained no Bonjour/local-network declarations, arbitrary ATS loads, or localhost transport exception |
 | Security | Root production audit: 0; the strict mobile gate accepted only the 12 transitive Expo/Metro findings rooted in the two reviewed advisories and rejects any new high/critical advisory; tracked/export secret scan passed; exact icon: 1024×1024 PNG, RGB, no alpha |
-| Workflows | Release-readiness remains manual-only and has no deploy/submit command; YAML parse is part of the final scoped snapshot gate |
+| Capacity contracts | Static k6 scenario/evaluator gate passed; no live 1,000-user or 2,500-session success claim is made |
+| Workflows | CI now runs the load-scenario contract gate; release-readiness remains manual-only and has no deploy/submit command |
 
 Observed warnings/limitations: Vite reported a web chunk above 500 kB after minification; Node labels its built-in SQLite API experimental; the mobile audit risk is recorded above. CocoaPods 1.17.0 is installed, but the selected developer directory is Command Line Tools and no usable full Xcode archive proof exists, so a Swift/Pods compile and signed archive were not run.
 
@@ -51,14 +55,16 @@ Observed warnings/limitations: Vite reported a web chunk above 500 kB after mini
 ## Backend and privacy
 
 - [ ] User applies ordered migrations to the user-owned Supabase project.
-- [ ] User configures `GROQ_API_KEY` and `AI_RATE_LIMIT_HMAC_SECRET` through provider secret prompts.
+- [ ] User configures AI, RevenueCat, Stripe, reminder-provider, and observability HMAC secrets through provider secret prompts.
 - [ ] Functions deploy and synthetic consented requests pass with content-free logs.
 - [ ] EAS public environment contains the production Supabase URL/publishable key; no service-role/provider secret is present in the app or web bundles.
 - [ ] Account deletion removes the authenticated user, owner-scoped logo, synced records, local cache, outbox, conflicts, session, consent, and temporary artifacts.
-- [x] Anonymous checks on 2026-08-10 returned HTTPS 200 for Privacy, Terms, and Support, and every response was byte-for-byte identical to its tracked `public/` release file.
+- [ ] Publish commit `f2a4952` (or its reviewed descendant), then recheck Privacy, Terms, and Support over HTTPS and byte-compare the responses to the revised tracked files. `BLOCKED until the branch is merged and Pages deploys.`
 - [ ] Reconcile those published pages once more against the final deployed Supabase functions, provider retention settings, deletion behavior, and product limits immediately before submission.
 - [ ] App Store privacy answers match the final production binary and deployed services.
 - [ ] RevenueCat App Store app, `FieldCraft Pro` subscription group, exact products, `pro` entitlement, `default` offering, webhook secret, and restore-transfer behavior are configured and directly verified.
+- [ ] Stripe Connect platform, hosted Checkout/payment-link URLs, signed webhook, reminder sending domain, delivery webhook, and retention/pruning schedule are configured and directly verified with synthetic accounts.
+- [ ] All four k6 scenarios pass against production-equivalent staging while database connections/CPU/locks, Edge concurrency, Realtime disconnects, provider outage recovery, and isolation counters are monitored. Local scenario validation is not capacity proof.
 - [ ] Reviewer account stays active for the entire review window, uses synthetic data, reaches all account-based features, and has exact onboarding/MFA/recovery instructions in App Review Information.
 
 ## Apple/TestFlight/App Review
@@ -86,4 +92,4 @@ Observed warnings/limitations: Vite reported a web chunk above 500 kB after mini
 
 ## Current stop condition
 
-All repository-controlled no-deploy gates listed above are complete. EAS reported `Not logged in` on 2026-08-10, Supabase CLI has no authorized project session, and this Mac has Command Line Tools rather than full Xcode (CocoaPods 1.17.0 alone is insufficient). Provider deployment, signed-device native validation, sandbox purchases, TestFlight, and App Store submission stop at authorized Supabase, RevenueCat, Expo, Apple, and hardware prompts. No credential should be pasted into chat, source, shell history, CI logs, or this checklist.
+The repository-controlled gates through `f2a4952` pass locally. The revised legal pages still require merge/Pages deployment and a fresh public byte comparison. EAS reported `Not logged in` on 2026-08-10, Supabase CLI has no authorized project session, and this Mac has Command Line Tools rather than full Xcode (CocoaPods 1.17.0 alone is insufficient). Provider deployment, live staging load, signed-device native/provider validation, sandbox purchases, TestFlight, and App Store submission stop at authorized Supabase, RevenueCat, Stripe, reminder-provider, Expo, Apple, and hardware prompts. No credential should be pasted into chat, source, shell history, CI logs, or this checklist.
