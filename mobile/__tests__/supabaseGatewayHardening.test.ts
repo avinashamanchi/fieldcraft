@@ -108,10 +108,23 @@ const rawInvoice = (overrides: Record<string, unknown> = {}) => ({
   id: 'invoice-1', user_id: OWNER, client_id: 'client-1', job_id: 'job-1', number: 'INV-1',
   line_items: [{ description: 'Cloud labor', type: 'labor', quantity: 1000, unitPriceCents: 200 }],
   subtotal_cents: 200, tax_basis_points: 0, tax_cents: 0, total_cents: 200,
-  payment_terms: 'Due on receipt', version: 6,
+  payment_terms: 'Due on receipt', status: 'Draft', version: 6,
   created_at: '2026-08-03T10:00:00.000Z', updated_at: '2026-08-03T10:00:06.000Z',
   clients: { name: 'Cloud name' },
   jobs: { title: 'Cloud job', trade_type: 'Plumbing' },
+  ...overrides,
+})
+
+const rawEstimate = (overrides: Record<string, unknown> = {}) => ({
+  id: 'estimate-1', user_id: OWNER, client_id: 'client-1', number: 'EST-1',
+  revision: 1, status: 'Converted', title: 'Cloud estimate', scope: 'Cloud scope',
+  line_items: [{ description: 'Cloud labor', type: 'labor', quantity: 1000, unitPriceCents: 200 }],
+  subtotal_cents: 200, tax_basis_points: 0, tax_cents: 0, total_cents: 200,
+  expires_at: '2026-09-03T10:00:00.000Z', issued_at: '2026-08-03T10:00:00.000Z',
+  accepted_at: '2026-08-03T10:01:00.000Z', acceptance_recorded_by: OWNER,
+  converted_job_id: 'job-1', issued_snapshot: { totalCents: 200 },
+  version: 4, created_at: '2026-08-03T10:00:00.000Z',
+  updated_at: '2026-08-03T10:00:04.000Z',
   ...overrides,
 })
 
@@ -179,7 +192,7 @@ it('pulls one owner-filtered global change feed page with a committed owner sequ
     name: 'pull_sync_changes',
     parameters: {
       p_cursor_change_seq: 40,
-      p_limit: 500,
+      p_limit: 200,
     },
   }])
   expect(result.rows.map((row) => ({ entityId: row.entityId, changeSeq: row.changeSeq }))).toEqual([
@@ -1043,4 +1056,60 @@ it('bounds a hung RPC with a gateway deadline even when the provider ignores abo
   } finally {
     jest.useRealTimers()
   }
+})
+
+it('routes conversion through its dedicated RPC and validates every returned canonical row', async () => {
+  const client = new Client()
+  client.replies = [{
+    status: 200,
+    error: null,
+    data: {
+      status: 'applied',
+      mutation_id: MUTATION_ID,
+      entity: 'estimate',
+      kind: 'convert_estimate',
+      entity_id: 'estimate-1',
+      cloud: rawEstimate(),
+      sync_position: {
+        updated_at: '2026-08-03T10:00:04.000Z', change_seq: 80, change_id: 80, source: 'sync_changes',
+      },
+      cloud_rows: [{
+        entity: 'job',
+        cloud: rawJob({ updated_at: '2026-08-03T10:00:03.000Z', version: 3 }),
+        sync_position: {
+          updated_at: '2026-08-03T10:00:03.000Z', change_seq: 79, change_id: 79, source: 'sync_changes',
+        },
+      }],
+    },
+  }]
+  const mutation: MutationEnvelope = {
+    id: MUTATION_ID,
+    ownerId: OWNER,
+    entity: 'estimate',
+    entityId: 'estimate-1',
+    kind: 'convert_estimate',
+    baseVersion: 3,
+    payload: {
+      estimateId: 'estimate-1', jobId: 'job-1', baseVersion: 3,
+      now: '2026-08-03T10:00:03.000Z',
+    },
+    createdAt: '2026-08-03T10:00:03.000Z',
+    attempts: 0,
+  }
+
+  await expect(createSupabaseGateway(client).pushMutation(
+    OWNER,
+    mutation,
+    new AbortController().signal,
+  )).resolves.toMatchObject({
+    type: 'applied',
+    rows: [
+      { entity: 'estimate', entityId: 'estimate-1', changeSeq: 80 },
+      { entity: 'job', entityId: 'job-1', changeSeq: 79 },
+    ],
+  })
+  expect(client.calls).toEqual([{
+    name: 'convert_estimate',
+    parameters: { p_mutation_id: MUTATION_ID, p_payload: mutation.payload },
+  }])
 })

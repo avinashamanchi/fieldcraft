@@ -93,4 +93,27 @@ export const calculateInvoice = (input: InvoiceDraft): CalculatedInvoice => {
   }
 }
 
+export type PersistedInvoiceStatus = 'Draft' | 'Issued' | 'Viewed' | 'Partially Paid' | 'Paid' | 'Void'
+export type InvoiceDisplayStatus = PersistedInvoiceStatus | 'Overdue'
+
+export const deriveInvoiceDisplayStatus = (
+  persistedStatus: PersistedInvoiceStatus,
+  dueAt: string,
+  balanceCents: number,
+  now: string,
+): InvoiceDisplayStatus => {
+  if (!Number.isSafeInteger(balanceCents) || balanceCents < 0 || balanceCents > MAX_MONEY_CENTS) {
+    throw new Error('INVALID_INVOICE_BALANCE')
+  }
+  const due = Date.parse(dueAt)
+  const observedAt = Date.parse(now)
+  if (!Number.isFinite(due) || !Number.isFinite(observedAt)) throw new Error('INVALID_INVOICE_TIMESTAMP')
+  if (
+    balanceCents > 0 &&
+    due < observedAt &&
+    ['Issued', 'Viewed', 'Partially Paid'].includes(persistedStatus)
+  ) return 'Overdue'
+  return persistedStatus
+}
+
 export type { InvoiceDraft, LineItemDraft, PaymentTerms, TradeType }

@@ -30,11 +30,23 @@ const EntityNameSchema = z.enum([
   'client',
   'job',
   'invoice',
+  'estimate',
+  'payment',
+  'reminder_schedule',
   'expense',
   'service',
   'inventory',
 ])
-const MutationKindSchema = z.enum(['create', 'update', 'delete', 'save_invoice_bundle'])
+const MutationKindSchema = z.enum([
+  'create',
+  'update',
+  'delete',
+  'save_invoice_bundle',
+  'save_estimate',
+  'convert_estimate',
+  'issue_invoice',
+  'record_manual_payment',
+])
 const SyncStateSchema = z.enum(['current', 'pending', 'syncing', 'failed', 'conflict'])
 const MoneySchema = z.number().finite().int().min(0).max(MAX_MONEY_CENTS)
 const VersionedEntitySchema = z
@@ -72,7 +84,10 @@ const entityPayloadSchemas: Record<EntityName, z.ZodType> = {
   job: VersionedEntitySchema.extend({
     clientId: z.string().min(1),
     title: z.string().min(1).max(200),
-    status: z.enum(['Scheduled', 'In Progress', 'Invoiced', 'Paid']),
+    status: z.enum([
+      'Scheduled', 'In Progress', 'Completed', 'Invoiced',
+      'Partially Paid', 'Paid', 'Cancelled',
+    ]),
     tradeType: z.enum([
       'Plumbing', 'Electrical', 'HVAC', 'Carpentry', 'General', 'Roofing', 'Flooring', 'Painting',
     ]).optional(),
@@ -91,6 +106,54 @@ const entityPayloadSchemas: Record<EntityName, z.ZodType> = {
     subtotalCents: MoneySchema,
     taxCents: MoneySchema,
     totalCents: MoneySchema,
+    number: z.string().min(1).max(64).optional(),
+    status: z.enum(['Draft', 'Issued', 'Viewed', 'Partially Paid', 'Paid', 'Void']).optional(),
+    issuedAt: z.string().optional(),
+    dueAt: z.string().optional(),
+  }),
+  estimate: VersionedEntitySchema.extend({
+    clientId: z.string().min(1),
+    convertedJobId: z.string().min(1).optional(),
+    number: z.string().min(1).max(64).optional(),
+    revision: z.number().finite().int().min(1),
+    status: z.enum(['Draft', 'Issued', 'Accepted', 'Declined', 'Expired', 'Converted', 'Void']),
+    title: z.string().min(1).max(200),
+    scope: z.string().min(1).max(4000),
+    lineItems: InvoiceDraftSchema.shape.lineItems,
+    subtotalCents: MoneySchema,
+    taxBasisPoints: z.number().finite().int().min(0).max(10_000),
+    taxCents: MoneySchema,
+    totalCents: MoneySchema,
+    expiresAt: z.string().min(1),
+    issuedAt: z.string().min(1).optional(),
+    acceptedAt: z.string().min(1).optional(),
+    acceptanceRecordedBy: z.string().min(1).optional(),
+    issuedSnapshot: z.unknown().optional(),
+    notes: z.string().max(4000).optional(),
+  }),
+  payment: VersionedEntitySchema.extend({
+    invoiceId: z.string().min(1),
+    amountCents: MoneySchema.min(1),
+    currency: z.literal('USD'),
+    method: z.enum(['Stripe', 'Cash', 'Check', 'Bank Transfer', 'Other']),
+    status: z.enum(['Pending', 'Succeeded', 'Failed', 'Partially Refunded', 'Refunded', 'Disputed']),
+    refundedCents: MoneySchema,
+    manual: z.boolean(),
+    providerPaymentIntentId: z.string().min(1).max(255).optional(),
+    providerChargeId: z.string().min(1).max(255).optional(),
+    providerEventAt: z.string().min(1).optional(),
+  }).superRefine((payment, context) => {
+    if (payment.refundedCents > payment.amountCents) {
+      context.addIssue({ code: 'custom', path: ['refundedCents'], message: 'refund exceeds payment' })
+    }
+  }),
+  reminder_schedule: VersionedEntitySchema.extend({
+    invoiceId: z.string().min(1),
+    active: z.boolean(),
+    recipientEmail: z.string().email().max(320),
+    hasReminderConsent: z.boolean(),
+    occurrences: z.array(z.enum(['three-days-before', 'due', 'seven-days-overdue']))
+      .min(1).max(3),
   }),
   expense: VersionedEntitySchema.extend({
     vendor: z.string().min(1).max(200),

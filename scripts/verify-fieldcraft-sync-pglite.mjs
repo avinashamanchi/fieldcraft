@@ -36,6 +36,13 @@ const bundleJobId = '79000000-0000-0000-0000-000000000072'
 const bundleInvoiceId = '79000000-0000-0000-0000-000000000073'
 const secondOwnerId = '70000000-0000-0000-0000-000000000072'
 const roleOnboardingMutationId = '7a000000-0000-4000-8000-000000000072'
+const lifecycleOwnerId = '83000000-0000-4000-8000-000000000001'
+const lifecycleClientId = '83100000-0000-4000-8000-000000000001'
+const lifecycleEstimateId = '83200000-0000-4000-8000-000000000001'
+const lifecycleJobId = '83300000-0000-4000-8000-000000000001'
+const lifecycleInvoiceId = '83400000-0000-4000-8000-000000000001'
+const lifecycleManualPaymentId = '83500000-0000-4000-8000-000000000001'
+const lifecycleProviderPaymentId = '83500000-0000-4000-8000-000000000002'
 
 const db = new PGlite()
 const failures = []
@@ -296,6 +303,7 @@ try {
   await db.exec(await readMigration('202608060004_fieldcraft_ai_rate_limits.sql'))
   await db.exec(await readMigration('202608070001_fieldcraft_identity_security.sql'))
   await db.exec(await readMigration('202608070002_fieldcraft_entitlements.sql'))
+  await db.exec(await readMigration('202608070003_fieldcraft_business_lifecycle.sql'))
   // Supabase grants its service role platform-level table and sequence access.
   // Model that runtime privilege here without changing production migrations or
   // granting user-facing RPCs that the migration intentionally withholds.
@@ -1673,7 +1681,7 @@ try {
           taxCents: 0,
           totalCents: 100,
           paymentTerms: 'Due on receipt',
-          status: 'Sent',
+          status: 'Issued',
         }),
       ]))
     }
@@ -1698,11 +1706,360 @@ try {
       () => db.query(`
         select public.apply_entity_mutation(
           '82700000-0000-4000-8000-000000000007', 'invoice', 'update', $1, 1,
-          '{"status":"Sent"}'::jsonb
+          '{"status":"Issued"}'::jsonb
         )
       `, [draftInvoice]),
       '42501',
     ))
+  })
+
+  await db.exec(`
+    insert into auth.users (id, email)
+    values ('${lifecycleOwnerId}', 'lifecycle-owner@example.test');
+    begin;
+    select public.fieldcraft_lock_sync_owner('${lifecycleOwnerId}', null);
+    insert into public.clients (id, user_id, name)
+    values ('${lifecycleClientId}', '${lifecycleOwnerId}', 'Lifecycle client');
+    commit;
+  `)
+  await db.query(`select set_config('request.jwt.claim.sub', $1, false)`, [lifecycleOwnerId])
+
+  const estimateBase = {
+    id: lifecycleEstimateId,
+    ownerId: lifecycleOwnerId,
+    clientId: lifecycleClientId,
+    revision: 1,
+    status: 'Draft',
+    title: 'Replace valve',
+    scope: 'Replace the failed shutoff valve.',
+    lineItems: [{ description: 'Labor', type: 'labor', quantity: 1000, unitPriceCents: 10000 }],
+    subtotalCents: 10000,
+    taxBasisPoints: 825,
+    taxCents: 825,
+    totalCents: 10825,
+    expiresAt: '2026-09-10T20:00:00.000Z',
+    version: 0,
+    createdAt: '2026-08-10T20:00:00.000Z',
+    updatedAt: '2026-08-10T20:00:00.000Z',
+    syncState: 'pending',
+  }
+
+  let issuedEstimateResponse
+  await verify('estimate lifecycle is immutable, transition-checked, idempotent, and conversion-once', async () => {
+    const draftMutation = '83600000-0000-4000-8000-000000000001'
+    const draft = await withRole('authenticated', () => db.query(
+      'select public.save_estimate($1, $2::jsonb) as response',
+      [draftMutation, JSON.stringify(estimateBase)],
+    ))
+    const replay = await withRole('authenticated', () => db.query(
+      'select public.save_estimate($1, $2::jsonb) as response',
+      [draftMutation, JSON.stringify({ ...estimateBase, title: 'Changed replay body' })],
+    ))
+    if (
+      JSON.stringify(draft.rows[0]?.response) !== JSON.stringify(replay.rows[0]?.response) ||
+      draft.rows[0]?.response?.cloud?.status !== 'Draft'
+    ) throw new Error('draft receipt replay was not byte-stable')
+
+    const issuedPayload = {
+      ...estimateBase,
+      version: 1,
+      status: 'Issued',
+      number: 'EST-1001',
+      issuedAt: '2026-08-10T20:00:00.000Z',
+    }
+    const issued = await withRole('authenticated', () => db.query(
+      'select public.save_estimate($1, $2::jsonb) as response',
+      ['83600000-0000-4000-8000-000000000002', JSON.stringify(issuedPayload)],
+    ))
+    issuedEstimateResponse = issued.rows[0]?.response
+    if (
+      issuedEstimateResponse?.cloud?.status !== 'Issued' ||
+      Number(issuedEstimateResponse?.cloud?.version) !== 2 ||
+      issuedEstimateResponse?.cloud?.issued_snapshot?.totalCents !== 10825
+    ) throw new Error(`issued estimate was ${JSON.stringify(issuedEstimateResponse)}`)
+
+    const acceptedPayload = { ...issuedPayload, version: 2, status: 'Accepted' }
+    const accepted = await withRole('authenticated', () => db.query(
+      'select public.save_estimate($1, $2::jsonb) as response',
+      ['83600000-0000-4000-8000-000000000003', JSON.stringify(acceptedPayload)],
+    ))
+    if (
+      accepted.rows[0]?.response?.cloud?.status !== 'Accepted' ||
+      accepted.rows[0]?.response?.cloud?.acceptance_recorded_by !== lifecycleOwnerId
+    ) throw new Error(`accepted estimate was ${JSON.stringify(accepted.rows[0]?.response)}`)
+
+    await withRole('authenticated', () => expectSqlState(
+      () => db.query(
+        'select public.save_estimate($1, $2::jsonb)',
+        ['83600000-0000-4000-8000-000000000004', JSON.stringify({
+          ...acceptedPayload,
+          version: 3,
+          title: 'Changed after issue',
+        })],
+      ),
+      '22023',
+    ))
+
+    const converted = await withRole('authenticated', () => db.query(
+      'select public.convert_estimate($1, $2::jsonb) as response',
+      ['83600000-0000-4000-8000-000000000005', JSON.stringify({
+        estimateId: lifecycleEstimateId,
+        jobId: lifecycleJobId,
+        baseVersion: 3,
+        now: '2026-08-10T21:00:00.000Z',
+      })],
+    ))
+    const conversionReplay = await withRole('authenticated', () => db.query(
+      'select public.convert_estimate($1, $2::jsonb) as response',
+      ['83600000-0000-4000-8000-000000000005', JSON.stringify({
+        estimateId: lifecycleEstimateId,
+        jobId: '83300000-0000-4000-8000-000000000099',
+        baseVersion: 99,
+        now: '2026-08-11T21:00:00.000Z',
+      })],
+    ))
+    if (
+      converted.rows[0]?.response?.cloud?.status !== 'Converted' ||
+      converted.rows[0]?.response?.cloud_rows?.[0]?.entity !== 'job' ||
+      JSON.stringify(converted.rows[0]?.response) !== JSON.stringify(conversionReplay.rows[0]?.response)
+    ) throw new Error(`conversion response was ${JSON.stringify(converted.rows[0]?.response)}`)
+    await withRole('authenticated', () => expectSqlStateIn(
+      () => db.query(
+        'select public.convert_estimate($1, $2::jsonb)',
+        ['83600000-0000-4000-8000-000000000006', JSON.stringify({
+          estimateId: lifecycleEstimateId,
+          jobId: '83300000-0000-4000-8000-000000000099',
+          baseVersion: 4,
+          now: '2026-08-11T21:00:00.000Z',
+        })],
+      ),
+      ['22023', '40001'],
+    ))
+  })
+
+  await verify('estimate input rejects 101 line items and cross-owner relationships atomically', async () => {
+    const receiptCountBefore = await db.query(
+      'select count(*)::int as count from public.mutation_receipts where user_id = $1',
+      [lifecycleOwnerId],
+    )
+    await withRole('authenticated', () => expectSqlState(
+      () => db.query(
+        'select public.save_estimate($1, $2::jsonb)',
+        ['83600000-0000-4000-8000-000000000007', JSON.stringify({
+          ...estimateBase,
+          id: '83200000-0000-4000-8000-000000000002',
+          lineItems: Array.from({ length: 101 }, (_, index) => ({
+            description: `Line ${index + 1}`,
+            type: 'labor',
+            quantity: 1000,
+            unitPriceCents: 1,
+          })),
+          subtotalCents: 101,
+          taxBasisPoints: 0,
+          taxCents: 0,
+          totalCents: 101,
+        })],
+      ),
+      '22023',
+    ))
+    await withRole('authenticated', () => expectSqlStateIn(
+      () => db.query(
+        'select public.save_estimate($1, $2::jsonb)',
+        ['83600000-0000-4000-8000-000000000008', JSON.stringify({
+          ...estimateBase,
+          id: '83200000-0000-4000-8000-000000000003',
+          clientId,
+        })],
+      ),
+      ['23503', '42501'],
+    ))
+    const receiptCountAfter = await db.query(
+      'select count(*)::int as count from public.mutation_receipts where user_id = $1',
+      [lifecycleOwnerId],
+    )
+    if (receiptCountAfter.rows[0]?.count !== receiptCountBefore.rows[0]?.count) {
+      throw new Error('rejected estimates wrote mutation receipts')
+    }
+  })
+
+  await verify('invoice issue and manual/provider payments are bounded, AAL2-gated, and replay-safe', async () => {
+    const createInvoice = await withRole('authenticated', () => db.query(`
+      select public.apply_entity_mutation(
+        $1, 'invoice', 'create', $2, null, $3::jsonb
+      ) as response
+    `, [
+      '83700000-0000-4000-8000-000000000001',
+      lifecycleInvoiceId,
+      JSON.stringify({
+        clientId: lifecycleClientId,
+        jobId: lifecycleJobId,
+        number: 'INV-1001',
+        lineItems: [{ description: 'Labor', type: 'labor', quantity: 1000, unitPriceCents: 10000 }],
+        subtotalCents: 10000,
+        taxBasisPoints: 0,
+        taxCents: 0,
+        totalCents: 10000,
+        paymentTerms: 'Due on receipt',
+        status: 'Draft',
+      }),
+    ]))
+    if (createInvoice.rows[0]?.response?.cloud?.status !== 'Draft') {
+      throw new Error('invoice draft was not created')
+    }
+    const issuePayload = {
+      invoiceId: lifecycleInvoiceId,
+      baseVersion: 1,
+      issuedAt: '2026-08-10T22:00:00.000Z',
+      dueAt: '2026-08-10T22:00:00.000Z',
+    }
+    const issued = await withRole('authenticated', () => db.query(
+      'select public.issue_invoice($1, $2::jsonb) as response',
+      ['83700000-0000-4000-8000-000000000002', JSON.stringify(issuePayload)],
+    ))
+    const issueReplay = await withRole('authenticated', () => db.query(
+      'select public.issue_invoice($1, $2::jsonb) as response',
+      ['83700000-0000-4000-8000-000000000002', JSON.stringify({ ...issuePayload, baseVersion: 99 })],
+    ))
+    if (
+      issued.rows[0]?.response?.cloud?.status !== 'Issued' ||
+      Number(issued.rows[0]?.response?.cloud?.balance_cents) !== 10000 ||
+      JSON.stringify(issued.rows[0]?.response) !== JSON.stringify(issueReplay.rows[0]?.response)
+    ) throw new Error(`invoice issue was ${JSON.stringify(issued.rows[0]?.response)}`)
+
+    await db.exec(`select set_config('request.jwt.claims', '{"aal":"aal1"}', false)`)
+    await withRole('authenticated', () => expectSqlState(
+      () => db.query(
+        'select public.record_manual_payment($1, $2::jsonb)',
+        ['83700000-0000-4000-8000-000000000003', JSON.stringify({
+          paymentId: lifecycleManualPaymentId,
+          invoiceId: lifecycleInvoiceId,
+          amountCents: 2500,
+          currency: 'USD',
+          method: 'Cash',
+          baseVersion: 2,
+          recordedAt: '2026-08-10T22:05:00.000Z',
+        })],
+      ),
+      '42501',
+    ))
+    const nowSeconds = Math.floor(Date.now() / 1000)
+    await db.query(`select set_config('request.jwt.claims', $1, false)`, [JSON.stringify({
+      aal: 'aal2',
+      amr: [{ method: 'totp', timestamp: nowSeconds - 30 }],
+    })])
+    const manualPayload = {
+      paymentId: lifecycleManualPaymentId,
+      invoiceId: lifecycleInvoiceId,
+      amountCents: 2500,
+      currency: 'USD',
+      method: 'Cash',
+      note: 'Owner-recorded cash payment',
+      baseVersion: 2,
+      recordedAt: '2026-08-10T22:05:00.000Z',
+    }
+    const manual = await withRole('authenticated', () => db.query(
+      'select public.record_manual_payment($1, $2::jsonb) as response',
+      ['83700000-0000-4000-8000-000000000004', JSON.stringify(manualPayload)],
+    ))
+    const manualReplay = await withRole('authenticated', () => db.query(
+      'select public.record_manual_payment($1, $2::jsonb) as response',
+      ['83700000-0000-4000-8000-000000000004', JSON.stringify({ ...manualPayload, amountCents: 1 })],
+    ))
+    if (
+      manual.rows[0]?.response?.cloud?.status !== 'Succeeded' ||
+      Number(manual.rows[0]?.response?.cloud_rows?.[0]?.cloud?.paid_cents) !== 2500 ||
+      JSON.stringify(manual.rows[0]?.response) !== JSON.stringify(manualReplay.rows[0]?.response)
+    ) throw new Error(`manual payment was ${JSON.stringify(manual.rows[0]?.response)}`)
+    await withRole('authenticated', () => expectSqlState(
+      () => db.query(
+        'select public.record_manual_payment($1, $2::jsonb)',
+        ['83700000-0000-4000-8000-000000000005', JSON.stringify({
+          ...manualPayload,
+          paymentId: '83500000-0000-4000-8000-000000000099',
+          amountCents: 7501,
+          baseVersion: 3,
+        })],
+      ),
+      '22023',
+    ))
+
+    const providerPayload = {
+      userId: lifecycleOwnerId,
+      paymentId: lifecycleProviderPaymentId,
+      invoiceId: lifecycleInvoiceId,
+      amountCents: 7500,
+      refundedCents: 0,
+      currency: 'USD',
+      status: 'Succeeded',
+      providerPaymentIntentId: 'pi_fieldcraft_fixture_1',
+      providerChargeId: 'ch_fieldcraft_fixture_1',
+      providerEventAt: '2026-08-10T22:10:00.000Z',
+    }
+    const provider = await withRole('service_role', () => db.query(
+      'select public.apply_provider_payment_event($1, $2::jsonb) as response',
+      ['evt_fieldcraft_fixture_1', JSON.stringify(providerPayload)],
+    ))
+    const duplicate = await withRole('service_role', () => db.query(
+      'select public.apply_provider_payment_event($1, $2::jsonb) as response',
+      ['evt_fieldcraft_fixture_1', JSON.stringify({ ...providerPayload, amountCents: 1 })],
+    ))
+    if (
+      provider.rows[0]?.response?.outcome !== 'applied' ||
+      duplicate.rows[0]?.response?.outcome !== 'duplicate'
+    ) throw new Error(`provider receipt outcomes were ${JSON.stringify({ provider: provider.rows[0], duplicate: duplicate.rows[0] })}`)
+    const paid = await db.query(
+      'select paid_cents, balance_cents, status from public.invoices where id = $1',
+      [lifecycleInvoiceId],
+    )
+    if (
+      Number(paid.rows[0]?.paid_cents) !== 10000 ||
+      Number(paid.rows[0]?.balance_cents) !== 0 ||
+      paid.rows[0]?.status !== 'Paid'
+    ) throw new Error(`paid projection was ${JSON.stringify(paid.rows[0])}`)
+
+    const refund = await withRole('service_role', () => db.query(
+      'select public.apply_provider_payment_event($1, $2::jsonb) as response',
+      ['evt_fieldcraft_fixture_2', JSON.stringify({
+        ...providerPayload,
+        status: 'Partially Refunded',
+        refundedCents: 1000,
+        providerEventAt: '2026-08-10T22:15:00.000Z',
+      })],
+    ))
+    const refunded = await db.query(
+      'select paid_cents, balance_cents, status from public.invoices where id = $1',
+      [lifecycleInvoiceId],
+    )
+    if (
+      refund.rows[0]?.response?.outcome !== 'applied' ||
+      Number(refunded.rows[0]?.paid_cents) !== 9000 ||
+      Number(refunded.rows[0]?.balance_cents) !== 1000 ||
+      refunded.rows[0]?.status !== 'Partially Paid'
+    ) throw new Error(`refund projection was ${JSON.stringify(refunded.rows[0])}`)
+  })
+
+  await verify('lifecycle tables are owner-readable only and provider writes are service-only', async () => {
+    const privileges = await db.query(`
+      select
+        has_function_privilege('anon', 'public.save_estimate(uuid,jsonb)', 'execute') as anon_estimate,
+        has_function_privilege('authenticated', 'public.save_estimate(uuid,jsonb)', 'execute') as auth_estimate,
+        has_function_privilege('authenticated', 'public.apply_provider_payment_event(text,jsonb)', 'execute') as auth_provider,
+        has_function_privilege('service_role', 'public.apply_provider_payment_event(text,jsonb)', 'execute') as service_provider,
+        has_table_privilege('authenticated', 'public.payments', 'insert') as auth_insert
+    `)
+    if (JSON.stringify(privileges.rows[0]) !== JSON.stringify({
+      anon_estimate: false,
+      auth_estimate: true,
+      auth_provider: false,
+      service_provider: true,
+      auth_insert: false,
+    })) throw new Error(`lifecycle privileges were ${JSON.stringify(privileges.rows[0])}`)
+    await db.query(`select set_config('request.jwt.claim.sub', $1, false)`, [secondOwnerId])
+    const hidden = await withRole('authenticated', () => db.query(
+      'select id from public.estimates where id = $1',
+      [lifecycleEstimateId],
+    ))
+    if (hidden.rows.length !== 0) throw new Error('cross-owner estimate was visible')
   })
 
   await verify('authenticated direct DML is isolated to owner reads and cannot bypass RPC writes', async () => {

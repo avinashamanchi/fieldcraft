@@ -12,7 +12,10 @@ import { colors, MIN_TOUCH_TARGET, radius, spacing, typography } from '../../the
 import { buildJobMutation, type JobDraft } from './jobForm'
 
 const TRADES: TradeType[] = ['Plumbing', 'Electrical', 'HVAC', 'Carpentry', 'General', 'Roofing', 'Flooring', 'Painting']
-const STATUSES: JobStatus[] = ['Scheduled', 'In Progress', 'Invoiced', 'Paid']
+const STATUSES: JobStatus[] = [
+  'Scheduled', 'In Progress', 'Completed', 'Invoiced',
+  'Partially Paid', 'Paid', 'Cancelled',
+]
 
 type JobEditorProps = {
   clients: Client[]

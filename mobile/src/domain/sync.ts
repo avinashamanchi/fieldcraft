@@ -3,10 +3,21 @@ export type EntityName =
   | 'client'
   | 'job'
   | 'invoice'
+  | 'estimate'
+  | 'payment'
+  | 'reminder_schedule'
   | 'expense'
   | 'service'
   | 'inventory'
-export type MutationKind = 'create' | 'update' | 'delete' | 'save_invoice_bundle'
+export type MutationKind =
+  | 'create'
+  | 'update'
+  | 'delete'
+  | 'save_invoice_bundle'
+  | 'save_estimate'
+  | 'convert_estimate'
+  | 'issue_invoice'
+  | 'record_manual_payment'
 
 export type MutationEnvelope = {
   id: string

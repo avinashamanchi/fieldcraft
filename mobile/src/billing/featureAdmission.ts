@@ -112,7 +112,7 @@ type ControlledRepositoryOptions = SQLiteFieldCraftRepositoryOptions & Readonly<
 }>
 
 const OPEN_JOB_STATUSES = new Set(['Scheduled', 'In Progress'])
-const ISSUED_DOCUMENT_STATUSES = new Set(['Sent', 'Viewed', 'Partially Paid', 'Paid'])
+const ISSUED_DOCUMENT_STATUSES = new Set(['Issued', 'Viewed', 'Partially Paid', 'Paid'])
 
 const rawRecord = (value: unknown): Record<string, unknown> => (
   typeof value === 'object' && value !== null && !Array.isArray(value)

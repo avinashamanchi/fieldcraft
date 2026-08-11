@@ -47,13 +47,16 @@ type CursorTuple = {
   changeId: number
 }
 
-const PULL_LIMIT = 500
+const PULL_LIMIT = 200
 const DEFAULT_DEADLINE_MS = 20_000
 const TABLES: { table: string; ownerColumn: 'id' | 'user_id' }[] = [
   { table: 'profiles', ownerColumn: 'id' },
   { table: 'clients', ownerColumn: 'user_id' },
   { table: 'jobs', ownerColumn: 'user_id' },
   { table: 'invoices', ownerColumn: 'user_id' },
+  { table: 'estimates', ownerColumn: 'user_id' },
+  { table: 'payments', ownerColumn: 'user_id' },
+  { table: 'reminder_schedules', ownerColumn: 'user_id' },
   { table: 'expenses', ownerColumn: 'user_id' },
   { table: 'services', ownerColumn: 'user_id' },
   { table: 'inventory_items', ownerColumn: 'user_id' },
@@ -63,6 +66,9 @@ const ENTITY_NAMES = new Set<EntityName>([
   'client',
   'job',
   'invoice',
+  'estimate',
+  'payment',
+  'reminder_schedule',
   'expense',
   'service',
   'inventory',
@@ -339,8 +345,74 @@ const normalizePayload = (
         subtotalCents: requireInteger(raw, 'subtotal_cents'),
         taxCents: requireInteger(raw, 'tax_cents'),
         totalCents: requireInteger(raw, 'total_cents'),
+        number: requireString(raw, 'number'),
+        status: requireString(raw, 'status'),
+        ...(optionalString(raw, 'issued_at') ? { issuedAt: requireTimestamp(raw, 'issued_at') } : {}),
+        ...(optionalString(raw, 'due_at') ? { dueAt: requireTimestamp(raw, 'due_at') } : {}),
       }
     }
+    case 'estimate':
+      return {
+        ...common,
+        clientId: requireString(raw, 'client_id'),
+        ...(optionalString(raw, 'converted_job_id')
+          ? { convertedJobId: optionalString(raw, 'converted_job_id') }
+          : {}),
+        ...(optionalString(raw, 'number') ? { number: optionalString(raw, 'number') } : {}),
+        revision: requireInteger(raw, 'revision'),
+        status: requireString(raw, 'status'),
+        title: requireString(raw, 'title'),
+        scope: requireString(raw, 'scope'),
+        lineItems: lineItemsFromCloud(raw.line_items),
+        subtotalCents: requireInteger(raw, 'subtotal_cents'),
+        taxBasisPoints: requireInteger(raw, 'tax_basis_points'),
+        taxCents: requireInteger(raw, 'tax_cents'),
+        totalCents: requireInteger(raw, 'total_cents'),
+        expiresAt: requireTimestamp(raw, 'expires_at'),
+        ...(optionalString(raw, 'issued_at') ? { issuedAt: requireTimestamp(raw, 'issued_at') } : {}),
+        ...(optionalString(raw, 'accepted_at') ? { acceptedAt: requireTimestamp(raw, 'accepted_at') } : {}),
+        ...(optionalString(raw, 'acceptance_recorded_by')
+          ? { acceptanceRecordedBy: optionalString(raw, 'acceptance_recorded_by') }
+          : {}),
+        ...(raw.issued_snapshot === undefined || raw.issued_snapshot === null
+          ? {}
+          : { issuedSnapshot: raw.issued_snapshot }),
+        ...(optionalString(raw, 'notes') ? { notes: optionalString(raw, 'notes') } : {}),
+      }
+    case 'payment':
+      return {
+        ...common,
+        invoiceId: requireString(raw, 'invoice_id'),
+        amountCents: requireInteger(raw, 'amount_cents'),
+        currency: requireString(raw, 'currency'),
+        method: requireString(raw, 'method'),
+        status: requireString(raw, 'status'),
+        refundedCents: requireInteger(raw, 'refunded_cents'),
+        manual: requireBoolean(raw, 'manual'),
+        ...(optionalString(raw, 'provider_payment_intent_id')
+          ? { providerPaymentIntentId: optionalString(raw, 'provider_payment_intent_id') }
+          : {}),
+        ...(optionalString(raw, 'provider_charge_id')
+          ? { providerChargeId: optionalString(raw, 'provider_charge_id') }
+          : {}),
+        ...(optionalString(raw, 'provider_event_at')
+          ? { providerEventAt: requireTimestamp(raw, 'provider_event_at') }
+          : {}),
+      }
+    case 'reminder_schedule':
+      return {
+        ...common,
+        invoiceId: requireString(raw, 'invoice_id'),
+        active: requireBoolean(raw, 'active'),
+        recipientEmail: requireString(raw, 'recipient_email'),
+        hasReminderConsent: requireBoolean(raw, 'has_reminder_consent'),
+        occurrences: (() => {
+          if (!Array.isArray(raw.occurrences) || raw.occurrences.some((value) => typeof value !== 'string')) {
+            throw new RemoteGatewayError('invalid-response')
+          }
+          return raw.occurrences
+        })(),
+      }
     case 'expense':
       return {
         ...common,
@@ -741,7 +813,26 @@ const parsePushResponse = (
     row.updatedAt,
     ['sync_changes', 'legacy_receipt'],
   ))
-  return { type: 'applied', rows: [row] }
+  const rows = [row]
+  if (data.cloud_rows !== undefined) {
+    if (!Array.isArray(data.cloud_rows)) throw new RemoteGatewayError('invalid-response')
+    const identities = new Set([`${row.entity}:${row.entityId}`])
+    for (const value of data.cloud_rows) {
+      const extra = asRecord(value)
+      const entity = requireEntity(extra, 'entity')
+      const extraRow = envelopeFromRaw(entity, asRecord(extra.cloud), ownerId)
+      const identity = `${entity}:${extraRow.entityId}`
+      if (identities.has(identity)) throw new RemoteGatewayError('invalid-response')
+      identities.add(identity)
+      Object.assign(extraRow, receiptPosition(
+        extra.sync_position,
+        extraRow.updatedAt,
+        ['sync_changes'],
+      ))
+      rows.push(extraRow)
+    }
+  }
+  return { type: 'applied', rows }
 }
 
 const parsePull = (
@@ -867,24 +958,37 @@ export const createSupabaseGateway = (
       if (!ownerId || mutation.ownerId !== ownerId) {
         throw new RemoteGatewayError('invalid-response')
       }
-      const reply = mutation.kind === 'save_invoice_bundle'
-        ? await callProvider(() => client.rpc('save_invoice_bundle', {
-            p_mutation_id: mutation.id,
-            p_payload: mutationRpcPayload(mutation),
-          }), signal, deadlineMs, true)
-        : mutation.entity === 'profile' && mutation.kind === 'create'
-          ? await callProvider(() => client.rpc('save_fieldcraft_onboarding', {
-              p_mutation_id: mutation.id,
-              p_payload: mutation.payload,
-            }), signal, deadlineMs, true)
-        : await callProvider(() => client.rpc('apply_entity_mutation', {
-            p_mutation_id: mutation.id,
-            p_entity: mutation.entity,
-            p_kind: mutation.kind,
-            p_entity_id: mutation.entityId,
-            p_base_version: mutation.baseVersion,
-            p_payload: mutation.kind === 'delete' ? {} : mutation.payload,
-          }), signal, deadlineMs, true)
+      let reply: ProviderReply
+      if (mutation.kind === 'save_invoice_bundle') {
+        reply = await callProvider(() => client.rpc('save_invoice_bundle', {
+          p_mutation_id: mutation.id,
+          p_payload: mutationRpcPayload(mutation),
+        }), signal, deadlineMs, true)
+      } else if (
+        mutation.kind === 'save_estimate' ||
+        mutation.kind === 'convert_estimate' ||
+        mutation.kind === 'issue_invoice' ||
+        mutation.kind === 'record_manual_payment'
+      ) {
+        reply = await callProvider(() => client.rpc(mutation.kind, {
+          p_mutation_id: mutation.id,
+          p_payload: mutation.payload,
+        }), signal, deadlineMs, true)
+      } else if (mutation.entity === 'profile' && mutation.kind === 'create') {
+        reply = await callProvider(() => client.rpc('save_fieldcraft_onboarding', {
+          p_mutation_id: mutation.id,
+          p_payload: mutation.payload,
+        }), signal, deadlineMs, true)
+      } else {
+        reply = await callProvider(() => client.rpc('apply_entity_mutation', {
+          p_mutation_id: mutation.id,
+          p_entity: mutation.entity,
+          p_kind: mutation.kind,
+          p_entity_id: mutation.entityId,
+          p_base_version: mutation.baseVersion,
+          p_payload: mutation.kind === 'delete' ? {} : mutation.payload,
+        }), signal, deadlineMs, true)
+      }
       return parsePushResponse(reply.data, mutation, ownerId)
     },
 
