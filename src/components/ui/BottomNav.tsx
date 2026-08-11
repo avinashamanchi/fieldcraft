@@ -1,4 +1,4 @@
-import { NavLink } from 'react-router-dom'
+import { NavLink } from 'react-router'
 import { LayoutDashboard, Briefcase, Users, Receipt, Settings } from 'lucide-react'
 
 const navItems = [

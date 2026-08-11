@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { motion, useInView, AnimatePresence } from 'framer-motion'
 import { Wrench, Mic, FileText, Users, BarChart3, Camera, Star, ChevronDown, CheckCircle, Zap, Shield, Smartphone, ArrowRight } from 'lucide-react'
 import DemoAnimation from '../components/landing/DemoAnimation'

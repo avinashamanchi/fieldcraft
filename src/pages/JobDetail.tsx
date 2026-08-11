@@ -1,13 +1,13 @@
-import { useParams, useNavigate } from 'react-router-dom'
+import { useParams, useNavigate } from 'react-router'
 import { useState } from 'react'
 import { motion } from 'framer-motion'
-import { ArrowLeft, FileText, DollarSign, Wrench, Clock, MapPin, Printer, CheckCircle, MessageSquare, Package } from 'lucide-react'
-import { useStore, selectExpensesByJob, selectInvoiceByJob } from '../store/useStore'
+import { ArrowLeft, FileText, Wrench, Clock, MapPin, Printer, CheckCircle, MessageSquare, Package } from 'lucide-react'
+import { useStore } from '../store/useStore'
 import StatusBadge from '../components/ui/StatusBadge'
 import TradeIcon from '../components/ui/TradeIcon'
 import Button from '../components/ui/Button'
 import { generateInvoicePDF, printInvoice } from '../lib/pdf'
-import { draftMessage } from '../lib/groq'
+import { draftMessage } from '../lib/fieldcraftAi'
 import type { JobStatus, MessageTone } from '../types'
 
 const STATUS_NEXT: Record<JobStatus, JobStatus | null> = {

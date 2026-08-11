@@ -1,11 +1,11 @@
-import { useParams, useNavigate } from 'react-router-dom'
+import { useParams, useNavigate } from 'react-router'
 import { useState } from 'react'
 import { ArrowLeft, Phone, MapPin, Briefcase, MessageSquare } from 'lucide-react'
 import { useStore } from '../store/useStore'
 import StatusBadge from '../components/ui/StatusBadge'
 import TradeIcon from '../components/ui/TradeIcon'
 import Button from '../components/ui/Button'
-import { draftMessage } from '../lib/groq'
+import { draftMessage } from '../lib/fieldcraftAi'
 import type { MessageTone } from '../types'
 
 function formatCurrency(n: number) {

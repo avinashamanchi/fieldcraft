@@ -1,4 +1,4 @@
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { motion } from 'framer-motion'
 import { Mic, DollarSign, Briefcase, TrendingUp, ChevronRight, AlertTriangle, Receipt, Users, Plus } from 'lucide-react'
 import { useStore } from '../store/useStore'
@@ -51,7 +51,7 @@ export default function Dashboard() {
 
   const overdueCount = invoices.filter((i) => {
     if (i.paymentStatus === 'Paid') return false
-    return (Date.now() - new Date(i.createdAt).getTime()) / 86400000 > 30
+    return (now.getTime() - new Date(i.createdAt).getTime()) / 86400000 > 30
   }).length
 
   if (!hydrated) {

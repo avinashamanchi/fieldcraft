@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { HashRouter, Routes, Route, Navigate } from 'react-router-dom'
+import { HashRouter, Routes, Route, Navigate } from 'react-router'
 import type { Session } from '@supabase/supabase-js'
 import { useStore } from './store/useStore'
 import { supabase, handleAuthCallback, isSupabaseConfigured } from './lib/supabase'

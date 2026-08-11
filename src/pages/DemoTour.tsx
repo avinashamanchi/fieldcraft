@@ -2,8 +2,7 @@ import { useState, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
   LayoutDashboard, Mic, Users, Receipt, Settings,
-  DollarSign, TrendingUp, Briefcase, ChevronRight,
-  Camera, CheckCircle2, Loader2, FileText, Star, Package, Plus,
+  ChevronRight, Camera, CheckCircle2, Plus,
 } from 'lucide-react'
 import { useStore } from '../store/useStore'
 import DemoAnimation from '../components/landing/DemoAnimation'

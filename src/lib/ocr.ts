@@ -45,7 +45,7 @@ function extractVendor(text: string): string {
 
 function extractDate(text: string): string {
   const patterns = [
-    /(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/,
+    /(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})/,
     /(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+(\d{1,2}),?\s+(\d{4})/i,
   ]
 

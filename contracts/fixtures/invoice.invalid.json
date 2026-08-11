@@ -1,0 +1,16 @@
+{
+  "clientName": "Jordan Lee",
+  "jobTitle": "Replace valve",
+  "tradeType": "Plumbing",
+  "taxBasisPoints": 825,
+  "paymentTerms": "Due on receipt",
+  "lineItems": [
+    {
+      "description": "Labor",
+      "type": "labor",
+      "quantity": 1000,
+      "unitPriceCents": 10000
+    }
+  ],
+  "suppliedAiTotalCents": 19051
+}

@@ -6,6 +6,6 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   base: '/fieldcraft/',
   build: {
-    outDir: 'docs',
+    outDir: 'dist',
   },
 })

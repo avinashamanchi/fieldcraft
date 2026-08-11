@@ -274,7 +274,7 @@ async function getUserId(): Promise<string | null> {
 
 // ─── Store implementation ─────────────────────────────────────────────────────
 
-export const useStore = create<AppState>()((set, get) => ({
+export const useStore = create<AppState>()((set) => ({
   jobs: [],
   clients: [],
   expenses: [],

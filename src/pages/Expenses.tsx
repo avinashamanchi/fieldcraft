@@ -4,7 +4,7 @@ import { Camera, Upload, Receipt, AlertTriangle, CheckCircle, X, Package, Fuel, 
 import { v4 as uuid } from 'uuid'
 import { useStore } from '../store/useStore'
 import { processReceiptImage } from '../lib/ocr'
-import { categorizeExpense } from '../lib/groq'
+import { categorizeExpense } from '../lib/fieldcraftAi'
 import Button from '../components/ui/Button'
 import EmptyState from '../components/ui/EmptyState'
 import type { ExpenseCategory } from '../types'

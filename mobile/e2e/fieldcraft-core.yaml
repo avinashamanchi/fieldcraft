@@ -1,0 +1,21 @@
+appId: com.avinashamanchi.fieldcraft
+---
+- launchApp:
+    clearState: false
+- assertVisible: "Dashboard"
+- tapOn:
+    id: "log-job"
+- tapOn:
+    id: "manual-job-entry"
+- inputText: "Replace valve for Jordan, two hours labor and one $25 valve"
+- tapOn:
+    id: "review-invoice"
+- assertVisible: "Review invoice"
+- tapOn:
+    id: "save-invoice"
+- assertVisible: "Saved on this device"
+- tapOn:
+    id: "tab-jobs"
+- tapOn:
+    id: "job-row-0"
+- assertVisible: "Invoice"

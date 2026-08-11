@@ -1,8 +1,8 @@
 import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { motion } from 'framer-motion'
 import { Search, Users, Phone, Plus } from 'lucide-react'
-import { useStore, selectClientTotals } from '../store/useStore'
+import { useStore } from '../store/useStore'
 import EmptyState from '../components/ui/EmptyState'
 
 export default function Clients() {
