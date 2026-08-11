@@ -22,6 +22,9 @@ export default function SettingsScreen() {
       <Pressable accessibilityRole="button" onPress={() => router.push('/subscription' as never)} style={styles.row}>
         <Text style={styles.label}>{entitlement.state === 'pro' ? 'FieldCraft Pro — verified' : 'FieldCraft plan & purchases'}</Text>
       </Pressable>
+      <Pressable accessibilityRole="button" onPress={() => router.push('/settings/payments' as never)} style={styles.row}>
+        <Text style={styles.label}>Customer payments</Text>
+      </Pressable>
       <Text style={styles.section}>Privacy & account</Text>
       <Pressable accessibilityRole="button" onPress={() => router.push('/settings/export' as never)} style={styles.row}><Text style={styles.label}>Export account data</Text></Pressable>
       <Pressable accessibilityRole="button" onPress={() => router.push('/settings/ai' as never)} style={styles.row}><Text style={styles.label}>AI & consent</Text></Pressable>

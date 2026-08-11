@@ -86,6 +86,7 @@ export default function InvoiceDetailScreen() {
       {(detail.invoice.status ?? 'Draft') === 'Draft' ? <PrimaryButton disabled={busy} label={busy ? 'Issuing…' : 'Issue invoice'} onPress={() => { void issue() }} testID="issue-invoice" /> : null}
       {['Issued', 'Viewed', 'Partially Paid'].includes(detail.invoice.status ?? '') ? <>
         <PrimaryButton label="Record manual payment" onPress={() => router.push(`/invoices/${detail.invoice.id}/record-payment` as never)} />
+        <PrimaryButton label="Create customer payment link" onPress={() => router.push(`/invoices/${detail.invoice.id}/payment-link` as never)} />
         <PrimaryButton label="Prepare manual reminder" onPress={() => router.push(`/invoices/${detail.invoice.id}/reminders` as never)} />
       </> : null}
       <PrimaryButton label="Create PDF to share" onPress={() => router.push(`/invoices/${detail.invoice.id}/share` as never)} />

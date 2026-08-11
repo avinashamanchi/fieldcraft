@@ -162,6 +162,7 @@ export class AdmissionControlledFieldCraftRepository extends SQLiteFieldCraftRep
       return current && current.status !== 'Draft' ? [] : ['issue-document']
     }
     if (mutation.kind === 'create') {
+      if (mutation.entity === 'reminder_schedule') return ['scheduled-reminder']
       if (mutation.entity === 'client') return ['create-client']
       if (mutation.entity === 'job' && OPEN_JOB_STATUSES.has(String(payload.status))) {
         return ['create-open-job']
@@ -170,6 +171,9 @@ export class AdmissionControlledFieldCraftRepository extends SQLiteFieldCraftRep
         return ['issue-document']
       }
       return []
+    }
+    if (mutation.kind === 'update' && mutation.entity === 'reminder_schedule') {
+      return ['scheduled-reminder']
     }
     if (mutation.kind === 'update' && mutation.entity === 'job' && OPEN_JOB_STATUSES.has(String(payload.status))) {
       const current = await this.get<Job>('job', mutation.entityId)

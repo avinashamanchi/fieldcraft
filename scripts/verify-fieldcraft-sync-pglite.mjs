@@ -305,6 +305,7 @@ try {
   await db.exec(await readMigration('202608070002_fieldcraft_entitlements.sql'))
   await db.exec(await readMigration('202608070003_fieldcraft_business_lifecycle.sql'))
   await db.exec(await readMigration('202608070004_fieldcraft_sync_retention.sql'))
+  await db.exec(await readMigration('202608070005_fieldcraft_pro_services.sql'))
   // Supabase grants its service role platform-level table and sequence access.
   // Model that runtime privilege here without changing production migrations or
   // granting user-facing RPCs that the migration intentionally withholds.
@@ -2215,6 +2216,50 @@ try {
     if (!receiptConstraint.rows[0]?.definition.includes("'400 days'")) {
       throw new Error(`receipt retention was ${JSON.stringify(receiptConstraint.rows[0] ?? null)}`)
     }
+  })
+
+  await verify('connected payments expose owner reads while provider mutations remain service-only', async () => {
+    const grants = await db.query(`
+      select
+        has_table_privilege('authenticated', 'public.stripe_connected_accounts', 'select') as owner_reads_account,
+        has_table_privilege('authenticated', 'public.stripe_connected_accounts', 'insert') as owner_writes_account,
+        has_table_privilege('authenticated', 'public.invoice_payment_links', 'select') as owner_reads_link,
+        has_function_privilege('authenticated', 'public.fieldcraft_resolve_payment_link(text)', 'execute') as owner_resolves_public,
+        has_function_privilege('service_role', 'public.fieldcraft_resolve_payment_link(text)', 'execute') as service_resolves_public,
+        has_function_privilege('authenticated', 'public.fieldcraft_claim_reminders(integer)', 'execute') as owner_claims,
+        has_function_privilege('service_role', 'public.fieldcraft_claim_reminders(integer)', 'execute') as service_claims
+    `)
+    const row = grants.rows[0]
+    if (
+      row?.owner_reads_account !== true || row?.owner_writes_account !== false ||
+      row?.owner_reads_link !== true || row?.owner_resolves_public !== false ||
+      row?.service_resolves_public !== true || row?.owner_claims !== false ||
+      row?.service_claims !== true
+    ) throw new Error(`provider grants were ${JSON.stringify(row ?? null)}`)
+    await withRole('service_role', () => expectSqlState(
+      () => db.query('select * from public.fieldcraft_claim_reminders(101)'),
+      '22023',
+    ))
+  })
+
+  await verify('payment-link and reminder identities are digest-only, unique, and expiry indexed', async () => {
+    const schema = await db.query(`
+      select
+        (select data_type from information_schema.columns
+          where table_schema = 'public' and table_name = 'invoice_payment_links'
+            and column_name = 'token_hash') as token_type,
+        (select count(*)::int from pg_indexes
+          where schemaname = 'public' and indexname = 'invoice_payment_links_one_active_idx') as active_link_index,
+        (select count(*)::int from pg_indexes
+          where schemaname = 'public' and indexname = 'reminder_delivery_occurrence_idx') as occurrence_index,
+        (select count(*)::int from pg_indexes
+          where schemaname = 'public' and indexname = 'reminder_delivery_provider_message_idx') as provider_message_index
+    `)
+    const row = schema.rows[0]
+    if (
+      row?.token_type !== 'bytea' || row?.active_link_index !== 1 ||
+      row?.occurrence_index !== 1 || row?.provider_message_index !== 1
+    ) throw new Error(`provider schema was ${JSON.stringify(row ?? null)}`)
   })
 
   await verify('deleting the auth owner cascades canonical and synchronization state', async () => {

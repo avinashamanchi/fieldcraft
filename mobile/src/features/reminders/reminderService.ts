@@ -1,7 +1,10 @@
 import { Share } from 'react-native'
 
 import { MAX_MONEY_CENTS } from '../../domain/limits'
+import type { ReminderSchedule } from '../../domain/entities'
 import { recordManualReminderShare } from '../../domain/reminders'
+import type { MutationEnvelope } from '../../domain/sync'
+import type { FieldCraftRepository } from '../../data/repository'
 
 export type ManualReminderInput = Readonly<{
   businessName: string
@@ -56,4 +59,59 @@ export const shareManualReminder = (
     if (inFlight?.promise === pending) inFlight = null
   }).catch(() => {})
   return pending
+}
+
+export const buildReminderScheduleMutation = (input: Readonly<{
+  ownerId: string
+  invoiceId: string
+  scheduleId: string
+  mutationId: string
+  recipientEmail: string
+  hasReminderConsent: boolean
+  now: string
+  current?: ReminderSchedule
+}>): MutationEnvelope => {
+  const email = input.recipientEmail.trim().toLowerCase()
+  if (!/^[^\s@]{1,64}@[^\s@]{1,190}\.[^\s@]{2,63}$/.test(email) || email.length > 320) throw new Error('INVALID_REMINDER_EMAIL')
+  if (!input.hasReminderConsent) throw new Error('REMINDER_CONSENT_REQUIRED')
+  if (input.current && (input.current.ownerId !== input.ownerId || input.current.invoiceId !== input.invoiceId || input.current.id !== input.scheduleId)) throw new Error('REMINDER_OWNER_MISMATCH')
+  const payload: ReminderSchedule = {
+    id: input.scheduleId,
+    ownerId: input.ownerId,
+    invoiceId: input.invoiceId,
+    active: true,
+    recipientEmail: email,
+    hasReminderConsent: true,
+    occurrences: ['three-days-before', 'due', 'seven-days-overdue'],
+    version: input.current?.version ?? 0,
+    createdAt: input.current?.createdAt ?? input.now,
+    updatedAt: input.now,
+    syncState: 'pending',
+  }
+  return {
+    id: input.mutationId, ownerId: input.ownerId, entity: 'reminder_schedule',
+    entityId: input.scheduleId, kind: input.current ? 'update' : 'create',
+    baseVersion: input.current?.version ?? null, payload, createdAt: input.now, attempts: 0,
+  }
+}
+
+export const findInvoiceReminderSchedule = async (
+  repository: Pick<FieldCraftRepository, 'listPage'>,
+  invoiceId: string,
+  currentOwnerId?: () => string | null,
+): Promise<ReminderSchedule | null> => {
+  const owner = currentOwnerId?.()
+  let after: { updatedAt: string; id: string } | null = null
+  let scanned = 0
+  do {
+    if (currentOwnerId && currentOwnerId() !== owner) throw new Error('REMINDER_OWNER_CHANGED')
+    const page: { items: ReminderSchedule[]; next: { updatedAt: string; id: string } | null } =
+      await repository.listPage<ReminderSchedule>('reminder_schedule', { limit: 50, after })
+    scanned += page.items.length
+    if (scanned > 10_000) throw new Error('REMINDER_ENTITY_CAP_EXCEEDED')
+    const found = page.items.find((schedule) => schedule.invoiceId === invoiceId)
+    if (found) return found
+    after = page.next
+  } while (after !== null)
+  return null
 }

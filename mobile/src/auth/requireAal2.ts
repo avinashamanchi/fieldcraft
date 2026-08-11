@@ -3,6 +3,7 @@ import type { AuthenticatedOwnerLease } from './AuthProvider'
 export type SensitiveOperation =
   | 'stripe-connect'
   | 'payment-link'
+  | 'scheduled-reminder'
   | 'payment-adjustment'
   | 'account-export'
   | 'disable-mfa'
