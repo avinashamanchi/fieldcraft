@@ -2,6 +2,7 @@ import { z } from 'zod'
 
 import { getSupabaseClient } from '../auth/supabase'
 import { requireRecentAal2 } from '../auth/requireAal2'
+import { validateSupabaseFunctionUrl } from '../network/supabaseFunctionUrl'
 
 export type ConnectStatus = Readonly<{
   state: 'not-connected' | 'pending' | 'restricted' | 'complete'
@@ -39,9 +40,13 @@ const SuccessSchema = z.object({ status: z.string().min(1) }).passthrough()
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
 const validateBaseUrl = (value: string): string => {
-  const url = new URL(value)
-  if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || !url.pathname.endsWith('/functions/v1')) throw new Error('Payment functions require an HTTPS Supabase URL.')
-  return url.toString().replace(/\/$/, '')
+  const suffix = '/stripe-connect'
+  const trustedFunctionUrl = validateSupabaseFunctionUrl(
+    `${value.replace(/\/$/, '')}${suffix}`,
+    'stripe-connect',
+    'Payment functions require an HTTPS Supabase URL.',
+  )
+  return trustedFunctionUrl.slice(0, -suffix.length)
 }
 
 const readBounded = async (response: Response, signal: AbortSignal): Promise<string> => {

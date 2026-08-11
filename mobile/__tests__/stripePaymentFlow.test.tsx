@@ -1,5 +1,21 @@
 import { createPaymentService, PaymentServiceError } from '../src/payments/paymentService'
 
+it('rejects payment function URLs outside the exact Supabase project host and path', () => {
+  const options = {
+    getAccessToken: async () => 'access-token',
+    requireRecentAal2: () => {},
+  }
+
+  expect(() => createPaymentService({
+    ...options,
+    functionBaseUrl: 'https://attacker.example/functions/v1',
+  })).toThrow(/Supabase URL/i)
+  expect(() => createPaymentService({
+    ...options,
+    functionBaseUrl: 'https://project.supabase.co/functions/v1/../admin',
+  })).toThrow(/Supabase URL/i)
+})
+
 it('requires recent AAL2 and rejects an oversized provider response', async () => {
   let calls = 0
   const service = createPaymentService({
