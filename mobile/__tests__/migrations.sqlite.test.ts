@@ -34,6 +34,12 @@ it('applies every FieldCraft migration using the SQLite grammar shipped on iOS',
     expect(database.prepare('PRAGMA user_version').get()).toEqual({
       user_version: DATABASE_SCHEMA_VERSION,
     })
+    expect(database.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'quarantined_outbox'",
+    ).get()).toEqual({ name: 'quarantined_outbox' })
+    expect(database.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'outbox_dependencies'",
+    ).get()).toEqual({ name: 'outbox_dependencies' })
   } finally {
     database.close()
   }

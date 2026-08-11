@@ -14,7 +14,21 @@ import {
   type MutationOutbox,
 } from './outbox'
 import { OwnerBoundary } from './ownerBoundary'
+import {
+  type Page,
+  type PageRequest,
+  validatePageRequest,
+} from './pagination'
 import { parsePostgresTimestamp } from './postgresTimestamp'
+import {
+  DISCARD_QUARANTINE_CONFIRMATION,
+  MAX_AUTOMATIC_ATTEMPTS,
+  MAX_MUTATION_PAYLOAD_BYTES,
+  MAX_RETAINED_MUTATIONS,
+  type QuarantinedMutation,
+  type QuarantineReason,
+  utf8ByteLength,
+} from './quarantine'
 import {
   DataCorruptionError,
   OutboxCorruptionError,
@@ -239,10 +253,36 @@ const MutationFailureReasonSchema = z.enum([
   'validation',
   'invalid-response',
 ])
+const QuarantineReasonSchema = z.enum([
+  'validation',
+  'unsupported-schema',
+  'integrity',
+  'invalid-response',
+  'attempt-limit',
+])
 
 type RecordRow = {
   entity_id: string
   payload_json: string
+  updated_at: string
+}
+
+type QuarantinedOutboxRow = {
+  owner_id: string
+  mutation_id: string
+  sequence: number
+  entity: MutationEnvelope['entity']
+  entity_id: string
+  kind: MutationEnvelope['kind']
+  base_version: number | null
+  payload_json: string
+  payload_hash: string
+  created_at: string
+  attempts: number
+  reason: QuarantineReason
+  quarantined_at: string
+  superseded_by: string | null
+  recovery_history_json: string
 }
 
 type ReconciliationRecordRow = {
@@ -254,6 +294,7 @@ type ReconciliationRecordRow = {
   updated_at: string
   change_seq: number
   change_id: number
+  change_source: 'sync_changes' | 'sync_snapshot'
 }
 
 type ReconciliationOutboxRow = {
@@ -274,6 +315,10 @@ type LaterOutboxRow = ReconciliationOutboxRow & {
 
 type ExistingMutationRow = {
   payload_hash: string
+}
+
+type DependencyMutationRow = {
+  mutation_id: string
 }
 
 type NextSequenceRow = {
@@ -328,6 +373,8 @@ type PreparedCloudRow = {
 
 const FEED_RECONCILIATION_KEY = 'sync-feed-v2-reconciliation-required'
 const FEED_RECONCILIATION_TERMINAL_KEY = 'sync-feed-v2-terminal-reconciliation-pending'
+const SNAPSHOT_RESET_WATERMARK_KEY = 'sync-snapshot-reset-watermark'
+const SNAPSHOT_RESET_CURSOR_KEY = 'sync-snapshot-reset-cursor'
 const recordKey = (entity: EntityName, entityId: string): string => `${entity}:${entityId}`
 
 type ImmutablePosition = {
@@ -384,6 +431,23 @@ const parseSyncCursorTuple = (cursor: string): ImmutablePosition => {
     throw new DataCorruptionError('Terminal bootstrap cursor is invalid', { cause })
   }
 }
+
+const parseSnapshotCursor = (cursor: string): { entity: EntityName; id: string } => {
+  try {
+    const parsed = z.object({
+      entity: EntityNameSchema,
+      id: z.string().min(1),
+    }).strict().parse(JSON.parse(cursor))
+    return parsed
+  } catch (cause) {
+    throw new DataCorruptionError('Snapshot cursor is invalid', { cause })
+  }
+}
+
+const compareSnapshotKeys = (
+  left: { entity: EntityName; id: string },
+  right: { entity: EntityName; id: string },
+): number => left.entity.localeCompare(right.entity) || left.id.localeCompare(right.id)
 
 export const validateEntityPayload = (
   entity: EntityName,
@@ -497,14 +561,6 @@ const prepareCloudRows = (
       parsePreciseTimestamp(row.updatedAt)
       if (row.deleted && row.payload !== null) {
         throw new Error('Deleted cloud rows require a null tombstone payload')
-      }
-      if (
-        row.changeSource === 'sync_snapshot' &&
-        (!row.deleted || row.payload !== null || row.version !== 0)
-      ) {
-        throw new DataCorruptionError(
-          'Snapshot authority is valid only for a version-zero absent tombstone',
-        )
       }
       const payload = row.deleted
         ? null
@@ -853,26 +909,29 @@ const writeBootstrapRows = async (
 ): Promise<void> => {
   for (const { row, payloadJson } of prepared) {
     if (
-      row.changeSource !== 'sync_changes' ||
+      (row.changeSource !== 'sync_changes' && row.changeSource !== 'sync_snapshot') ||
       row.changeSeq === undefined ||
       row.changeId === undefined
     ) {
-      throw new DataCorruptionError('Bootstrap cloud rows require a complete sync-change position')
+      throw new DataCorruptionError('Bootstrap cloud rows require a complete snapshot or sync-change position')
     }
     await database.runAsync(
       `/* bootstrap:stage:upsert */
        INSERT INTO sync_bootstrap_records
          (owner_id, entity, entity_id, payload_json, version, deleted, updated_at,
-          change_seq, change_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          change_seq, change_id, change_source)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(owner_id, entity, entity_id) DO UPDATE SET
          payload_json = excluded.payload_json,
          version = excluded.version,
          deleted = excluded.deleted,
          updated_at = excluded.updated_at,
          change_seq = excluded.change_seq,
-         change_id = excluded.change_id
-       WHERE excluded.change_seq >= sync_bootstrap_records.change_seq`,
+         change_id = excluded.change_id,
+         change_source = excluded.change_source
+       WHERE excluded.change_seq > sync_bootstrap_records.change_seq
+          OR (excluded.change_seq = sync_bootstrap_records.change_seq
+              AND excluded.change_source >= sync_bootstrap_records.change_source)`,
       [
         row.ownerId,
         row.entity,
@@ -883,6 +942,7 @@ const writeBootstrapRows = async (
         row.updatedAt,
         row.changeSeq,
         row.changeId,
+        row.changeSource,
       ],
     )
   }
@@ -936,7 +996,8 @@ const finalizeBootstrapReconciliation = async (
 ): Promise<boolean> => {
   const stagedRows = await database.getAllAsync<ReconciliationRecordRow>(
     `/* bootstrap:records:list */
-     SELECT entity, entity_id, payload_json, version, deleted, updated_at, change_seq, change_id
+     SELECT entity, entity_id, payload_json, version, deleted, updated_at,
+            change_seq, change_id, change_source
      FROM sync_bootstrap_records
      WHERE owner_id = ?`,
     [ownerId],
@@ -970,7 +1031,7 @@ const finalizeBootstrapReconciliation = async (
       updatedAt: row.updated_at,
       changeSeq: row.change_seq,
       changeId: row.change_id,
-      changeSource: 'sync_changes',
+      changeSource: row.change_source,
       ...(row.deleted === 1 ? { deleted: true } : {}),
     }
   }), ownerId)
@@ -1029,7 +1090,7 @@ const stagedRowIsAtLeastAsNew = (
         updatedAt: staged.updated_at,
         changeSeq: staged.change_seq,
         changeId: staged.change_id,
-        changeSource: 'sync_changes',
+        changeSource: staged.change_source,
       },
       authorityPosition(receipt.row),
     ) >= 0
@@ -1067,7 +1128,8 @@ const repairAcknowledgedBootstrapRows = async (
 
   const stagedRows = await database.getAllAsync<ReconciliationRecordRow>(
     `/* bootstrap:records:list */
-     SELECT entity, entity_id, payload_json, version, deleted, updated_at, change_seq, change_id
+     SELECT entity, entity_id, payload_json, version, deleted, updated_at,
+            change_seq, change_id, change_source
      FROM sync_bootstrap_records
      WHERE owner_id = ?`,
     [ownerId],
@@ -1099,7 +1161,7 @@ const repairAcknowledgedBootstrapRows = async (
         updatedAt: row.updated_at,
         changeSeq: row.change_seq,
         changeId: row.change_id,
-        changeSource: 'sync_changes',
+        changeSource: row.change_source,
         ...(row.deleted === 1 ? { deleted: true } : {}),
       }
     }), ownerId))
@@ -1344,6 +1406,151 @@ export const validateMutationEnvelope = (input: MutationEnvelope): MutationEnvel
   }
 }
 
+const readQuarantinedRow = (
+  database: SQLiteDatabase,
+  ownerId: string,
+  mutationId: string,
+): Promise<QuarantinedOutboxRow | null> => database.getFirstAsync<QuarantinedOutboxRow>(
+  `/* quarantine:get */
+   SELECT owner_id, mutation_id, sequence, entity, entity_id, kind, base_version,
+          payload_json, payload_hash, created_at, attempts, reason, quarantined_at,
+          superseded_by, recovery_history_json
+   FROM quarantined_outbox
+   WHERE owner_id = ? AND mutation_id = ?`,
+  [ownerId, mutationId],
+)
+
+const parseQuarantinedRow = async (
+  row: QuarantinedOutboxRow,
+): Promise<QuarantinedMutation> => {
+  try {
+    const payload: unknown = JSON.parse(row.payload_json)
+    const mutation = validateMutationEnvelope({
+      id: row.mutation_id,
+      ownerId: row.owner_id,
+      entity: row.entity,
+      entityId: row.entity_id,
+      kind: row.kind,
+      baseVersion: row.base_version,
+      payload,
+      createdAt: row.created_at,
+      attempts: row.attempts,
+    })
+    if (await hashMutationEnvelope(mutation) !== row.payload_hash) {
+      throw new Error('immutable mutation hash mismatch')
+    }
+    const recoveryHistory = z.array(z.object({
+      action: z.enum(['quarantined', 'retried', 'superseded']),
+      at: z.string().min(1),
+    }).strict()).parse(JSON.parse(row.recovery_history_json))
+    return {
+      mutationId: mutation.id,
+      ownerId: mutation.ownerId,
+      entity: mutation.entity,
+      entityId: mutation.entityId,
+      kind: mutation.kind,
+      baseVersion: mutation.baseVersion,
+      payload: mutation.payload,
+      payloadHash: row.payload_hash,
+      createdAt: mutation.createdAt,
+      attempts: mutation.attempts,
+      reason: QuarantineReasonSchema.parse(row.reason),
+      quarantinedAt: row.quarantined_at,
+      ...(row.superseded_by ? { supersededBy: row.superseded_by } : {}),
+      recoveryHistory,
+    }
+  } catch (cause) {
+    throw new OutboxCorruptionError(row.mutation_id, 'A quarantined mutation is corrupt', { cause })
+  }
+}
+
+const moveOutboxRowToQuarantine = async (
+  database: SQLiteDatabase,
+  ownerId: string,
+  mutationId: string,
+  reason: QuarantineReason,
+  quarantinedAt: string,
+): Promise<void> => {
+  const row = await database.getFirstAsync<QuarantinedOutboxRow>(
+    `/* quarantine:source */
+     SELECT owner_id, mutation_id, sequence, entity, entity_id, kind, base_version,
+            payload_json, payload_hash, created_at, attempts,
+            NULL AS reason, NULL AS quarantined_at, NULL AS superseded_by,
+            '[]' AS recovery_history_json
+     FROM outbox
+     WHERE owner_id = ? AND mutation_id = ? AND state <> 'complete'`,
+    [ownerId, mutationId],
+  )
+  if (!row) throw new Error('Quarantine transition did not match one retained outbox record')
+  const recoveryHistory = canonicalStringify([{
+    action: 'quarantined',
+    at: quarantinedAt,
+  }])
+  const inserted = await database.runAsync(
+    `/* quarantine:insert */
+     INSERT INTO quarantined_outbox
+       (owner_id, mutation_id, sequence, entity, entity_id, kind, base_version,
+        payload_json, payload_hash, created_at, attempts, reason, quarantined_at,
+        superseded_by, recovery_history_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+    [
+      row.owner_id,
+      row.mutation_id,
+      row.sequence,
+      row.entity,
+      row.entity_id,
+      row.kind,
+      row.base_version,
+      row.payload_json,
+      row.payload_hash,
+      row.created_at,
+      row.attempts,
+      reason,
+      quarantinedAt,
+      recoveryHistory,
+    ],
+  )
+  if (inserted.changes !== 1) throw new Error('Quarantine insertion failed')
+  const removed = await database.runAsync(
+    `/* quarantine:remove-source */
+     DELETE FROM outbox
+     WHERE owner_id = ? AND mutation_id = ? AND state <> 'complete'`,
+    [ownerId, mutationId],
+  )
+  if (removed.changes !== 1) throw new Error('Quarantine source removal failed')
+}
+
+const referencedMutationEntities = (
+  mutation: MutationEnvelope,
+): { entity: EntityName; entityId: string }[] => {
+  if (mutation.kind === 'delete' || mutation.kind === 'save_invoice_bundle') return []
+  const payload = mutation.payload as Record<string, unknown>
+  const candidates: { entity: EntityName; entityId: unknown }[] = []
+  if (mutation.entity === 'job' || mutation.entity === 'estimate') {
+    candidates.push({ entity: 'client', entityId: payload.clientId })
+  } else if (mutation.entity === 'invoice') {
+    candidates.push(
+      { entity: 'client', entityId: payload.clientId },
+      { entity: 'job', entityId: payload.jobId },
+    )
+  } else if (mutation.entity === 'payment' || mutation.entity === 'reminder_schedule') {
+    candidates.push({ entity: 'invoice', entityId: payload.invoiceId })
+  } else if (mutation.entity === 'expense') {
+    candidates.push(
+      { entity: 'client', entityId: payload.clientId },
+      { entity: 'job', entityId: payload.jobId },
+    )
+  }
+  const seen = new Set<string>()
+  return candidates.flatMap(({ entity, entityId }) => {
+    if (typeof entityId !== 'string' || entityId.length === 0) return []
+    const key = `${entity}:${entityId}`
+    if (seen.has(key)) return []
+    seen.add(key)
+    return [{ entity, entityId }]
+  })
+}
+
 export type SQLiteFieldCraftRepositoryOptions = {
   databaseName?: string
 }
@@ -1450,6 +1657,49 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
     )
   }
 
+  async listPage<T>(entity: EntityName, input: PageRequest): Promise<Page<T>> {
+    EntityNameSchema.parse(entity)
+    const request = validatePageRequest(input)
+    const snapshot = this.requireOwnerSnapshot()
+    const rows = await this.accessDatabase((database) => request.after === null
+      ? database.getAllAsync<RecordRow>(
+          `/* records:list-page:first */
+           SELECT entity_id, payload_json, updated_at
+           FROM records
+           WHERE owner_id = ? AND entity = ? AND deleted = 0
+           ORDER BY updated_at DESC, entity_id ASC
+           LIMIT ?`,
+          [snapshot.ownerId, entity, request.limit + 1],
+        )
+      : database.getAllAsync<RecordRow>(
+          `/* records:list-page:after */
+           SELECT entity_id, payload_json, updated_at
+           FROM records
+           WHERE owner_id = ? AND entity = ? AND deleted = 0
+             AND (updated_at < ? OR (updated_at = ? AND entity_id > ?))
+           ORDER BY updated_at DESC, entity_id ASC
+           LIMIT ?`,
+          [
+            snapshot.ownerId,
+            entity,
+            request.after.updatedAt,
+            request.after.updatedAt,
+            request.after.id,
+            request.limit + 1,
+          ],
+        ))
+    if (!this.ownerBoundary.isCurrent(snapshot)) return { items: [], next: null }
+    const hasMore = rows.length > request.limit
+    const pageRows = rows.slice(0, request.limit)
+    const last = pageRows.at(-1)
+    return {
+      items: pageRows.map((row) =>
+        this.parsePersistedPayload<T>(entity, row.payload_json, snapshot.ownerId, row.entity_id),
+      ),
+      next: hasMore && last ? { updatedAt: last.updated_at, id: last.entity_id } : null,
+    }
+  }
+
   async get<T>(entity: EntityName, id: string): Promise<T | null> {
     EntityNameSchema.parse(entity)
     if (!id) throw new Error('An entity ID is required')
@@ -1482,6 +1732,9 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
       }
       const hash = await hashMutationEnvelope(mutation)
       const payloadJson = canonicalStringify(mutation.payload)
+      if (utf8ByteLength(payloadJson) > MAX_MUTATION_PAYLOAD_BYTES) {
+        throw new RangeError(`MUTATION_PAYLOAD_LIMIT: maximum ${MAX_MUTATION_PAYLOAD_BYTES} UTF-8 bytes`)
+      }
       await this.accessDatabase(async (database) => {
         await database.withExclusiveTransactionAsync(async (transaction) => {
         const duplicate = await transaction.getFirstAsync<ExistingMutationRow>(
@@ -1496,6 +1749,21 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
             )
           }
           return
+        }
+
+        const retained = await transaction.getFirstAsync<CountRow>(
+          `/* outbox:retained-count */
+           SELECT
+             (SELECT COUNT(*) FROM outbox
+              WHERE owner_id = ? AND state <> 'complete')
+             +
+             (SELECT COUNT(*) FROM quarantined_outbox
+              WHERE owner_id = ? AND superseded_by IS NULL)
+             AS count`,
+          [mutation.ownerId, mutation.ownerId],
+        )
+        if ((retained?.count ?? 0) >= MAX_RETAINED_MUTATIONS) {
+          throw new RangeError(`OUTBOX_QUEUE_LIMIT: maximum ${MAX_RETAINED_MUTATIONS} retained operations`)
         }
 
         const records = mutation.kind === 'save_invoice_bundle'
@@ -1565,6 +1833,38 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
             mutation.attempts,
           ],
         )
+        for (const reference of referencedMutationEntities(mutation)) {
+          const dependency = await transaction.getFirstAsync<DependencyMutationRow>(
+            `/* outbox-dependencies:find-parent */
+             SELECT candidate.mutation_id
+             FROM (
+               SELECT pending.mutation_id, pending.sequence
+               FROM outbox AS pending
+               WHERE pending.owner_id = ? AND pending.entity = ? AND pending.entity_id = ?
+                 AND pending.mutation_id <> ? AND pending.state <> 'complete'
+               UNION ALL
+               SELECT blocked.mutation_id, blocked.sequence
+               FROM quarantined_outbox AS blocked
+               WHERE blocked.owner_id = ? AND blocked.entity = ? AND blocked.entity_id = ?
+                 AND blocked.mutation_id <> ? AND blocked.superseded_by IS NULL
+             ) AS candidate
+             ORDER BY candidate.sequence DESC
+             LIMIT 1`,
+            [
+              mutation.ownerId, reference.entity, reference.entityId, mutation.id,
+              mutation.ownerId, reference.entity, reference.entityId, mutation.id,
+            ],
+          )
+          if (dependency) {
+            await transaction.runAsync(
+              `/* outbox-dependencies:insert */
+               INSERT INTO outbox_dependencies
+                 (owner_id, mutation_id, depends_on_mutation_id, created_at)
+               VALUES (?, ?, ?, ?)`,
+              [mutation.ownerId, mutation.id, dependency.mutation_id, mutation.createdAt],
+            )
+          }
+        }
         didWrite = true
 
         if (!this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
@@ -1698,6 +1998,170 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
       const listeners = this.control.initialPullListeners.get(ownerId)
       this.control.initialPullListeners.delete(ownerId)
       for (const listener of listeners ?? []) listener()
+    }
+  }
+
+  async beginSnapshotReset(ownerId: string, snapshotWatermark: number): Promise<string | null> {
+    if (!Number.isSafeInteger(snapshotWatermark) || snapshotWatermark < 0) {
+      throw new DataCorruptionError('Snapshot watermark is invalid')
+    }
+    const snapshot = this.requireOwnerSnapshot()
+    if (ownerId !== snapshot.ownerId) throw new Error('Snapshot owner must match the active owner')
+    let cursor: string | null = null
+    await this.serializeWrite(async () => {
+      this.assertSharedOwnerAvailable(ownerId)
+      await this.accessDatabase(async (database) => {
+        await database.withExclusiveTransactionAsync(async (transaction) => {
+          const currentWatermark = await transaction.getFirstAsync<MetadataRow>(
+            `/* metadata:snapshot-watermark:get */
+             SELECT value FROM metadata WHERE owner_id = ? AND key = ?`,
+            [ownerId, SNAPSHOT_RESET_WATERMARK_KEY],
+          )
+          if (currentWatermark?.value === String(snapshotWatermark)) {
+            const currentCursor = await transaction.getFirstAsync<MetadataRow>(
+              `/* metadata:snapshot-cursor:get */
+               SELECT value FROM metadata WHERE owner_id = ? AND key = ?`,
+              [ownerId, SNAPSHOT_RESET_CURSOR_KEY],
+            )
+            if (currentCursor?.value && currentCursor.value !== 'null') {
+              parseSnapshotCursor(currentCursor.value)
+              cursor = currentCursor.value
+            }
+            return
+          }
+          await scheduleFreshBootstrapReconciliation(transaction, ownerId)
+          await transaction.runAsync(
+            `/* metadata:snapshot-watermark:upsert */
+             INSERT INTO metadata (owner_id, key, value)
+             VALUES (?, ?, ?)
+             ON CONFLICT(owner_id, key) DO UPDATE SET value = excluded.value`,
+            [ownerId, SNAPSHOT_RESET_WATERMARK_KEY, String(snapshotWatermark)],
+          )
+          await transaction.runAsync(
+            `/* metadata:snapshot-cursor:upsert */
+             INSERT INTO metadata (owner_id, key, value)
+             VALUES (?, ?, ?)
+             ON CONFLICT(owner_id, key) DO UPDATE SET value = excluded.value`,
+            [ownerId, SNAPSHOT_RESET_CURSOR_KEY, 'null'],
+          )
+          if (!this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
+            throw new Error('Owner changed while starting a snapshot reset')
+          }
+        })
+      }, true)
+    })
+    return this.ownerBoundary.isCurrent(snapshot) ? cursor : null
+  }
+
+  async commitSnapshotPage(
+    ownerId: string,
+    inputRows: CloudRowEnvelope[],
+    snapshotCursor: string | null,
+    snapshotWatermark: number,
+    hasMore: boolean,
+    resumeCursor: string,
+    isCurrent: () => boolean = () => true,
+  ): Promise<void> {
+    if (!Number.isSafeInteger(snapshotWatermark) || snapshotWatermark < 0) {
+      throw new DataCorruptionError('Snapshot watermark is invalid')
+    }
+    if ((hasMore && snapshotCursor === null) || (!hasMore && snapshotCursor !== null)) {
+      throw new DataCorruptionError('Snapshot cursor does not match page termination')
+    }
+    const nextCursor = snapshotCursor === null ? null : parseSnapshotCursor(snapshotCursor)
+    const terminal = parseSyncCursorTuple(resumeCursor)
+    if (terminal.changeSeq !== snapshotWatermark) {
+      throw new DataCorruptionError('Snapshot resume cursor does not match its watermark')
+    }
+    const snapshot = this.requireOwnerSnapshot()
+    if (ownerId !== snapshot.ownerId) throw new Error('Snapshot owner must match the active owner')
+    const prepared = prepareCloudRows(inputRows, ownerId)
+    requirePositionedRows(prepared, 'Snapshot commit')
+    requireAuthoritySources(prepared, ['sync_snapshot'], 'Snapshot commit')
+    const keys = prepared.map(({ row }) => ({ entity: row.entity, id: row.entityId }))
+    for (const { row } of prepared) {
+      if (row.changeSeq !== snapshotWatermark || row.changeId !== 0 || row.deleted) {
+        throw new DataCorruptionError('Snapshot rows require current canonical authority')
+      }
+    }
+    for (let index = 1; index < keys.length; index += 1) {
+      if (compareSnapshotKeys(keys[index - 1], keys[index]) >= 0) {
+        throw new DataCorruptionError('Snapshot rows are not in strict keyset order')
+      }
+    }
+    if (nextCursor && keys.length > 0 && compareSnapshotKeys(keys.at(-1)!, nextCursor) !== 0) {
+      throw new DataCorruptionError('Snapshot page cursor does not identify its last row')
+    }
+    let completedInitialHydration = false
+    await this.serializeWrite(async () => {
+      this.assertSharedOwnerAvailable(ownerId)
+      await this.accessDatabase(async (database) => {
+        await database.withExclusiveTransactionAsync(async (transaction) => {
+          const watermark = await transaction.getFirstAsync<MetadataRow>(
+            `/* metadata:snapshot-watermark:get */
+             SELECT value FROM metadata WHERE owner_id = ? AND key = ?`,
+            [ownerId, SNAPSHOT_RESET_WATERMARK_KEY],
+          )
+          if (watermark?.value !== String(snapshotWatermark)) {
+            throw new DataCorruptionError('Snapshot reset watermark changed before page commit')
+          }
+          const previousCursorRow = await transaction.getFirstAsync<MetadataRow>(
+            `/* metadata:snapshot-cursor:get */
+             SELECT value FROM metadata WHERE owner_id = ? AND key = ?`,
+            [ownerId, SNAPSHOT_RESET_CURSOR_KEY],
+          )
+          const previousCursor = previousCursorRow?.value && previousCursorRow.value !== 'null'
+            ? parseSnapshotCursor(previousCursorRow.value)
+            : null
+          if (previousCursor && keys.length > 0 && compareSnapshotKeys(previousCursor, keys[0]) >= 0) {
+            throw new DataCorruptionError('Snapshot page overlaps or rewinds its durable cursor')
+          }
+          await writeBootstrapRows(transaction, prepared)
+          if (hasMore) {
+            await transaction.runAsync(
+              `/* metadata:snapshot-cursor:upsert */
+               INSERT INTO metadata (owner_id, key, value)
+               VALUES (?, ?, ?)
+               ON CONFLICT(owner_id, key) DO UPDATE SET value = excluded.value`,
+              [ownerId, SNAPSHOT_RESET_CURSOR_KEY, snapshotCursor!],
+            )
+          } else {
+            await transaction.runAsync(
+              `/* sync-cursors:upsert */
+               INSERT INTO sync_cursors (owner_id, entity, cursor)
+               VALUES (?, ?, ?)
+               ON CONFLICT(owner_id, entity) DO UPDATE SET cursor = excluded.cursor`,
+              [ownerId, '__all__', resumeCursor],
+            )
+            await finalizeBootstrapReconciliation(transaction, ownerId)
+            completedInitialHydration = true
+            await transaction.runAsync(
+              `/* metadata:initial-pull:upsert */
+               INSERT INTO metadata (owner_id, key, value)
+               VALUES (?, ?, ?)
+               ON CONFLICT(owner_id, key) DO UPDATE SET value = excluded.value`,
+              [ownerId, 'initial-cloud-pull-complete', 'true'],
+            )
+            await transaction.runAsync(
+              `/* metadata:snapshot-reset:delete */
+               DELETE FROM metadata
+               WHERE owner_id = ? AND key IN (?, ?)`,
+              [ownerId, SNAPSHOT_RESET_WATERMARK_KEY, SNAPSHOT_RESET_CURSOR_KEY],
+            )
+          }
+          if (!isCurrent() || !this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
+            throw new Error('Owner changed while committing a snapshot page')
+          }
+        })
+      }, true)
+    })
+    if (this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
+      if (prepared.length > 0 || !hasMore) this.ownerBoundary.markDataChanged()
+      if (completedInitialHydration) {
+        const listeners = this.control.initialPullListeners.get(ownerId)
+        this.control.initialPullListeners.delete(ownerId)
+        for (const listener of listeners ?? []) listener()
+      }
     }
   }
 
@@ -1853,10 +2317,219 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
             [reason, ownerId, mutationId],
           )
           if (result.changes !== 1) throw new Error('Mutation failure did not match one outbox record')
+          const failed = await transaction.getFirstAsync<{ attempts: number }>(
+            `/* outbox:attempts */
+             SELECT attempts FROM outbox
+             WHERE owner_id = ? AND mutation_id = ? AND state = 'failed'`,
+            [ownerId, mutationId],
+          )
+          if (!failed) throw new Error('Mutation failure attempt could not be verified')
+          if (failed.attempts >= MAX_AUTOMATIC_ATTEMPTS) {
+            await moveOutboxRowToQuarantine(
+              transaction,
+              ownerId,
+              mutationId,
+              'attempt-limit',
+              new Date().toISOString(),
+            )
+          }
           if (!isCurrent() || !this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
             throw new Error('Owner changed while recording a mutation failure')
           }
         })
+      }, true)
+    })
+    if (this.ownerBoundary.isOwnerEpochCurrent(snapshot)) this.ownerBoundary.markDataChanged()
+  }
+
+  async quarantineMutation(
+    ownerId: string,
+    mutationId: string,
+    inputReason: QuarantineReason,
+  ): Promise<void> {
+    const reason = QuarantineReasonSchema.parse(inputReason)
+    const snapshot = this.requireOwnerSnapshot()
+    if (ownerId !== snapshot.ownerId) throw new Error('Quarantine owner must match the active owner')
+    await this.serializeWrite(async () => {
+      this.assertSharedOwnerAvailable(ownerId)
+      await this.accessDatabase(async (database) => {
+        await database.withExclusiveTransactionAsync(async (transaction) => {
+          await moveOutboxRowToQuarantine(
+            transaction,
+            ownerId,
+            mutationId,
+            reason,
+            new Date().toISOString(),
+          )
+          if (!this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
+            throw new Error('Owner changed while quarantining a mutation')
+          }
+        })
+      }, true)
+    })
+    if (this.ownerBoundary.isOwnerEpochCurrent(snapshot)) this.ownerBoundary.markDataChanged()
+  }
+
+  async listQuarantined(ownerId: string): Promise<QuarantinedMutation[]> {
+    const snapshot = this.requireOwnerSnapshot()
+    if (ownerId !== snapshot.ownerId) throw new Error('Quarantine owner must match the active owner')
+    const rows = await this.accessDatabase((database) => database.getAllAsync<QuarantinedOutboxRow>(
+      `/* quarantine:list */
+       SELECT owner_id, mutation_id, sequence, entity, entity_id, kind, base_version,
+              payload_json, payload_hash, created_at, attempts, reason, quarantined_at,
+              superseded_by, recovery_history_json
+       FROM quarantined_outbox
+       WHERE owner_id = ?
+       ORDER BY quarantined_at DESC, mutation_id ASC`,
+      [ownerId],
+    ))
+    if (!this.ownerBoundary.isCurrent(snapshot)) return []
+    return Promise.all(rows.map(parseQuarantinedRow))
+  }
+
+  async retryQuarantined(ownerId: string, mutationId: string): Promise<void> {
+    const snapshot = this.requireOwnerSnapshot()
+    if (ownerId !== snapshot.ownerId) throw new Error('Quarantine owner must match the active owner')
+    await this.serializeWrite(async () => {
+      this.assertSharedOwnerAvailable(ownerId)
+      await this.accessDatabase(async (database) => {
+        await database.withExclusiveTransactionAsync(async (transaction) => {
+          const row = await readQuarantinedRow(transaction, ownerId, mutationId)
+          if (!row) throw new Error('Quarantined mutation was not found')
+          if (row.superseded_by) throw new Error('A superseded mutation cannot be retried')
+          await parseQuarantinedRow(row)
+          const inserted = await transaction.runAsync(
+            `/* quarantine:retry */
+             INSERT INTO outbox
+               (owner_id, mutation_id, sequence, entity, entity_id, kind, base_version,
+                payload_json, payload_hash, created_at, attempts, state, last_error)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'pending', NULL)`,
+            [
+              row.owner_id,
+              row.mutation_id,
+              row.sequence,
+              row.entity,
+              row.entity_id,
+              row.kind,
+              row.base_version,
+              row.payload_json,
+              row.payload_hash,
+              row.created_at,
+            ],
+          )
+          if (inserted.changes !== 1) throw new Error('Quarantined retry insertion failed')
+          const removed = await transaction.runAsync(
+            `/* quarantine:delete */
+             DELETE FROM quarantined_outbox WHERE owner_id = ? AND mutation_id = ?`,
+            [ownerId, mutationId],
+          )
+          if (removed.changes !== 1) throw new Error('Quarantined retry cleanup failed')
+          if (!this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
+            throw new Error('Owner changed while retrying a quarantined mutation')
+          }
+        })
+      }, true)
+    })
+    if (this.ownerBoundary.isOwnerEpochCurrent(snapshot)) {
+      this.ownerBoundary.markDataChanged()
+      this.emitLocalMutation(ownerId)
+    }
+  }
+
+  async supersedeQuarantined(
+    ownerId: string,
+    mutationId: string,
+    replacementInput: MutationEnvelope,
+  ): Promise<void> {
+    const replacement = validateMutationEnvelope(replacementInput)
+    if (replacement.ownerId !== ownerId) throw new Error('Replacement owner must match quarantine owner')
+    if (replacement.id === mutationId) throw new Error('A replacement requires a new mutation ID')
+    const existing = await this.accessDatabase((database) => readQuarantinedRow(database, ownerId, mutationId))
+    if (!existing || existing.superseded_by) throw new Error('Active quarantined mutation was not found')
+    await parseQuarantinedRow(existing)
+    await this.transactLocalMutation(replacement)
+    const snapshot = this.requireOwnerSnapshot()
+    await this.serializeWrite(async () => {
+      await this.accessDatabase(async (database) => {
+        await database.withExclusiveTransactionAsync(async (transaction) => {
+          const result = await transaction.runAsync(
+            `/* quarantine:supersede */
+             UPDATE quarantined_outbox
+             SET superseded_by = ?,
+                 recovery_history_json = json_insert(
+                   recovery_history_json, '$[#]',
+                   json_object('action', 'superseded', 'at', ?)
+                 )
+             WHERE owner_id = ? AND mutation_id = ? AND superseded_by IS NULL`,
+            [replacement.id, new Date().toISOString(), ownerId, mutationId],
+          )
+          if (result.changes !== 1) {
+            throw new Error('Quarantined mutation could not be marked superseded')
+          }
+          await transaction.runAsync(
+            `/* outbox-dependencies:repoint */
+             UPDATE outbox_dependencies
+             SET depends_on_mutation_id = ?
+             WHERE owner_id = ? AND depends_on_mutation_id = ? AND mutation_id <> ?`,
+            [replacement.id, ownerId, mutationId, replacement.id],
+          )
+        })
+      }, true)
+    })
+    if (this.ownerBoundary.isOwnerEpochCurrent(snapshot)) this.ownerBoundary.markDataChanged()
+  }
+
+  async exportQuarantined(ownerId: string, mutationId: string): Promise<string> {
+    const snapshot = this.requireOwnerSnapshot()
+    if (ownerId !== snapshot.ownerId) throw new Error('Quarantine owner must match the active owner')
+    const row = await this.accessDatabase((database) => readQuarantinedRow(database, ownerId, mutationId))
+    if (!this.ownerBoundary.isCurrent(snapshot)) throw new Error('Owner changed while exporting quarantine')
+    if (!row) throw new Error('Quarantined mutation was not found')
+    return canonicalStringify(await parseQuarantinedRow(row))
+  }
+
+  async discardQuarantined(
+    ownerId: string,
+    mutationId: string,
+    confirmation: 'DISCARD UNSYNCED CHANGE',
+  ): Promise<void> {
+    if (confirmation !== DISCARD_QUARANTINE_CONFIRMATION) {
+      throw new Error(`Quarantine discard requires confirmation: ${DISCARD_QUARANTINE_CONFIRMATION}`)
+    }
+    const snapshot = this.requireOwnerSnapshot()
+    if (ownerId !== snapshot.ownerId) throw new Error('Quarantine owner must match the active owner')
+    await this.serializeWrite(async () => {
+      await this.accessDatabase(async (database) => {
+        const blocked = await database.getFirstAsync<CountRow>(
+          `/* outbox-dependencies:blocked-count */
+           SELECT COUNT(*) AS count
+           FROM outbox_dependencies AS dependency
+           WHERE dependency.owner_id = ? AND dependency.depends_on_mutation_id = ?
+             AND (
+               EXISTS (
+                 SELECT 1 FROM outbox AS child
+                 WHERE child.owner_id = dependency.owner_id
+                   AND child.mutation_id = dependency.mutation_id
+                   AND child.state <> 'complete'
+               )
+               OR EXISTS (
+                 SELECT 1 FROM quarantined_outbox AS child
+                 WHERE child.owner_id = dependency.owner_id
+                   AND child.mutation_id = dependency.mutation_id
+                   AND child.superseded_by IS NULL
+               )
+             )`,
+          [ownerId, mutationId],
+        )
+        if ((blocked?.count ?? 0) > 0) {
+          throw new Error('DEPENDENCY_BLOCKED: repair or export dependent changes before discard')
+        }
+        const result = await database.runAsync(
+          `/* quarantine:delete */
+           DELETE FROM quarantined_outbox WHERE owner_id = ? AND mutation_id = ?`,
+          [ownerId, mutationId],
+        )
+        if (result.changes !== 1) throw new Error('Quarantined mutation was not found')
       }, true)
     })
     if (this.ownerBoundary.isOwnerEpochCurrent(snapshot)) this.ownerBoundary.markDataChanged()
@@ -2126,6 +2799,8 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
         await database.withExclusiveTransactionAsync(async (transaction) => {
           await transaction.runAsync('/* owner:clear:records */ DELETE FROM records WHERE owner_id = ?', [ownerId])
           await transaction.runAsync('/* owner:clear:outbox */ DELETE FROM outbox WHERE owner_id = ?', [ownerId])
+          await transaction.runAsync('/* owner:clear:quarantined_outbox */ DELETE FROM quarantined_outbox WHERE owner_id = ?', [ownerId])
+          await transaction.runAsync('/* owner:clear:outbox_dependencies */ DELETE FROM outbox_dependencies WHERE owner_id = ?', [ownerId])
           await transaction.runAsync('/* owner:clear:conflicts */ DELETE FROM conflicts WHERE owner_id = ?', [ownerId])
           await transaction.runAsync('/* owner:clear:sync_cursors */ DELETE FROM sync_cursors WHERE owner_id = ?', [ownerId])
           await transaction.runAsync('/* owner:clear:sync_bootstrap_records */ DELETE FROM sync_bootstrap_records WHERE owner_id = ?', [ownerId])

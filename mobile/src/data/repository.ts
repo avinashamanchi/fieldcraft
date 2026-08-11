@@ -1,5 +1,7 @@
 import type { ConflictRecord, EntityName, MutationEnvelope } from '../domain/sync'
 import type { Client, Invoice, Job } from '../domain/entities'
+import type { Page, PageRequest } from './pagination'
+import type { QuarantinedMutation, QuarantineReason } from './quarantine'
 
 export type InvoiceBundlePayload = {
   client: Client
@@ -35,6 +37,7 @@ export type MutationFailureReason =
 export interface FieldCraftRepository {
   initialize(ownerId: string): Promise<void>
   list<T>(entity: EntityName): Promise<T[]>
+  listPage<T>(entity: EntityName, request: PageRequest): Promise<Page<T>>
   get<T>(entity: EntityName, id: string): Promise<T | null>
   transactLocalMutation(mutation: MutationEnvelope): Promise<void>
   subscribeToLocalMutations(listener: (ownerId: string) => void): () => void
@@ -46,6 +49,16 @@ export interface FieldCraftRepository {
     rows: CloudRowEnvelope[],
     cursor: string,
     markInitialHydration?: boolean,
+    isCurrent?: () => boolean,
+  ): Promise<void>
+  beginSnapshotReset(ownerId: string, snapshotWatermark: number): Promise<string | null>
+  commitSnapshotPage(
+    ownerId: string,
+    rows: CloudRowEnvelope[],
+    snapshotCursor: string | null,
+    snapshotWatermark: number,
+    hasMore: boolean,
+    resumeCursor: string,
     isCurrent?: () => boolean,
   ): Promise<void>
   hasCompletedInitialPull(ownerId: string): Promise<boolean>
@@ -62,6 +75,20 @@ export interface FieldCraftRepository {
     mutationId: string,
     reason: MutationFailureReason,
     isCurrent?: () => boolean,
+  ): Promise<void>
+  quarantineMutation(ownerId: string, mutationId: string, reason: QuarantineReason): Promise<void>
+  listQuarantined(ownerId: string): Promise<QuarantinedMutation[]>
+  retryQuarantined(ownerId: string, mutationId: string): Promise<void>
+  supersedeQuarantined(
+    ownerId: string,
+    mutationId: string,
+    replacement: MutationEnvelope,
+  ): Promise<void>
+  exportQuarantined(ownerId: string, mutationId: string): Promise<string>
+  discardQuarantined(
+    ownerId: string,
+    mutationId: string,
+    confirmation: 'DISCARD UNSYNCED CHANGE',
   ): Promise<void>
   recordMutationConflict(
     ownerId: string,

@@ -304,6 +304,7 @@ try {
   await db.exec(await readMigration('202608070001_fieldcraft_identity_security.sql'))
   await db.exec(await readMigration('202608070002_fieldcraft_entitlements.sql'))
   await db.exec(await readMigration('202608070003_fieldcraft_business_lifecycle.sql'))
+  await db.exec(await readMigration('202608070004_fieldcraft_sync_retention.sql'))
   // Supabase grants its service role platform-level table and sequence access.
   // Model that runtime privilege here without changing production migrations or
   // granting user-facing RPCs that the migration intentionally withholds.
@@ -2114,6 +2115,106 @@ try {
         '55000',
       )
     })
+  })
+
+  await verify('retention grants expose snapshot reads to owners and pruning only to service role', async () => {
+    const privileges = await db.query(`
+      select
+        has_function_privilege('authenticated',
+          'public.pull_sync_snapshot(bigint,text,text,integer)', 'execute') as can_snapshot,
+        has_function_privilege('authenticated',
+          'public.prune_fieldcraft_operational_data(timestamptz)', 'execute') as can_prune,
+        has_function_privilege('service_role',
+          'public.prune_fieldcraft_operational_data(timestamptz)', 'execute') as service_can_prune,
+        has_function_privilege('authenticated',
+          'public.pull_sync_changes_retained_internal(bigint,integer)', 'execute') as can_internal
+    `)
+    const row = privileges.rows[0]
+    if (
+      row?.can_snapshot !== true || row?.can_prune !== false ||
+      row?.service_can_prune !== true || row?.can_internal !== false
+    ) throw new Error(`retention grants were ${JSON.stringify(row ?? null)}`)
+  })
+
+  await verify('a device floor bounds 90-day pruning and an expired cursor receives snapshot recovery', async () => {
+    const headResult = await db.query(
+      'select last_change_seq from public.sync_owner_counters where user_id = $1',
+      [ownerId],
+    )
+    const head = Number(headResult.rows[0]?.last_change_seq ?? 0)
+    if (head < 4) throw new Error(`owner head was unexpectedly ${head}`)
+    const deviceCursor = head - 2
+    await db.exec(`select set_config('request.jwt.claim.sub', '${ownerId}', false)`)
+    await withRole('authenticated', () => db.query(
+      'select public.record_fieldcraft_sync_device_cursor($1, $2)',
+      ['84000000-0000-4000-8000-000000000001', deviceCursor],
+    ))
+    await db.query(
+      `update public.sync_changes set updated_at = '2025-01-01T00:00:00Z'
+       where user_id = $1 and change_seq <= $2`,
+      [ownerId, head],
+    )
+    await withRole('service_role', () => db.query(
+      `select public.prune_fieldcraft_operational_data('2026-08-10T12:00:00Z') as response`,
+    ))
+    const retained = await db.query(
+      `select min(change_seq)::bigint as first_seq, max(change_seq)::bigint as last_seq
+       from public.sync_changes where user_id = $1`,
+      [ownerId],
+    )
+    if (
+      Number(retained.rows[0]?.first_seq) !== deviceCursor + 1 ||
+      Number(retained.rows[0]?.last_seq) !== head
+    ) throw new Error(`retained range was ${JSON.stringify(retained.rows[0] ?? null)}`)
+    const expired = await db.query(
+      'select public.pull_sync_changes($1, 200) as response',
+      [deviceCursor - 1],
+    )
+    if (
+      expired.rows[0]?.response?.status !== 'cursor_expired' ||
+      Number(expired.rows[0]?.response?.snapshot_watermark) !== head
+    ) throw new Error(`expired response was ${JSON.stringify(expired.rows[0]?.response ?? null)}`)
+    const snapshot = await db.query(
+      'select public.pull_sync_snapshot($1, null, null, 1) as response',
+      [head],
+    )
+    const response = snapshot.rows[0]?.response
+    if (
+      response?.status !== 'ok' || response?.rows?.length !== 1 ||
+      Number(response?.snapshot_watermark) !== head ||
+      Number(response?.resume_cursor?.change_seq) !== head ||
+      response?.rows?.[0]?.owner_id !== ownerId
+    ) throw new Error(`snapshot response was ${JSON.stringify(response ?? null)}`)
+  })
+
+  await verify('400-day receipts and 30-day content-free events prune at separate boundaries', async () => {
+    await withRole('service_role', async () => {
+      await db.query(`
+        insert into public.fieldcraft_operational_events
+          (user_id, event_type, outcome, dimensions, occurred_at)
+        values
+          ($1, 'sync_pull', 'ok', '{"page_count":1}'::jsonb, '2026-06-01T00:00:00Z'),
+          ($1, 'sync_pull', 'ok', '{"page_count":1}'::jsonb, '2026-08-01T00:00:00Z')
+      `, [ownerId])
+      await db.query(
+        `select public.prune_fieldcraft_operational_data('2026-08-10T12:00:00Z')`,
+      )
+    })
+    const events = await db.query(
+      'select occurred_at from public.fieldcraft_operational_events where user_id = $1 order by occurred_at',
+      [ownerId],
+    )
+    if (events.rows.length !== 1 || new Date(events.rows[0].occurred_at).toISOString() !== '2026-08-01T00:00:00.000Z') {
+      throw new Error(`operational retention left ${JSON.stringify(events.rows)}`)
+    }
+    const receiptConstraint = await db.query(`
+      select pg_get_constraintdef(oid) as definition
+      from pg_constraint
+      where conname = 'mutation_receipts_minimum_retention_check'
+    `)
+    if (!receiptConstraint.rows[0]?.definition.includes("'400 days'")) {
+      throw new Error(`receipt retention was ${JSON.stringify(receiptConstraint.rows[0] ?? null)}`)
+    }
   })
 
   await verify('deleting the auth owner cascades canonical and synchronization state', async () => {

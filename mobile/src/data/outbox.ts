@@ -103,9 +103,19 @@ export class SQLiteMutationOutbox implements MutationOutbox {
         `/* outbox:list */
          SELECT owner_id, mutation_id, entity, entity_id, kind, base_version,
                 payload_json, payload_hash, created_at, attempts, last_error
-         FROM outbox
-         WHERE owner_id = ? AND state IN ('pending', 'failed')
-         ORDER BY sequence ASC`,
+         FROM outbox AS candidate
+         WHERE candidate.owner_id = ? AND candidate.state IN ('pending', 'failed')
+           AND NOT EXISTS (
+             SELECT 1
+             FROM outbox_dependencies AS dependency
+             INNER JOIN quarantined_outbox AS blocked
+               ON blocked.owner_id = dependency.owner_id
+              AND blocked.mutation_id = dependency.depends_on_mutation_id
+              AND blocked.superseded_by IS NULL
+             WHERE dependency.owner_id = candidate.owner_id
+               AND dependency.mutation_id = candidate.mutation_id
+           )
+         ORDER BY candidate.sequence ASC`,
         [ownerId],
       )
 

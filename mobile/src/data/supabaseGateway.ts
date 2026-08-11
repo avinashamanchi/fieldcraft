@@ -9,6 +9,7 @@ import { parsePostgresTimestamp } from './postgresTimestamp'
 import {
   RemoteGatewayError,
   type PullResult,
+  type SnapshotPullResult,
   type PushResult,
   type RealtimeSubscription,
   type RemoteGateway,
@@ -45,6 +46,11 @@ type CursorTuple = {
   updatedAt: string
   changeSeq: number
   changeId: number
+}
+
+type SnapshotCursorTuple = {
+  entity: EntityName
+  id: string
 }
 
 const PULL_LIMIT = 200
@@ -165,6 +171,21 @@ const cursorEquals = (left: CursorTuple, right: CursorTuple): boolean =>
   left.updatedAt === right.updatedAt &&
   left.changeSeq === right.changeSeq &&
   left.changeId === right.changeId
+
+const decodeSnapshotCursor = (cursor: string | null): SnapshotCursorTuple | null => {
+  if (cursor === null) return null
+  try {
+    const parsed = asRecord(JSON.parse(cursor))
+    return { entity: requireEntity(parsed, 'entity'), id: requireString(parsed, 'id') }
+  } catch (error) {
+    if (error instanceof RemoteGatewayError) throw error
+    throw new RemoteGatewayError('invalid-response')
+  }
+}
+
+const encodeSnapshotCursor = (cursor: SnapshotCursorTuple): string => JSON.stringify(cursor)
+const compareSnapshotCursor = (left: SnapshotCursorTuple, right: SnapshotCursorTuple): number =>
+  left.entity.localeCompare(right.entity) || left.id.localeCompare(right.id)
 
 const mapProviderFailure = (reply: ProviderReply): void => {
   if (!reply.error && (reply.status === undefined || (reply.status >= 200 && reply.status < 300))) {
@@ -841,7 +862,23 @@ const parsePull = (
   previous: CursorTuple | null,
 ): PullResult => {
   const data = asRecord(value)
-  if (requireString(data, 'status') !== 'ok' || !Array.isArray(data.changes)) {
+  const status = requireString(data, 'status')
+  if (status === 'cursor_expired') {
+    const snapshotWatermark = requireInteger(data, 'snapshot_watermark')
+    if (data.snapshot_cursor !== null) throw new RemoteGatewayError('invalid-response')
+    const stableCursor = previous ?? {
+      updatedAt: '1970-01-01T00:00:00.000Z', changeSeq: 0, changeId: 0,
+    }
+    return {
+      type: 'cursorExpired',
+      snapshotWatermark,
+      snapshotCursor: null,
+      rows: [],
+      cursor: encodeCursor(stableCursor),
+      hasMore: false,
+    }
+  }
+  if (status !== 'ok' || !Array.isArray(data.changes)) {
     throw new RemoteGatewayError('invalid-response')
   }
   const cursorRaw = asRecord(data.cursor)
@@ -930,7 +967,79 @@ const parsePull = (
   })
   const hasMore = requireBoolean(data, 'has_more')
   if (hasMore && rows.length === 0) throw new RemoteGatewayError('invalid-response')
-  return { rows, cursor: encodeCursor(cursor), hasMore }
+  return { type: 'page', rows, cursor: encodeCursor(cursor), hasMore }
+}
+
+const parseSnapshotPull = (
+  value: unknown,
+  ownerId: string,
+  expectedWatermark: number,
+  previous: SnapshotCursorTuple | null,
+): SnapshotPullResult => {
+  const data = asRecord(value)
+  if (requireString(data, 'status') !== 'ok' || !Array.isArray(data.rows)) {
+    throw new RemoteGatewayError('invalid-response')
+  }
+  const snapshotWatermark = requireInteger(data, 'snapshot_watermark')
+  if (snapshotWatermark !== expectedWatermark) throw new RemoteGatewayError('invalid-response')
+  const resumeRaw = asRecord(data.resume_cursor)
+  const resume = {
+    updatedAt: requireTimestamp(resumeRaw, 'updated_at'),
+    changeSeq: requireInteger(resumeRaw, 'change_seq'),
+    changeId: requireInteger(resumeRaw, 'change_id'),
+  }
+  if (resume.changeSeq !== snapshotWatermark) throw new RemoteGatewayError('invalid-response')
+  const rows = data.rows.map((value): CloudRowEnvelope => {
+    const item = asRecord(value)
+    if (requireString(item, 'owner_id') !== ownerId) throw new RemoteGatewayError('invalid-response')
+    const entity = requireEntity(item, 'entity')
+    const entityId = requireString(item, 'entity_id')
+    const version = requireInteger(item, 'version')
+    const updatedAt = requireTimestamp(item, 'updated_at')
+    const envelope = envelopeFromRaw(entity, asRecord(item.payload), ownerId)
+    if (
+      envelope.entityId !== entityId ||
+      envelope.version !== version ||
+      envelope.updatedAt !== updatedAt
+    ) throw new RemoteGatewayError('invalid-response')
+    return {
+      ...envelope,
+      changeSource: 'sync_snapshot',
+      changeSeq: snapshotWatermark,
+      changeId: 0,
+    }
+  })
+  if (rows.length > PULL_LIMIT) throw new RemoteGatewayError('invalid-response')
+  const keys = rows.map((row) => ({ entity: row.entity, id: row.entityId }))
+  if (previous && keys.length > 0 && compareSnapshotCursor(previous, keys[0]) >= 0) {
+    throw new RemoteGatewayError('invalid-response')
+  }
+  for (let index = 1; index < keys.length; index += 1) {
+    if (compareSnapshotCursor(keys[index - 1], keys[index]) >= 0) {
+      throw new RemoteGatewayError('invalid-response')
+    }
+  }
+  const hasMore = requireBoolean(data, 'has_more')
+  const cursor = data.cursor === null
+    ? null
+    : encodeSnapshotCursor({
+        entity: requireEntity(asRecord(data.cursor), 'entity'),
+        id: requireString(asRecord(data.cursor), 'id'),
+      })
+  if (
+    (hasMore && (rows.length === 0 || cursor === null)) ||
+    (!hasMore && cursor !== null)
+  ) throw new RemoteGatewayError('invalid-response')
+  if (cursor !== null && compareSnapshotCursor(keys.at(-1)!, decodeSnapshotCursor(cursor)!) !== 0) {
+    throw new RemoteGatewayError('invalid-response')
+  }
+  return {
+    rows,
+    cursor,
+    hasMore,
+    snapshotWatermark,
+    resumeCursor: encodeCursor(resume),
+  }
 }
 
 export const createSupabaseGateway = (
@@ -952,6 +1061,20 @@ export const createSupabaseGateway = (
         p_limit: PULL_LIMIT,
       }), signal, deadlineMs)
       return parsePull(reply.data, ownerId, cursor)
+    },
+
+    async pullSnapshot(ownerId, watermark, cursorValue, signal): Promise<SnapshotPullResult> {
+      if (!ownerId || !Number.isSafeInteger(watermark) || watermark < 0) {
+        throw new RemoteGatewayError('invalid-response')
+      }
+      const cursor = decodeSnapshotCursor(cursorValue)
+      const reply = await callProvider(() => client.rpc('pull_sync_snapshot', {
+        p_snapshot_watermark: watermark,
+        p_after_entity: cursor?.entity ?? null,
+        p_after_id: cursor?.id ?? null,
+        p_limit: PULL_LIMIT,
+      }), signal, deadlineMs)
+      return parseSnapshotPull(reply.data, ownerId, watermark, cursor)
     },
 
     async pushMutation(ownerId, mutation, signal): Promise<PushResult> {

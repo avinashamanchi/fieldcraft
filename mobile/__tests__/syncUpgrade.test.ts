@@ -553,7 +553,7 @@ it('upgrades a packaged legacy cursor through crash-resumable staged reconciliat
 
   const repository = new SQLiteFieldCraftRepository({ databaseName: DATABASE })
   await repository.initialize(OWNER)
-  expect(raw.userVersion).toBe(5)
+  expect(raw.userVersion).toBe(6)
   await expect(repository.getSyncCursor(OWNER)).resolves.toBeNull()
   await expect(repository.hasCompletedInitialPull(OWNER)).resolves.toBe(false)
 
@@ -627,9 +627,9 @@ it('upgrades a packaged legacy cursor through crash-resumable staged reconciliat
   await expect(repository.outbox.list(OWNER)).resolves.toEqual([])
   expect((raw as unknown as { bootstrapRecords: unknown[] }).bootstrapRecords).toEqual([])
   expect(client.calls.filter((call) => call.name === 'pull_sync_changes')).toEqual([
-    expect.objectContaining({ parameters: { p_cursor_change_seq: null, p_limit: 500 } }),
-    expect.objectContaining({ parameters: { p_cursor_change_seq: 1, p_limit: 500 } }),
-    expect.objectContaining({ parameters: { p_cursor_change_seq: 1, p_limit: 500 } }),
+    expect.objectContaining({ parameters: { p_cursor_change_seq: null, p_limit: 200 } }),
+    expect.objectContaining({ parameters: { p_cursor_change_seq: 1, p_limit: 200 } }),
+    expect.objectContaining({ parameters: { p_cursor_change_seq: 1, p_limit: 200 } }),
   ])
 })
 
