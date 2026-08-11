@@ -39,14 +39,12 @@ const StatusSchema = z.object({ state: z.enum(['not-connected', 'pending', 'rest
 const SuccessSchema = z.object({ status: z.string().min(1) }).passthrough()
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
-const validateBaseUrl = (value: string): string => {
-  const suffix = '/stripe-connect'
-  const trustedFunctionUrl = validateSupabaseFunctionUrl(
-    `${value.replace(/\/$/, '')}${suffix}`,
-    'stripe-connect',
+const validateEndpointUrl = (baseUrl: string, functionName: 'stripe-connect' | 'payment-link'): string => {
+  return validateSupabaseFunctionUrl(
+    `${baseUrl.replace(/\/$/, '')}/${functionName}`,
+    functionName,
     'Payment functions require an HTTPS Supabase URL.',
   )
-  return trustedFunctionUrl.slice(0, -suffix.length)
 }
 
 const readBounded = async (response: Response, signal: AbortSignal): Promise<string> => {
@@ -71,7 +69,10 @@ const readBounded = async (response: Response, signal: AbortSignal): Promise<str
 }
 
 export const createPaymentService = (options: Options): PaymentService => {
-  const baseUrl = validateBaseUrl(options.functionBaseUrl)
+  const endpointUrls = {
+    'stripe-connect': validateEndpointUrl(options.functionBaseUrl, 'stripe-connect'),
+    'payment-link': validateEndpointUrl(options.functionBaseUrl, 'payment-link'),
+  } as const
   const call = async <T>(route: 'stripe-connect' | 'payment-link', body: Record<string, unknown>, schema: z.ZodType<T>): Promise<T> => {
     options.requireRecentAal2()
     const accessToken = await options.getAccessToken()
@@ -80,7 +81,7 @@ export const createPaymentService = (options: Options): PaymentService => {
     let timedOut = false
     const timer = setTimeout(() => { timedOut = true; controller.abort() }, options.deadlineMs ?? 10_000)
     try {
-      const response = await (options.fetcher ?? fetch)(`${baseUrl}/${route}`, {
+      const response = await (options.fetcher ?? fetch)(endpointUrls[route], {
         method: 'POST', signal: controller.signal,
         headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
