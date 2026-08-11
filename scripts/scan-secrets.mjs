@@ -16,6 +16,8 @@ const EXACT_PUBLIC_FIXTURES = [
   'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiJ9.signature',
 ]
 
+const DEFAULT_BUNDLE_DIRECTORIES = ['dist', 'mobile/dist', 'supabase/functions/dist']
+
 export const SECRET_RULES = [
   { id: 'private-key', pattern: /-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----/g },
   { id: 'provider-api-key', pattern: /\b(?:gsk_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,})\b/g },
@@ -27,12 +29,23 @@ export const SECRET_RULES = [
   },
 ]
 
-export const scanSecretText = (path, contents) => {
-  const redactedFixtures = EXACT_PUBLIC_FIXTURES.reduce((value, fixture) => value.replaceAll(fixture, ''), contents)
+const isBundlePath = (path, bundleDirectories) => bundleDirectories.some(
+  (directory) => path === directory || path.startsWith(`${directory}/`),
+)
+
+export const scanSecretText = (
+  path,
+  contents,
+  { publicBundleValues = [], bundleDirectories = DEFAULT_BUNDLE_DIRECTORIES } = {},
+) => {
+  const exactAllowedValues = isBundlePath(path, bundleDirectories)
+    ? [...EXACT_PUBLIC_FIXTURES, ...publicBundleValues.filter((value) => typeof value === 'string' && value.length > 0)]
+    : EXACT_PUBLIC_FIXTURES
+  const redactedFixtures = exactAllowedValues.reduce((value, fixture) => value.replaceAll(fixture, ''), contents)
   return SECRET_RULES.flatMap(({ id, pattern }) => {
-  pattern.lastIndex = 0
-  const count = [...redactedFixtures.matchAll(pattern)].length
-  return count > 0 ? [{ path, ruleId: id, count }] : []
+    pattern.lastIndex = 0
+    const count = [...redactedFixtures.matchAll(pattern)].length
+    return count > 0 ? [{ path, ruleId: id, count }] : []
   })
 }
 
@@ -47,7 +60,11 @@ const walk = (directory, root) => {
   })
 }
 
-export const scanRepository = ({ root = process.cwd(), bundleDirectories = ['dist', 'mobile/dist', 'supabase/functions/dist'] } = {}) => {
+export const scanRepository = ({
+  root = process.cwd(),
+  bundleDirectories = DEFAULT_BUNDLE_DIRECTORIES,
+  publicBundleValues = [],
+} = {}) => {
   const tracked = execFileSync('git', ['ls-files', '-z'], { cwd: root, encoding: 'utf8' }).split('\0').filter(Boolean)
   const bundleFiles = bundleDirectories.flatMap((directory) => walk(resolve(root, directory), root))
   const files = [...new Set([...tracked, ...bundleFiles])].filter((path) => !EXACT_EXCLUSIONS.has(path))
@@ -56,13 +73,15 @@ export const scanRepository = ({ root = process.cwd(), bundleDirectories = ['dis
     if (!existsSync(absolute) || !lstatSync(absolute).isFile() || !TEXT_EXTENSIONS.has(extname(path).toLocaleLowerCase())) return []
     const bytes = readFileSync(absolute)
     if (bytes.length > 8 * 1024 * 1024 || bytes.includes(0)) return []
-    return scanSecretText(path, bytes.toString('utf8'))
+    return scanSecretText(path, bytes.toString('utf8'), { bundleDirectories, publicBundleValues })
   })
 }
 
 const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 if (isMain) {
-  const findings = scanRepository()
+  const findings = scanRepository({
+    publicBundleValues: [process.env.VITE_SUPABASE_ANON_KEY?.trim()].filter(Boolean),
+  })
   for (const finding of findings) process.stderr.write(`${finding.path}\t${finding.ruleId}\t${finding.count}\n`)
   if (findings.length > 0) process.exitCode = 1
   else process.stdout.write('Secret scan passed.\n')

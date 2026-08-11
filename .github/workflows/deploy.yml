@@ -79,7 +79,10 @@ jobs:
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
           VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
         run: npm run build
-      - run: npm run scan:secrets
+      - name: Scan built app without exposing the public browser key
+        env:
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+        run: npm run scan:secrets
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist
