@@ -1,10 +1,28 @@
 import type { ConflictRecord, MutationEnvelope } from '../domain/sync'
 import type { CloudRowEnvelope } from './repository'
 
-export type PullResult = {
+export type PullResult =
+  | {
+      type?: 'page'
+      rows: CloudRowEnvelope[]
+      cursor: string
+      hasMore: boolean
+    }
+  | {
+      type: 'cursorExpired'
+      snapshotWatermark: number
+      snapshotCursor: string | null
+      rows: []
+      cursor: string
+      hasMore: false
+    }
+
+export type SnapshotPullResult = {
   rows: CloudRowEnvelope[]
-  cursor: string
+  cursor: string | null
   hasMore: boolean
+  snapshotWatermark: number
+  resumeCursor: string
 }
 
 export type PushResult =
@@ -34,6 +52,12 @@ export type RealtimeSubscription = {
 
 export interface RemoteGateway {
   pullSince(ownerId: string, cursor: string | null, signal: AbortSignal): Promise<PullResult>
+  pullSnapshot?(
+    ownerId: string,
+    watermark: number,
+    cursor: string | null,
+    signal: AbortSignal,
+  ): Promise<SnapshotPullResult>
   pushMutation(
     ownerId: string,
     mutation: MutationEnvelope,

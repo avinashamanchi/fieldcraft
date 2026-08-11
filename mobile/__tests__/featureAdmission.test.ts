@@ -141,7 +141,10 @@ describe('FeatureAdmissionService', () => {
       entitlementStore: store,
       gateway: { reserve },
     })
-    jest.spyOn(repository, 'list').mockResolvedValue(Array.from({ length: 10 }, () => ({})))
+    jest.spyOn(repository, 'listPage').mockImplementation(async (entity) => ({
+      items: entity === 'client' ? Array.from({ length: 10 }, () => ({})) : [],
+      next: null,
+    }))
     const localWrite = jest
       .spyOn(SQLiteFieldCraftRepository.prototype, 'transactLocalMutation')
       .mockResolvedValue()

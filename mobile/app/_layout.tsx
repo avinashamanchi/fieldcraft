@@ -30,6 +30,8 @@ import {
 import { InvoiceSessionProvider } from '../src/features/invoices/invoiceSession'
 import { OnboardingGate } from '../src/features/onboarding/OnboardingGate'
 import { colors } from '../src/theme/tokens'
+import { tempArtifactRegistry } from '../src/files/tempArtifactRegistry'
+import { aiConsentStore } from '../src/ai/consentStore'
 
 const HydrationGate = ({ children }: PropsWithChildren) => {
   const auth = useAuth()
@@ -152,13 +154,26 @@ export default function RootLayout() {
     }
   })
   const repository = resources.repository
+  useEffect(() => {
+    void tempArtifactRegistry.sweepExpired().catch(() => {
+      // Cleanup is best-effort at launch and retried by explicit privacy controls.
+    })
+  }, [])
   const [authLifecycle] = useState(() => ({
     initialize: (ownerId: string) => repository.initialize(ownerId),
     deactivateOwner: () => {
       resources.coordinator.invalidateBeforeTeardown()
       repository.deactivateOwner()
     },
-    clearOwner: (ownerId: string) => repository.clearOwner(ownerId),
+    clearOwner: async (ownerId: string) => {
+      resources.coordinator.invalidateBeforeTeardown()
+      await Promise.all([
+        repository.clearOwner(ownerId),
+        aiConsentStore.revoke(ownerId),
+        tempArtifactRegistry.cleanupRegistered(),
+        tempArtifactRegistry.cleanupOwnedDirectories(),
+      ])
+    },
     hasCompletedInitialPull: (ownerId: string) => repository.hasCompletedInitialPull(ownerId),
     waitForInitialPull: (ownerId: string) => repository.waitForInitialPull(ownerId),
     ownerBoundary: repository.ownerBoundary,

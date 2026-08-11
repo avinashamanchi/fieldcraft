@@ -19,6 +19,7 @@ const response = (body: string, status = 200) => ({
 it('rejects non-HTTPS and provider URLs before sending data', () => {
   expect(() => createAiClient({ functionUrl: 'http://example.test/fieldcraft-ai' })).toThrow(/https/i)
   expect(() => createAiClient({ functionUrl: 'https://api.groq.com/openai/v1' })).toThrow(/function url/i)
+  expect(() => createAiClient({ functionUrl: 'https://attacker.example/functions/v1/fieldcraft-ai' })).toThrow(/function url/i)
 })
 
 it('requires consent and a Supabase access token before fetch', async () => {

@@ -10,15 +10,15 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22.22.0
           cache: npm
           cache-dependency-path: |
             package-lock.json
             mobile/package-lock.json
-      - uses: denoland/setup-deno@v2
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
         with:
           deno-version: v2.x
 
@@ -30,6 +30,7 @@ jobs:
           npm run lint
           npm run build
           npm run scan:secrets
+          npm run check:load-scenarios
           npm audit --audit-level=high
 
       - name: Mobile gates
@@ -60,7 +61,7 @@ jobs:
           mkdir -p release-evidence
           node -e 'require("node:fs").writeFileSync("release-evidence/result.txt", `sha=${process.env.GITHUB_SHA}\nstatus=local-gates-passed\ndeployed=false\nsubmitted=false\n`)'
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: fieldcraft-release-readiness-${{ github.sha }}
           path: release-evidence/result.txt

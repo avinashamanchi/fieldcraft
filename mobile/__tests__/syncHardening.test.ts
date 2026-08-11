@@ -350,11 +350,13 @@ it('retains realtime invalidations, resubscribes, and backs off repeated channel
   gateway.subscriptions[0].invalidate()
   gateway.subscriptions[0].fail()
   expect(gateway.subscriptions[0].active).toBe(false)
-  expect(clock.timers.size).toBe(1)
+  expect([...clock.timers.values()].map((timer) => timer.delay).sort((left, right) => left - right)).toEqual([5_000, 5_000])
   release()
   await initial
   await coordinator.whenIdle()
 
+  clock.runNext()
+  await flush()
   clock.runNext()
   await flush()
   expect(gateway.subscriptions).toHaveLength(2)

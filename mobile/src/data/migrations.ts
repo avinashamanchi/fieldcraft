@@ -1,6 +1,6 @@
 import type { SQLiteDatabase } from 'expo-sqlite'
 
-export const DATABASE_SCHEMA_VERSION = 5
+export const DATABASE_SCHEMA_VERSION = 6
 
 type UserVersionRow = { user_version: number }
 
@@ -205,6 +205,55 @@ const VERSION_FIVE_SCHEMA = `
   PRAGMA user_version = 5;
 `
 
+const VERSION_SIX_SCHEMA = `
+  CREATE INDEX IF NOT EXISTS records_owner_entity_page_idx
+    ON records (owner_id, entity, updated_at DESC, entity_id ASC)
+    WHERE deleted = 0;
+
+  CREATE TABLE IF NOT EXISTS quarantined_outbox (
+    owner_id TEXT NOT NULL,
+    mutation_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    entity TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    base_version INTEGER,
+    payload_json TEXT NOT NULL,
+    payload_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    attempts INTEGER NOT NULL CHECK (attempts >= 0),
+    reason TEXT NOT NULL
+      CHECK (reason IN ('validation', 'unsupported-schema', 'integrity', 'invalid-response', 'attempt-limit')),
+    quarantined_at TEXT NOT NULL,
+    superseded_by TEXT,
+    recovery_history_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(recovery_history_json)),
+    PRIMARY KEY (owner_id, mutation_id),
+    UNIQUE (owner_id, sequence)
+  );
+
+  CREATE INDEX IF NOT EXISTS quarantined_outbox_owner_active_idx
+    ON quarantined_outbox (owner_id, quarantined_at DESC, mutation_id)
+    WHERE superseded_by IS NULL;
+
+  CREATE TABLE IF NOT EXISTS outbox_dependencies (
+    owner_id TEXT NOT NULL,
+    mutation_id TEXT NOT NULL,
+    depends_on_mutation_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (owner_id, mutation_id, depends_on_mutation_id),
+    CHECK (mutation_id <> depends_on_mutation_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS outbox_dependencies_parent_idx
+    ON outbox_dependencies (owner_id, depends_on_mutation_id, mutation_id);
+
+  ALTER TABLE sync_bootstrap_records ADD COLUMN change_source TEXT NOT NULL
+    DEFAULT 'sync_changes'
+    CHECK (change_source IN ('sync_changes', 'sync_snapshot'));
+
+  PRAGMA user_version = 6;
+`
+
 export const applyMigrations = async (database: SQLiteDatabase): Promise<void> => {
   await database.withExclusiveTransactionAsync(async (transaction) => {
     const row = await transaction.getFirstAsync<UserVersionRow>('PRAGMA user_version')
@@ -238,6 +287,11 @@ export const applyMigrations = async (database: SQLiteDatabase): Promise<void> =
 
     if (currentVersion === 4) {
       await transaction.execAsync(VERSION_FIVE_SCHEMA)
+      currentVersion = 5
+    }
+
+    if (currentVersion === 5) {
+      await transaction.execAsync(VERSION_SIX_SCHEMA)
     }
   })
 }

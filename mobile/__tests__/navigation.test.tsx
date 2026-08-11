@@ -7,9 +7,12 @@ jest.mock('expo-router', () => {
   MockTabs.Screen = ({ options }: {
     options: {
       title: string
-      tabBarButton: (props: Record<string, unknown>) => unknown
+      href?: string | null
+      tabBarButton?: (props: Record<string, unknown>) => unknown
     }
-  }) => options.tabBarButton({ children: mockReact.createElement(MockText, null, options.title) })
+  }) => options.href === null || !options.tabBarButton
+    ? null
+    : options.tabBarButton({ children: mockReact.createElement(MockText, null, options.title) })
   return { Tabs: MockTabs }
 })
 jest.mock('@expo/vector-icons', () => ({ Ionicons: () => null }))
@@ -23,8 +26,8 @@ it('renders exactly five ordered native tabs and no voice tab', () => {
   expect(tabs.map((tab) => tab.props.testID)).toEqual([
     'tab-dashboard',
     'tab-jobs',
+    'tab-estimates',
     'tab-clients',
-    'tab-expenses',
     'tab-settings',
   ])
   expect(screen.queryByTestId('tab-voice')).toBeNull()
@@ -34,7 +37,7 @@ it('gives each tab a plain-language VoiceOver label', () => {
   render(<TabsLayout />)
   expect(screen.getByLabelText('Dashboard tab')).toBeTruthy()
   expect(screen.getByLabelText('Jobs tab')).toBeTruthy()
+  expect(screen.getByLabelText('Estimates tab')).toBeTruthy()
   expect(screen.getByLabelText('Clients tab')).toBeTruthy()
-  expect(screen.getByLabelText('Expenses tab')).toBeTruthy()
   expect(screen.getByLabelText('Settings tab')).toBeTruthy()
 })

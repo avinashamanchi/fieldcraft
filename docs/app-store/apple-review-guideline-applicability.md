@@ -1,6 +1,6 @@
 # FieldCraft — Apple App Review guideline applicability
 
-Reviewed against Apple's App Review overview and App Review Guidelines on 2026-08-10. This is a source-package control, not an approval prediction. `IMPLEMENTED` means repository evidence exists; `EXTERNAL GATE` requires a live service, signed build, device, credentialed account, or reviewer action; `N/A` means the capability is absent and must stay absent unless this matrix is reviewed again.
+Reviewed against Apple's App Review overview and App Review Guidelines on 2026-08-11. This is a source-package control, not an approval prediction. `IMPLEMENTED` means repository evidence exists; `EXTERNAL GATE` requires a live service, signed build, device, credentialed account, or reviewer action; `N/A` means the capability is absent and must stay absent unless this matrix is reviewed again.
 
 | Guideline | Status | FieldCraft decision and evidence |
 | --- | --- | --- |
@@ -18,7 +18,7 @@ Reviewed against Apple's App Review overview and App Review Guidelines on 2026-0
 | 2.5 Software requirements | IMPLEMENTED + EXTERNAL GATE | Uses public Expo/iOS APIs, HTTPS, App Sandbox, no downloaded executable code, no hidden background mode, and explicit camera/photo/microphone/speech purpose strings. Archive privacy-manifest and IPv6-only validation remain gates. |
 | 3.1.1 In-App Purchase | IMPLEMENTED + EXTERNAL GATE | Digital Pro limits use Apple IAP through RevenueCat only. StoreKit-localized monthly/annual prices, purchase, restore, and management are coded; products and sandbox/TestFlight verification remain external. |
 | 3.1.2 Subscriptions | IMPLEMENTED + EXTERNAL GATE | Ongoing synced business capacity supports auto-renewing Pro. Free remains usable; benefits, period, renewal, cancellation, privacy, terms, and downgrade behavior are disclosed. Use one subscription group and submit the first IAP with the app version. |
-| 3.1.3 Other purchase methods | IMPLEMENTED | FieldCraft does not steer users to external payment for digital app features. Customer invoice/payment records concern real-world trade services and must never unlock digital FieldCraft functionality. |
+| 3.1.3 Other purchase methods | IMPLEMENTED + EXTERNAL GATE | FieldCraft does not steer users to external payment for digital app features. Stripe-hosted checkout is limited to customer payment for real-world trade services, never grants Pro, and remains pending until a signed webhook. Verify the exact sandbox and reviewer path. |
 | 3.2 Other business-model rules | N/A | No reader content, enterprise-only distribution, crypto, advertising management, person-to-person gifts, loans, trading, or regulated financial service. |
 | 4.1 Copycats | IMPLEMENTED | Original FieldCraft name/assets and field-service workflow. Final screenshots/assets require rights verification. |
 | 4.2 Minimum functionality | IMPLEMENTED | Native offline workspace, camera/photo receipt selection, speech transcription, PDF/share, sync, conflict handling, and secure account controls—not a web clipping. |
@@ -27,9 +27,9 @@ Reviewed against Apple's App Review overview and App Review Guidelines on 2026-0
 | 4.5 Apple sites/services and 4.6 alternate icons | N/A | No Apple-site scraping, Apple impersonation, or alternate-icon claim. |
 | 4.7 Mini apps/plug-ins | N/A | No embedded mini-app, HTML game, plug-in, or downloaded-code catalog. |
 | 4.8 Login services | IMPLEMENTED | Only FieldCraft's first-party email/password account is offered; no third-party/social login is present, so Sign in with Apple parity is not triggered. |
-| 4.9 Apple Pay | N/A | No Apple Pay transaction. Future real-world customer payments require a separate payments review; Apple Pay branding cannot be added before integration. |
+| 4.9 Apple Pay | IMPLEMENTED + EXTERNAL GATE | Stripe-hosted checkout may offer Apple Pay only for eligible real-world customer invoice payments. In-app copy says “Apple Pay or card when available”; it does not guarantee availability or use Apple Pay branding assets. Verify domain/provider eligibility and the signed sandbox path before submission. |
 | 4.10 Monetizing built-in capabilities | IMPLEMENTED | No charge for push, camera, microphone, speech, or other built-in iOS capabilities themselves. Pro gates business capacity. |
-| 5.1 Privacy | IMPLEMENTED + EXTERNAL GATE | In-app disclosures cover local/cache/cloud data, Supabase, optional AI/Groq, Apple/RevenueCat, retention, consent revocation, local deletion, and account deletion. Public policy must return HTTPS 200 and match the final binary/provider settings. |
+| 5.1 Privacy | IMPLEMENTED + EXTERNAL GATE | In-app disclosures cover local/cache/cloud data, Supabase, optional AI/Groq, Apple/RevenueCat, Stripe-hosted payments, reminder delivery, retention, consent revocation, local deletion, and account deletion. Public policy must return HTTPS 200 and match the final binary/provider settings. |
 | 5.1.1 Collection/minimization | IMPLEMENTED | No contacts, card details, ads, or tracking; raw audio and receipt images stay local. AI is off until explicit versioned consent and manual entry remains available. |
 | 5.1.1(v) Account deletion | IMPLEMENTED + EXTERNAL GATE | In-app Delete Account exists. Verify recent-auth/MFA, backend erasure, retries, retention exceptions, and signed-device behavior against production before submission. |
 | 5.1.2 Data use/sharing | IMPLEMENTED + EXTERNAL GATE | Reviewed text is sent to the disclosed processor only with consent; privacy copy names processors and protections. Verify final contracts/settings and App Privacy answers. |

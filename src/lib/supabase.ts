@@ -1,4 +1,5 @@
 import { createClient } from '@supabase/supabase-js'
+import { parseAuthCallbackType } from './authCallback'
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string
@@ -30,7 +31,7 @@ export async function handleAuthCallback(): Promise<void> {
 
   // Handle token_hash flow (Supabase v2 newer format for email verification)
   const tokenHash = params.get('token_hash')
-  const type = params.get('type') as 'signup' | 'recovery' | 'email_change' | null
+  const type = parseAuthCallbackType(params.get('type'))
   if (tokenHash && type) {
     try {
       await supabase.auth.verifyOtp({ token_hash: tokenHash, type })

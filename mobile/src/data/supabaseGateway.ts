@@ -9,6 +9,7 @@ import { parsePostgresTimestamp } from './postgresTimestamp'
 import {
   RemoteGatewayError,
   type PullResult,
+  type SnapshotPullResult,
   type PushResult,
   type RealtimeSubscription,
   type RemoteGateway,
@@ -47,13 +48,21 @@ type CursorTuple = {
   changeId: number
 }
 
-const PULL_LIMIT = 500
+type SnapshotCursorTuple = {
+  entity: EntityName
+  id: string
+}
+
+const PULL_LIMIT = 200
 const DEFAULT_DEADLINE_MS = 20_000
 const TABLES: { table: string; ownerColumn: 'id' | 'user_id' }[] = [
   { table: 'profiles', ownerColumn: 'id' },
   { table: 'clients', ownerColumn: 'user_id' },
   { table: 'jobs', ownerColumn: 'user_id' },
   { table: 'invoices', ownerColumn: 'user_id' },
+  { table: 'estimates', ownerColumn: 'user_id' },
+  { table: 'payments', ownerColumn: 'user_id' },
+  { table: 'reminder_schedules', ownerColumn: 'user_id' },
   { table: 'expenses', ownerColumn: 'user_id' },
   { table: 'services', ownerColumn: 'user_id' },
   { table: 'inventory_items', ownerColumn: 'user_id' },
@@ -63,6 +72,9 @@ const ENTITY_NAMES = new Set<EntityName>([
   'client',
   'job',
   'invoice',
+  'estimate',
+  'payment',
+  'reminder_schedule',
   'expense',
   'service',
   'inventory',
@@ -159,6 +171,21 @@ const cursorEquals = (left: CursorTuple, right: CursorTuple): boolean =>
   left.updatedAt === right.updatedAt &&
   left.changeSeq === right.changeSeq &&
   left.changeId === right.changeId
+
+const decodeSnapshotCursor = (cursor: string | null): SnapshotCursorTuple | null => {
+  if (cursor === null) return null
+  try {
+    const parsed = asRecord(JSON.parse(cursor))
+    return { entity: requireEntity(parsed, 'entity'), id: requireString(parsed, 'id') }
+  } catch (error) {
+    if (error instanceof RemoteGatewayError) throw error
+    throw new RemoteGatewayError('invalid-response')
+  }
+}
+
+const encodeSnapshotCursor = (cursor: SnapshotCursorTuple): string => JSON.stringify(cursor)
+const compareSnapshotCursor = (left: SnapshotCursorTuple, right: SnapshotCursorTuple): number =>
+  left.entity.localeCompare(right.entity) || left.id.localeCompare(right.id)
 
 const mapProviderFailure = (reply: ProviderReply): void => {
   if (!reply.error && (reply.status === undefined || (reply.status >= 200 && reply.status < 300))) {
@@ -339,8 +366,78 @@ const normalizePayload = (
         subtotalCents: requireInteger(raw, 'subtotal_cents'),
         taxCents: requireInteger(raw, 'tax_cents'),
         totalCents: requireInteger(raw, 'total_cents'),
+        number: requireString(raw, 'number'),
+        status: requireString(raw, 'status'),
+        ...(optionalString(raw, 'issued_at') ? { issuedAt: requireTimestamp(raw, 'issued_at') } : {}),
+        ...(optionalString(raw, 'due_at') ? { dueAt: requireTimestamp(raw, 'due_at') } : {}),
       }
     }
+    case 'estimate':
+      return {
+        ...common,
+        clientId: requireString(raw, 'client_id'),
+        ...(optionalString(raw, 'converted_job_id')
+          ? { convertedJobId: optionalString(raw, 'converted_job_id') }
+          : {}),
+        ...(optionalString(raw, 'number') ? { number: optionalString(raw, 'number') } : {}),
+        revision: requireInteger(raw, 'revision'),
+        status: requireString(raw, 'status'),
+        title: requireString(raw, 'title'),
+        scope: requireString(raw, 'scope'),
+        lineItems: lineItemsFromCloud(raw.line_items),
+        subtotalCents: requireInteger(raw, 'subtotal_cents'),
+        taxBasisPoints: requireInteger(raw, 'tax_basis_points'),
+        taxCents: requireInteger(raw, 'tax_cents'),
+        totalCents: requireInteger(raw, 'total_cents'),
+        expiresAt: requireTimestamp(raw, 'expires_at'),
+        ...(optionalString(raw, 'issued_at') ? { issuedAt: requireTimestamp(raw, 'issued_at') } : {}),
+        ...(optionalString(raw, 'accepted_at') ? { acceptedAt: requireTimestamp(raw, 'accepted_at') } : {}),
+        ...(optionalString(raw, 'acceptance_recorded_by')
+          ? { acceptanceRecordedBy: optionalString(raw, 'acceptance_recorded_by') }
+          : {}),
+        ...(raw.issued_snapshot === undefined || raw.issued_snapshot === null
+          ? {}
+          : { issuedSnapshot: raw.issued_snapshot }),
+        ...(optionalString(raw, 'notes') ? { notes: optionalString(raw, 'notes') } : {}),
+      }
+    case 'payment':
+      return {
+        ...common,
+        invoiceId: requireString(raw, 'invoice_id'),
+        amountCents: requireInteger(raw, 'amount_cents'),
+        currency: requireString(raw, 'currency'),
+        method: requireString(raw, 'method'),
+        status: requireString(raw, 'status'),
+        refundedCents: requireInteger(raw, 'refunded_cents'),
+        manual: requireBoolean(raw, 'manual'),
+        ...(optionalString(raw, 'provider_payment_intent_id')
+          ? { providerPaymentIntentId: optionalString(raw, 'provider_payment_intent_id') }
+          : {}),
+        ...(optionalString(raw, 'provider_charge_id')
+          ? { providerChargeId: optionalString(raw, 'provider_charge_id') }
+          : {}),
+        ...(optionalString(raw, 'provider_event_at')
+          ? { providerEventAt: requireTimestamp(raw, 'provider_event_at') }
+          : {}),
+        ...(optionalString(raw, 'note') ? { note: optionalString(raw, 'note') } : {}),
+        ...(optionalString(raw, 'recorded_at')
+          ? { recordedAt: requireTimestamp(raw, 'recorded_at') }
+          : {}),
+      }
+    case 'reminder_schedule':
+      return {
+        ...common,
+        invoiceId: requireString(raw, 'invoice_id'),
+        active: requireBoolean(raw, 'active'),
+        recipientEmail: requireString(raw, 'recipient_email'),
+        hasReminderConsent: requireBoolean(raw, 'has_reminder_consent'),
+        occurrences: (() => {
+          if (!Array.isArray(raw.occurrences) || raw.occurrences.some((value) => typeof value !== 'string')) {
+            throw new RemoteGatewayError('invalid-response')
+          }
+          return raw.occurrences
+        })(),
+      }
     case 'expense':
       return {
         ...common,
@@ -741,7 +838,26 @@ const parsePushResponse = (
     row.updatedAt,
     ['sync_changes', 'legacy_receipt'],
   ))
-  return { type: 'applied', rows: [row] }
+  const rows = [row]
+  if (data.cloud_rows !== undefined) {
+    if (!Array.isArray(data.cloud_rows)) throw new RemoteGatewayError('invalid-response')
+    const identities = new Set([`${row.entity}:${row.entityId}`])
+    for (const value of data.cloud_rows) {
+      const extra = asRecord(value)
+      const entity = requireEntity(extra, 'entity')
+      const extraRow = envelopeFromRaw(entity, asRecord(extra.cloud), ownerId)
+      const identity = `${entity}:${extraRow.entityId}`
+      if (identities.has(identity)) throw new RemoteGatewayError('invalid-response')
+      identities.add(identity)
+      Object.assign(extraRow, receiptPosition(
+        extra.sync_position,
+        extraRow.updatedAt,
+        ['sync_changes'],
+      ))
+      rows.push(extraRow)
+    }
+  }
+  return { type: 'applied', rows }
 }
 
 const parsePull = (
@@ -750,7 +866,23 @@ const parsePull = (
   previous: CursorTuple | null,
 ): PullResult => {
   const data = asRecord(value)
-  if (requireString(data, 'status') !== 'ok' || !Array.isArray(data.changes)) {
+  const status = requireString(data, 'status')
+  if (status === 'cursor_expired') {
+    const snapshotWatermark = requireInteger(data, 'snapshot_watermark')
+    if (data.snapshot_cursor !== null) throw new RemoteGatewayError('invalid-response')
+    const stableCursor = previous ?? {
+      updatedAt: '1970-01-01T00:00:00.000Z', changeSeq: 0, changeId: 0,
+    }
+    return {
+      type: 'cursorExpired',
+      snapshotWatermark,
+      snapshotCursor: null,
+      rows: [],
+      cursor: encodeCursor(stableCursor),
+      hasMore: false,
+    }
+  }
+  if (status !== 'ok' || !Array.isArray(data.changes)) {
     throw new RemoteGatewayError('invalid-response')
   }
   const cursorRaw = asRecord(data.cursor)
@@ -839,7 +971,79 @@ const parsePull = (
   })
   const hasMore = requireBoolean(data, 'has_more')
   if (hasMore && rows.length === 0) throw new RemoteGatewayError('invalid-response')
-  return { rows, cursor: encodeCursor(cursor), hasMore }
+  return { type: 'page', rows, cursor: encodeCursor(cursor), hasMore }
+}
+
+const parseSnapshotPull = (
+  value: unknown,
+  ownerId: string,
+  expectedWatermark: number,
+  previous: SnapshotCursorTuple | null,
+): SnapshotPullResult => {
+  const data = asRecord(value)
+  if (requireString(data, 'status') !== 'ok' || !Array.isArray(data.rows)) {
+    throw new RemoteGatewayError('invalid-response')
+  }
+  const snapshotWatermark = requireInteger(data, 'snapshot_watermark')
+  if (snapshotWatermark !== expectedWatermark) throw new RemoteGatewayError('invalid-response')
+  const resumeRaw = asRecord(data.resume_cursor)
+  const resume = {
+    updatedAt: requireTimestamp(resumeRaw, 'updated_at'),
+    changeSeq: requireInteger(resumeRaw, 'change_seq'),
+    changeId: requireInteger(resumeRaw, 'change_id'),
+  }
+  if (resume.changeSeq !== snapshotWatermark) throw new RemoteGatewayError('invalid-response')
+  const rows = data.rows.map((value): CloudRowEnvelope => {
+    const item = asRecord(value)
+    if (requireString(item, 'owner_id') !== ownerId) throw new RemoteGatewayError('invalid-response')
+    const entity = requireEntity(item, 'entity')
+    const entityId = requireString(item, 'entity_id')
+    const version = requireInteger(item, 'version')
+    const updatedAt = requireTimestamp(item, 'updated_at')
+    const envelope = envelopeFromRaw(entity, asRecord(item.payload), ownerId)
+    if (
+      envelope.entityId !== entityId ||
+      envelope.version !== version ||
+      envelope.updatedAt !== updatedAt
+    ) throw new RemoteGatewayError('invalid-response')
+    return {
+      ...envelope,
+      changeSource: 'sync_snapshot',
+      changeSeq: snapshotWatermark,
+      changeId: 0,
+    }
+  })
+  if (rows.length > PULL_LIMIT) throw new RemoteGatewayError('invalid-response')
+  const keys = rows.map((row) => ({ entity: row.entity, id: row.entityId }))
+  if (previous && keys.length > 0 && compareSnapshotCursor(previous, keys[0]) >= 0) {
+    throw new RemoteGatewayError('invalid-response')
+  }
+  for (let index = 1; index < keys.length; index += 1) {
+    if (compareSnapshotCursor(keys[index - 1], keys[index]) >= 0) {
+      throw new RemoteGatewayError('invalid-response')
+    }
+  }
+  const hasMore = requireBoolean(data, 'has_more')
+  const cursor = data.cursor === null
+    ? null
+    : encodeSnapshotCursor({
+        entity: requireEntity(asRecord(data.cursor), 'entity'),
+        id: requireString(asRecord(data.cursor), 'id'),
+      })
+  if (
+    (hasMore && (rows.length === 0 || cursor === null)) ||
+    (!hasMore && cursor !== null)
+  ) throw new RemoteGatewayError('invalid-response')
+  if (cursor !== null && compareSnapshotCursor(keys.at(-1)!, decodeSnapshotCursor(cursor)!) !== 0) {
+    throw new RemoteGatewayError('invalid-response')
+  }
+  return {
+    rows,
+    cursor,
+    hasMore,
+    snapshotWatermark,
+    resumeCursor: encodeCursor(resume),
+  }
 }
 
 export const createSupabaseGateway = (
@@ -863,28 +1067,55 @@ export const createSupabaseGateway = (
       return parsePull(reply.data, ownerId, cursor)
     },
 
+    async pullSnapshot(ownerId, watermark, cursorValue, signal): Promise<SnapshotPullResult> {
+      if (!ownerId || !Number.isSafeInteger(watermark) || watermark < 0) {
+        throw new RemoteGatewayError('invalid-response')
+      }
+      const cursor = decodeSnapshotCursor(cursorValue)
+      const reply = await callProvider(() => client.rpc('pull_sync_snapshot', {
+        p_snapshot_watermark: watermark,
+        p_after_entity: cursor?.entity ?? null,
+        p_after_id: cursor?.id ?? null,
+        p_limit: PULL_LIMIT,
+      }), signal, deadlineMs)
+      return parseSnapshotPull(reply.data, ownerId, watermark, cursor)
+    },
+
     async pushMutation(ownerId, mutation, signal): Promise<PushResult> {
       if (!ownerId || mutation.ownerId !== ownerId) {
         throw new RemoteGatewayError('invalid-response')
       }
-      const reply = mutation.kind === 'save_invoice_bundle'
-        ? await callProvider(() => client.rpc('save_invoice_bundle', {
-            p_mutation_id: mutation.id,
-            p_payload: mutationRpcPayload(mutation),
-          }), signal, deadlineMs, true)
-        : mutation.entity === 'profile' && mutation.kind === 'create'
-          ? await callProvider(() => client.rpc('save_fieldcraft_onboarding', {
-              p_mutation_id: mutation.id,
-              p_payload: mutation.payload,
-            }), signal, deadlineMs, true)
-        : await callProvider(() => client.rpc('apply_entity_mutation', {
-            p_mutation_id: mutation.id,
-            p_entity: mutation.entity,
-            p_kind: mutation.kind,
-            p_entity_id: mutation.entityId,
-            p_base_version: mutation.baseVersion,
-            p_payload: mutation.kind === 'delete' ? {} : mutation.payload,
-          }), signal, deadlineMs, true)
+      let reply: ProviderReply
+      if (mutation.kind === 'save_invoice_bundle') {
+        reply = await callProvider(() => client.rpc('save_invoice_bundle', {
+          p_mutation_id: mutation.id,
+          p_payload: mutationRpcPayload(mutation),
+        }), signal, deadlineMs, true)
+      } else if (
+        mutation.kind === 'save_estimate' ||
+        mutation.kind === 'convert_estimate' ||
+        mutation.kind === 'issue_invoice' ||
+        mutation.kind === 'record_manual_payment'
+      ) {
+        reply = await callProvider(() => client.rpc(mutation.kind, {
+          p_mutation_id: mutation.id,
+          p_payload: mutation.payload,
+        }), signal, deadlineMs, true)
+      } else if (mutation.entity === 'profile' && mutation.kind === 'create') {
+        reply = await callProvider(() => client.rpc('save_fieldcraft_onboarding', {
+          p_mutation_id: mutation.id,
+          p_payload: mutation.payload,
+        }), signal, deadlineMs, true)
+      } else {
+        reply = await callProvider(() => client.rpc('apply_entity_mutation', {
+          p_mutation_id: mutation.id,
+          p_entity: mutation.entity,
+          p_kind: mutation.kind,
+          p_entity_id: mutation.entityId,
+          p_base_version: mutation.baseVersion,
+          p_payload: mutation.kind === 'delete' ? {} : mutation.payload,
+        }), signal, deadlineMs, true)
+      }
       return parsePushResponse(reply.data, mutation, ownerId)
     },
 

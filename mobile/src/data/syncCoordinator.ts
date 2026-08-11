@@ -37,6 +37,16 @@ export interface SyncRepository {
     markInitialHydration?: boolean,
     isCurrent?: () => boolean,
   ): Promise<void>
+  beginSnapshotReset?(ownerId: string, snapshotWatermark: number): Promise<string | null>
+  commitSnapshotPage?(
+    ownerId: string,
+    rows: CloudRowEnvelope[],
+    snapshotCursor: string | null,
+    snapshotWatermark: number,
+    hasMore: boolean,
+    resumeCursor: string,
+    isCurrent?: () => boolean,
+  ): Promise<void>
   acknowledgeMutation(
     ownerId: string,
     mutationId: string,
@@ -87,6 +97,7 @@ type SyncCoordinatorOptions = {
   clock?: SyncClock
   random?: () => number
   onReauthenticationRequired?: (ownerId: string) => void
+  yieldControl?: () => Promise<void>
 }
 
 const systemClock: SyncClock = {
@@ -97,6 +108,9 @@ const systemClock: SyncClock = {
 
 const MIN_RETRY_DELAY_MS = 5_000
 const MAX_RETRY_DELAY_MS = 300_000
+const REALTIME_DEBOUNCE_MS = 2_000
+const MIN_REALTIME_PULL_INTERVAL_MS = 5_000
+const MAX_PAGES_BEFORE_YIELD = 10
 
 export const computeRetryDelayMs = (attempt: number, random: number): number => {
   const safeAttempt = Math.max(0, Math.min(30, Math.floor(attempt)))
@@ -132,6 +146,7 @@ export class SyncCoordinator {
   private readonly clock: SyncClock
   private readonly random: () => number
   private readonly onReauthenticationRequired: (ownerId: string) => void
+  private readonly yieldControl: () => Promise<void>
   private lifecycle: SyncLifecycle = {
     ownerId: null,
     authenticated: false,
@@ -145,6 +160,8 @@ export class SyncCoordinator {
   private realtime: RealtimeSubscription | null = null
   private retryTimer: unknown = null
   private realtimeRetryTimer: unknown = null
+  private realtimeInvalidationTimer: unknown = null
+  private lastPullStartedAt = Number.NEGATIVE_INFINITY
   private followUpRequested = false
   private readonly retryAttempts = { authentication: 0, pull: 0, push: 0, realtime: 0 }
   private disposed = false
@@ -156,6 +173,7 @@ export class SyncCoordinator {
     this.clock = options.clock ?? systemClock
     this.random = options.random ?? Math.random
     this.onReauthenticationRequired = options.onReauthenticationRequired ?? (() => {})
+    this.yieldControl = options.yieldControl ?? (() => Promise.resolve())
   }
 
   readonly getStatus = (): SyncStatus => this.status
@@ -309,21 +327,38 @@ export class SyncCoordinator {
     if (!this.isRunCurrent(generation, ownerId, signal)) return
 
     try {
-      const cursor = await this.repository.getSyncCursor(ownerId)
-      if (!this.isRunCurrent(generation, ownerId, signal)) return
-      const pull = await this.gateway.pullSince(ownerId, cursor, signal)
-      if (!this.isRunCurrent(generation, ownerId, signal)) return
-      await this.repository.commitPull(
-        ownerId,
-        pull.rows,
-        pull.cursor,
-        !pull.hasMore,
-        () => this.isRunCurrent(generation, ownerId, signal),
-      )
-      this.retryAttempts.pull = 0
-      if (pull.hasMore) {
-        this.followUpRequested = true
-        return
+      let cursor = await this.repository.getSyncCursor(ownerId)
+      let pagesSinceYield = 0
+      while (this.isRunCurrent(generation, ownerId, signal)) {
+        this.lastPullStartedAt = this.clock.now()
+        const pull = await this.gateway.pullSince(ownerId, cursor, signal)
+        if (!this.isRunCurrent(generation, ownerId, signal)) return
+        if (pull.type === 'cursorExpired') {
+          await this.recoverExpiredCursor(
+            ownerId,
+            pull.snapshotWatermark,
+            generation,
+            signal,
+          )
+          cursor = await this.repository.getSyncCursor(ownerId)
+          pagesSinceYield = 0
+          continue
+        }
+        await this.repository.commitPull(
+          ownerId,
+          pull.rows,
+          pull.cursor,
+          !pull.hasMore,
+          () => this.isRunCurrent(generation, ownerId, signal),
+        )
+        this.retryAttempts.pull = 0
+        cursor = pull.cursor
+        pagesSinceYield += 1
+        if (!pull.hasMore) break
+        if (pagesSinceYield === MAX_PAGES_BEFORE_YIELD) {
+          await this.yieldControl()
+          pagesSinceYield = 0
+        }
       }
     } catch (error) {
       if (!this.isRunCurrent(generation, ownerId, signal)) return
@@ -512,7 +547,7 @@ export class SyncCoordinator {
         () => {
           if (this.isGenerationCurrent(generation)) {
             this.retryAttempts.realtime = 0
-            void this.trigger(true)
+            this.scheduleRealtimeInvalidation(generation)
           }
         },
         () => {
@@ -526,6 +561,67 @@ export class SyncCoordinator {
       )
     } catch {
       this.scheduleRealtimeRetry(ownerId, generation)
+    }
+  }
+
+  private scheduleRealtimeInvalidation(generation: number): void {
+    if (!this.isGenerationCurrent(generation)) return
+    if (this.realtimeInvalidationTimer !== null) {
+      this.clock.clearTimeout(this.realtimeInvalidationTimer)
+    }
+    const sinceLastPull = this.clock.now() - this.lastPullStartedAt
+    const delay = Math.max(
+      REALTIME_DEBOUNCE_MS,
+      MIN_REALTIME_PULL_INTERVAL_MS - sinceLastPull,
+    )
+    this.realtimeInvalidationTimer = this.clock.setTimeout(() => {
+      this.realtimeInvalidationTimer = null
+      if (this.isGenerationCurrent(generation)) void this.trigger(true)
+    }, delay)
+  }
+
+  private async recoverExpiredCursor(
+    ownerId: string,
+    snapshotWatermark: number,
+    generation: number,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (
+      !this.repository.beginSnapshotReset ||
+      !this.repository.commitSnapshotPage ||
+      !this.gateway.pullSnapshot
+    ) throw new RemoteGatewayError('invalid-response')
+    let snapshotCursor = await this.repository.beginSnapshotReset(ownerId, snapshotWatermark)
+    let pagesSinceYield = 0
+    while (this.isRunCurrent(generation, ownerId, signal)) {
+      this.lastPullStartedAt = this.clock.now()
+      const page = await this.gateway.pullSnapshot(
+        ownerId,
+        snapshotWatermark,
+        snapshotCursor,
+        signal,
+      )
+      if (!this.isRunCurrent(generation, ownerId, signal)) return
+      if (page.snapshotWatermark !== snapshotWatermark) {
+        throw new RemoteGatewayError('invalid-response')
+      }
+      await this.repository.commitSnapshotPage(
+        ownerId,
+        page.rows,
+        page.cursor,
+        snapshotWatermark,
+        page.hasMore,
+        page.resumeCursor,
+        () => this.isRunCurrent(generation, ownerId, signal),
+      )
+      snapshotCursor = page.cursor
+      pagesSinceYield += 1
+      if (!page.hasMore) return
+      if (snapshotCursor === null) throw new RemoteGatewayError('invalid-response')
+      if (pagesSinceYield === MAX_PAGES_BEFORE_YIELD) {
+        await this.yieldControl()
+        pagesSinceYield = 0
+      }
     }
   }
 
@@ -551,6 +647,10 @@ export class SyncCoordinator {
     if (this.realtimeRetryTimer !== null) {
       this.clock.clearTimeout(this.realtimeRetryTimer)
       this.realtimeRetryTimer = null
+    }
+    if (this.realtimeInvalidationTimer !== null) {
+      this.clock.clearTimeout(this.realtimeInvalidationTimer)
+      this.realtimeInvalidationTimer = null
     }
   }
 

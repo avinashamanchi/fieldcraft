@@ -935,6 +935,7 @@ it('normalizes a changed invoice from its bounded owner-readable relation projec
     tax_cents: 0,
     total_cents: 100,
     payment_terms: 'Due on receipt',
+    status: 'Draft',
     version: 2,
     created_at: '2026-08-03T10:00:00.000Z',
     updated_at: '2026-08-03T10:00:04.000Z',

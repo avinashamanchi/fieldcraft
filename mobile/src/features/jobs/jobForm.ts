@@ -14,7 +14,10 @@ export const JobDraftSchema = z.object({
   clientId: z.string().min(1, 'Choose a client'),
   title: boundedText(200, 'Title').pipe(z.string().min(1, 'Enter a job title')),
   tradeType: z.enum(['Plumbing', 'Electrical', 'HVAC', 'Carpentry', 'General', 'Roofing', 'Flooring', 'Painting']),
-  status: z.enum(['Scheduled', 'In Progress', 'Invoiced', 'Paid']),
+  status: z.enum([
+    'Scheduled', 'In Progress', 'Completed', 'Invoiced',
+    'Partially Paid', 'Paid', 'Cancelled',
+  ]),
   address: boundedText(500, 'Address'),
   description: boundedText(4000, 'Description'),
   laborHoursThousandths: z.number().finite().int().min(0).max(MAX_QUANTITY_THOUSANDTHS),

@@ -3,7 +3,18 @@ import { z } from 'zod'
 import { MAX_MONEY_CENTS, MAX_TAX_BASIS_POINTS } from './limits'
 import type { MoneyCents } from './money'
 
-export type JobStatus = 'Scheduled' | 'In Progress' | 'Invoiced' | 'Paid'
+export type JobStatus =
+  | 'Scheduled'
+  | 'In Progress'
+  | 'Completed'
+  | 'Invoiced'
+  | 'Partially Paid'
+  | 'Paid'
+  | 'Cancelled'
+export type InvoiceStatus = 'Draft' | 'Issued' | 'Viewed' | 'Partially Paid' | 'Paid' | 'Void'
+export type EstimateStatus = 'Draft' | 'Issued' | 'Accepted' | 'Declined' | 'Expired' | 'Converted' | 'Void'
+export type PaymentStatus = 'Pending' | 'Succeeded' | 'Failed' | 'Partially Refunded' | 'Refunded' | 'Disputed'
+export type PaymentMethod = 'Stripe' | 'Cash' | 'Check' | 'Bank Transfer' | 'Other'
 export type SyncState = 'current' | 'pending' | 'syncing' | 'failed' | 'conflict'
 export type TradeType =
   | 'Plumbing'
@@ -78,6 +89,54 @@ export type Invoice = VersionedEntity & {
   subtotalCents: MoneyCents
   taxCents: MoneyCents
   totalCents: MoneyCents
+  number?: string
+  status?: InvoiceStatus
+  issuedAt?: string
+  dueAt?: string
+}
+
+export type Estimate = VersionedEntity & {
+  clientId: string
+  convertedJobId?: string
+  number?: string
+  revision: number
+  status: EstimateStatus
+  title: string
+  scope: string
+  lineItems: LineItemDraft[]
+  subtotalCents: MoneyCents
+  taxBasisPoints: number
+  taxCents: MoneyCents
+  totalCents: MoneyCents
+  expiresAt: string
+  issuedAt?: string
+  acceptedAt?: string
+  acceptanceRecordedBy?: string
+  issuedSnapshot?: unknown
+  notes?: string
+}
+
+export type Payment = VersionedEntity & {
+  invoiceId: string
+  amountCents: MoneyCents
+  currency: 'USD'
+  method: PaymentMethod
+  status: PaymentStatus
+  refundedCents: MoneyCents
+  manual: boolean
+  providerPaymentIntentId?: string
+  providerChargeId?: string
+  providerEventAt?: string
+  note?: string
+  recordedAt?: string
+}
+
+export type ReminderSchedule = VersionedEntity & {
+  invoiceId: string
+  active: boolean
+  recipientEmail: string
+  hasReminderConsent: boolean
+  occurrences: ('three-days-before' | 'due' | 'seven-days-overdue')[]
 }
 
 export type Expense = VersionedEntity & {

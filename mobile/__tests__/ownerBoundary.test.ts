@@ -380,7 +380,7 @@ it('deactivates exactly once when a replacement attachment fails initialization 
   const drainingClose = draining.close()
   await idle.close()
   const raw = __getRawDatabase('failed-replacement.db')
-  raw.userVersion = 6
+  raw.userVersion = 7
   const migrationPause = __pauseNextMigrationRead('failed-replacement.db')
   const replacement = new SQLiteFieldCraftRepository({ databaseName: 'failed-replacement.db' })
   const replacementInitialization = replacement.initialize('owner-a')

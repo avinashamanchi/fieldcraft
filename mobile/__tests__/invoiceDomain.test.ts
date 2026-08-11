@@ -70,3 +70,19 @@ it('enforces the versioned JSON and Zod invoice contracts', () => {
     expect(() => calculateInvoice(invalidDraft)).toThrow()
   }
 })
+
+it('derives overdue only for an unpaid issued invoice without persisting a clock transition', () => {
+  const lifecycle = require('../src/domain/invoice') as {
+    deriveInvoiceDisplayStatus?: (status: string, dueAt: string, balanceCents: number, now: string) => string
+  }
+  expect(typeof lifecycle.deriveInvoiceDisplayStatus).toBe('function')
+  if (!lifecycle.deriveInvoiceDisplayStatus) return
+  const now = '2026-08-10T20:00:00.000Z'
+
+  expect(lifecycle.deriveInvoiceDisplayStatus('Issued', '2026-08-09T20:00:00.000Z', 1, now)).toBe('Overdue')
+  expect(lifecycle.deriveInvoiceDisplayStatus('Viewed', '2026-08-09T20:00:00.000Z', 1, now)).toBe('Overdue')
+  expect(lifecycle.deriveInvoiceDisplayStatus('Partially Paid', '2026-08-09T20:00:00.000Z', 1, now)).toBe('Overdue')
+  expect(lifecycle.deriveInvoiceDisplayStatus('Paid', '2026-08-09T20:00:00.000Z', 0, now)).toBe('Paid')
+  expect(lifecycle.deriveInvoiceDisplayStatus('Issued', '2026-08-11T20:00:00.000Z', 1, now)).toBe('Issued')
+  expect(lifecycle.deriveInvoiceDisplayStatus('Void', '2026-08-09T20:00:00.000Z', 1, now)).toBe('Void')
+})

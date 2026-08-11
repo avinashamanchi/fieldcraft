@@ -1,6 +1,11 @@
 import * as FileSystem from 'expo-file-system/legacy'
 
-export const OWNED_TEMP_DIRECTORIES = ['fieldcraft-imports', 'fieldcraft-pdf', 'fieldcraft-logo-work'] as const
+export const OWNED_TEMP_DIRECTORIES = [
+  'fieldcraft-imports',
+  'fieldcraft-pdf',
+  'fieldcraft-logo-work',
+  'fieldcraft-export',
+] as const
 
 type Cleanup = () => Promise<void>
 
@@ -39,6 +44,41 @@ export class TempArtifactRegistry {
       fileSystem.deleteAsync(`${fileSystem.cacheDirectory}${directory}`, { idempotent: true }),
     ))
     if (results.some((result) => result.status === 'rejected')) throw new Error('Some FieldCraft temporary directories could not be deleted.')
+  }
+
+  async sweepExpired(
+    now = Date.now(),
+    maximumAgeMs = 24 * 60 * 60 * 1_000,
+    fileSystem: Pick<typeof FileSystem,
+      'cacheDirectory' | 'readDirectoryAsync' | 'getInfoAsync' | 'deleteAsync'> = FileSystem,
+  ): Promise<void> {
+    if (!fileSystem.cacheDirectory) return
+    if (!Number.isFinite(now) || !Number.isFinite(maximumAgeMs) || maximumAgeMs < 1) {
+      throw new Error('Temporary artifact retention settings are invalid.')
+    }
+    const cutoffSeconds = (now - maximumAgeMs) / 1_000
+    const failures: unknown[] = []
+    for (const directory of OWNED_TEMP_DIRECTORIES) {
+      const directoryUri = `${fileSystem.cacheDirectory}${directory}`
+      let entries: string[]
+      try { entries = await fileSystem.readDirectoryAsync(directoryUri) }
+      catch { continue }
+      for (const entry of entries) {
+        if (!entry || entry.includes('/') || entry.includes('\\') || entry === '.' || entry === '..') {
+          failures.push(new Error('Unsafe temporary artifact name'))
+          continue
+        }
+        const uri = `${directoryUri}/${entry}`
+        try {
+          const info = await fileSystem.getInfoAsync(uri)
+          if (info.exists && typeof info.modificationTime === 'number' && info.modificationTime <= cutoffSeconds) {
+            await fileSystem.deleteAsync(uri, { idempotent: true })
+            this.cleanups.delete(uri)
+          }
+        } catch (cause) { failures.push(cause) }
+      }
+    }
+    if (failures.length > 0) throw new Error('Some expired FieldCraft temporary artifacts could not be deleted.')
   }
 }
 

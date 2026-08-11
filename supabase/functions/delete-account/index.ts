@@ -1,5 +1,7 @@
 import { authenticate } from "../_shared/auth.ts";
 import { readBoundedBody } from "../_shared/body.ts";
+import { createSupabaseService } from "../_shared/service.ts";
+import { createStripeTransport, requireStripeId } from "../_shared/stripe.ts";
 
 type Dependencies = {
   allowedOrigins: Set<string>;
@@ -7,6 +9,10 @@ type Dependencies = {
     authorization: string | null,
   ): Promise<{ userId: string }>;
   requireRecentAal2(authorization: string): Promise<void>;
+  invalidateOwnerWork(userId: string): Promise<void>;
+  revokePaymentLinks(userId: string): Promise<void>;
+  cancelReminders(userId: string): Promise<void>;
+  disconnectProvider(userId: string): Promise<void>;
   deleteLogo(userId: string): Promise<void>;
   deleteUser(userId: string): Promise<void>;
   log(entry: { requestId: string; status: number; publicCode: string }): void;
@@ -82,6 +88,16 @@ export const createDeleteAccountHandler =
       }
       if (!authorization) throw new Error("unauthorized");
       await dependencies.requireRecentAal2(authorization);
+      await dependencies.invalidateOwnerWork(identity.userId);
+      await dependencies.revokePaymentLinks(identity.userId);
+      await dependencies.cancelReminders(identity.userId);
+      try {
+        await dependencies.disconnectProvider(identity.userId);
+      } catch {
+        // Provider unlinking is deliberately best effort. Required local/cloud
+        // revocation has already completed and auth deletion must remain usable
+        // during a provider outage.
+      }
       await dependencies.deleteLogo(identity.userId);
       await dependencies.deleteUser(identity.userId);
       return json(200, { requestId, status: "deleted" }, cors);
@@ -116,6 +132,11 @@ export const createProductionDeleteAccountHandler = (
   const publishableKey = environment.SUPABASE_ANON_KEY?.trim() ||
     required(environment, "SUPABASE_PUBLISHABLE_KEY");
   const serviceRoleKey = required(environment, "SUPABASE_SERVICE_ROLE_KEY");
+  const service = createSupabaseService(environment, fetcher);
+  const stripeKey = environment.STRIPE_SECRET_KEY?.trim();
+  const stripe = stripeKey
+    ? createStripeTransport({ secretKey: stripeKey, fetcher })
+    : null;
   const adminHeaders = {
     Authorization: `Bearer ${serviceRoleKey}`,
     apikey: serviceRoleKey,
@@ -146,6 +167,42 @@ export const createProductionDeleteAccountHandler = (
         throw new Error("aal2-required");
       }
       if (!response.ok) throw new Error("aal2-check-failed");
+    },
+    async invalidateOwnerWork(userId) {
+      await service.serviceRpc("fieldcraft_invalidate_owner_work", {
+        p_user_id: userId,
+      });
+    },
+    async revokePaymentLinks(userId) {
+      await service.serviceRpc("fieldcraft_revoke_owner_payment_links", {
+        p_user_id: userId,
+      });
+    },
+    async cancelReminders(userId) {
+      await service.serviceRpc("fieldcraft_cancel_owner_reminders", {
+        p_user_id: userId,
+      });
+    },
+    async disconnectProvider(userId) {
+      if (!stripe) return;
+      const value = await service.serviceRpc("fieldcraft_get_stripe_account", {
+        p_user_id: userId,
+      });
+      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        return;
+      }
+      const connectedAccountId = (value as Record<string, unknown>)
+        .connectedAccountId;
+      if (typeof connectedAccountId !== "string") return;
+      const accountId = requireStripeId(connectedAccountId, "acct");
+      await stripe.request(`accounts/${accountId}`, {}, {
+        method: "DELETE",
+        idempotencyKey: `fieldcraft-account-delete:${userId}`,
+      });
+      await service.serviceRpc("fieldcraft_delete_stripe_account", {
+        p_user_id: userId,
+        p_connected_account_id: accountId,
+      });
     },
     async deleteLogo(userId) {
       const response = await fetcher(

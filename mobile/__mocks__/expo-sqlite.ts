@@ -13,6 +13,7 @@ type RecordRow = {
 type BootstrapRecordRow = RecordRow & {
   change_seq?: number
   change_id?: number
+  change_source?: 'sync_changes' | 'sync_snapshot'
 }
 
 type ServerAuthorityRow = RecordRow & {
@@ -43,6 +44,20 @@ type OutboxRow = {
   last_error: string | null
 }
 
+type QuarantinedOutboxRow = Omit<OutboxRow, 'state' | 'last_error'> & {
+  reason: 'validation' | 'unsupported-schema' | 'integrity' | 'invalid-response' | 'attempt-limit'
+  quarantined_at: string
+  superseded_by: string | null
+  recovery_history_json: string
+}
+
+type OutboxDependencyRow = {
+  owner_id: string
+  mutation_id: string
+  depends_on_mutation_id: string
+  created_at: string
+}
+
 type ConflictRow = {
   owner_id: string
   mutation_id: string
@@ -68,6 +83,8 @@ export type MockDatabaseState = {
   serverAuthorities: ServerAuthorityRow[]
   syncChangeEvents: SyncChangeEventRow[]
   outbox: OutboxRow[]
+  quarantinedOutbox: QuarantinedOutboxRow[]
+  outboxDependencies: OutboxDependencyRow[]
   conflicts: Record<string, unknown>[]
   syncCursors: Record<string, unknown>[]
   metadata: Record<string, unknown>[]
@@ -101,6 +118,8 @@ const createState = (): MockDatabaseState => ({
   serverAuthorities: [],
   syncChangeEvents: [],
   outbox: [],
+  quarantinedOutbox: [],
+  outboxDependencies: [],
   conflicts: [],
   syncCursors: [],
   metadata: [],
@@ -125,6 +144,8 @@ const copyState = (state: MockDatabaseState): MockDatabaseState => ({
   serverAuthorities: state.serverAuthorities.map((row) => ({ ...row })),
   syncChangeEvents: state.syncChangeEvents.map((row) => ({ ...row })),
   outbox: state.outbox.map((row) => ({ ...row })),
+  quarantinedOutbox: state.quarantinedOutbox.map((row) => ({ ...row })),
+  outboxDependencies: state.outboxDependencies.map((row) => ({ ...row })),
   conflicts: state.conflicts.map((row) => ({ ...row })),
   syncCursors: state.syncCursors.map((row) => ({ ...row })),
   metadata: state.metadata.map((row) => ({ ...row })),
@@ -149,6 +170,8 @@ const commitState = (target: MockDatabaseState, source: MockDatabaseState): void
   target.serverAuthorities = source.serverAuthorities
   target.syncChangeEvents = source.syncChangeEvents
   target.outbox = source.outbox
+  target.quarantinedOutbox = source.quarantinedOutbox
+  target.outboxDependencies = source.outboxDependencies
   target.conflicts = source.conflicts
   target.syncCursors = source.syncCursors
   target.metadata = source.metadata
@@ -176,16 +199,19 @@ const expectedSql = {
   bootstrapUpsert: normalizeSql(`/* bootstrap:stage:upsert */
     INSERT INTO sync_bootstrap_records
       (owner_id, entity, entity_id, payload_json, version, deleted, updated_at,
-       change_seq, change_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       change_seq, change_id, change_source)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(owner_id, entity, entity_id) DO UPDATE SET
       payload_json = excluded.payload_json,
       version = excluded.version,
       deleted = excluded.deleted,
       updated_at = excluded.updated_at,
       change_seq = excluded.change_seq,
-      change_id = excluded.change_id
-    WHERE excluded.change_seq >= sync_bootstrap_records.change_seq`),
+      change_id = excluded.change_id,
+      change_source = excluded.change_source
+    WHERE excluded.change_seq > sync_bootstrap_records.change_seq
+       OR (excluded.change_seq = sync_bootstrap_records.change_seq
+           AND excluded.change_source >= sync_bootstrap_records.change_source)`),
   authorityUpsert: normalizeSql(`/* server-authority:upsert */
     INSERT INTO sync_server_authority
       (owner_id, entity, entity_id, payload_json, version, deleted, updated_at,
@@ -242,6 +268,8 @@ const expectedSql = {
   conflictDelete: '/* conflicts:delete */ delete from conflicts where owner_id = ? and mutation_id = ?',
   recordsClear: '/* owner:clear:records */ delete from records where owner_id = ?',
   outboxClear: '/* owner:clear:outbox */ delete from outbox where owner_id = ?',
+  quarantineClear: '/* owner:clear:quarantined_outbox */ delete from quarantined_outbox where owner_id = ?',
+  dependenciesClear: '/* owner:clear:outbox_dependencies */ delete from outbox_dependencies where owner_id = ?',
   conflictsClear: '/* owner:clear:conflicts */ delete from conflicts where owner_id = ?',
   cursorsClear: '/* owner:clear:sync_cursors */ delete from sync_cursors where owner_id = ?',
   metadataClear: '/* owner:clear:metadata */ delete from metadata where owner_id = ?',
@@ -280,12 +308,123 @@ const expectedSql = {
     SELECT entity_id, payload_json FROM records
     WHERE owner_id = ? AND entity = ? AND deleted = 0
     ORDER BY updated_at DESC, entity_id ASC`),
+  recordsListPageFirst: normalizeSql(`/* records:list-page:first */
+    SELECT entity_id, payload_json, updated_at FROM records
+    WHERE owner_id = ? AND entity = ? AND deleted = 0
+    ORDER BY updated_at DESC, entity_id ASC LIMIT ?`),
+  recordsListPageAfter: normalizeSql(`/* records:list-page:after */
+    SELECT entity_id, payload_json, updated_at FROM records
+    WHERE owner_id = ? AND entity = ? AND deleted = 0
+      AND (updated_at < ? OR (updated_at = ? AND entity_id > ?))
+    ORDER BY updated_at DESC, entity_id ASC LIMIT ?`),
   outboxList: normalizeSql(`/* outbox:list */
     SELECT owner_id, mutation_id, entity, entity_id, kind, base_version,
            payload_json, payload_hash, created_at, attempts, last_error
+    FROM outbox AS candidate
+    WHERE candidate.owner_id = ? AND candidate.state IN ('pending', 'failed')
+      AND NOT EXISTS (
+        SELECT 1 FROM outbox_dependencies AS dependency
+        INNER JOIN quarantined_outbox AS blocked
+          ON blocked.owner_id = dependency.owner_id
+         AND blocked.mutation_id = dependency.depends_on_mutation_id
+         AND blocked.superseded_by IS NULL
+        WHERE dependency.owner_id = candidate.owner_id
+          AND dependency.mutation_id = candidate.mutation_id
+      )
+    ORDER BY candidate.sequence ASC`),
+  dependencyFindParent: normalizeSql(`/* outbox-dependencies:find-parent */
+    SELECT candidate.mutation_id
+    FROM (
+      SELECT pending.mutation_id, pending.sequence
+      FROM outbox AS pending
+      WHERE pending.owner_id = ? AND pending.entity = ? AND pending.entity_id = ?
+        AND pending.mutation_id <> ? AND pending.state <> 'complete'
+      UNION ALL
+      SELECT blocked.mutation_id, blocked.sequence
+      FROM quarantined_outbox AS blocked
+      WHERE blocked.owner_id = ? AND blocked.entity = ? AND blocked.entity_id = ?
+        AND blocked.mutation_id <> ? AND blocked.superseded_by IS NULL
+    ) AS candidate
+    ORDER BY candidate.sequence DESC LIMIT 1`),
+  dependencyInsert: normalizeSql(`/* outbox-dependencies:insert */
+    INSERT INTO outbox_dependencies
+      (owner_id, mutation_id, depends_on_mutation_id, created_at)
+    VALUES (?, ?, ?, ?)`),
+  dependencyRepoint: normalizeSql(`/* outbox-dependencies:repoint */
+    UPDATE outbox_dependencies
+    SET depends_on_mutation_id = ?
+    WHERE owner_id = ? AND depends_on_mutation_id = ? AND mutation_id <> ?`),
+  dependencyBlockedCount: normalizeSql(`/* outbox-dependencies:blocked-count */
+    SELECT COUNT(*) AS count
+    FROM outbox_dependencies AS dependency
+    WHERE dependency.owner_id = ? AND dependency.depends_on_mutation_id = ?
+      AND (
+        EXISTS (
+          SELECT 1 FROM outbox AS child
+          WHERE child.owner_id = dependency.owner_id
+            AND child.mutation_id = dependency.mutation_id
+            AND child.state <> 'complete'
+        )
+        OR EXISTS (
+          SELECT 1 FROM quarantined_outbox AS child
+          WHERE child.owner_id = dependency.owner_id
+            AND child.mutation_id = dependency.mutation_id
+            AND child.superseded_by IS NULL
+        )
+      )`),
+  retainedCount: normalizeSql(`/* outbox:retained-count */
+    SELECT
+      (SELECT COUNT(*) FROM outbox WHERE owner_id = ? AND state <> 'complete')
+      +
+      (SELECT COUNT(*) FROM quarantined_outbox WHERE owner_id = ? AND superseded_by IS NULL)
+      AS count`),
+  outboxAttempts: normalizeSql(`/* outbox:attempts */
+    SELECT attempts FROM outbox
+    WHERE owner_id = ? AND mutation_id = ? AND state = 'failed'`),
+  quarantineSource: normalizeSql(`/* quarantine:source */
+    SELECT owner_id, mutation_id, sequence, entity, entity_id, kind, base_version,
+           payload_json, payload_hash, created_at, attempts,
+           NULL AS reason, NULL AS quarantined_at, NULL AS superseded_by,
+           '[]' AS recovery_history_json
     FROM outbox
-    WHERE owner_id = ? AND state IN ('pending', 'failed')
-    ORDER BY sequence ASC`),
+    WHERE owner_id = ? AND mutation_id = ? AND state <> 'complete'`),
+  quarantineGet: normalizeSql(`/* quarantine:get */
+    SELECT owner_id, mutation_id, sequence, entity, entity_id, kind, base_version,
+           payload_json, payload_hash, created_at, attempts, reason, quarantined_at,
+           superseded_by, recovery_history_json
+    FROM quarantined_outbox
+    WHERE owner_id = ? AND mutation_id = ?`),
+  quarantineList: normalizeSql(`/* quarantine:list */
+    SELECT owner_id, mutation_id, sequence, entity, entity_id, kind, base_version,
+           payload_json, payload_hash, created_at, attempts, reason, quarantined_at,
+           superseded_by, recovery_history_json
+    FROM quarantined_outbox
+    WHERE owner_id = ?
+    ORDER BY quarantined_at DESC, mutation_id ASC`),
+  quarantineInsert: normalizeSql(`/* quarantine:insert */
+    INSERT INTO quarantined_outbox
+      (owner_id, mutation_id, sequence, entity, entity_id, kind, base_version,
+       payload_json, payload_hash, created_at, attempts, reason, quarantined_at,
+       superseded_by, recovery_history_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`),
+  quarantineRemoveSource: normalizeSql(`/* quarantine:remove-source */
+    DELETE FROM outbox
+    WHERE owner_id = ? AND mutation_id = ? AND state <> 'complete'`),
+  quarantineRetry: normalizeSql(`/* quarantine:retry */
+    INSERT INTO outbox
+      (owner_id, mutation_id, sequence, entity, entity_id, kind, base_version,
+       payload_json, payload_hash, created_at, attempts, state, last_error)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'pending', NULL)`),
+  quarantineDelete: normalizeSql(`/* quarantine:delete */
+    DELETE FROM quarantined_outbox WHERE owner_id = ? AND mutation_id = ?`),
+  quarantineSupersede: normalizeSql(`/* quarantine:supersede */
+    UPDATE quarantined_outbox
+    SET superseded_by = ?,
+        recovery_history_json = json_insert(
+          recovery_history_json, '$[#]',
+          json_object('action', 'superseded', 'at', ?)
+        )
+    WHERE owner_id = ? AND mutation_id = ? AND superseded_by IS NULL`),
   cursorGet: normalizeSql(`/* sync-cursors:get */
     SELECT cursor FROM sync_cursors WHERE owner_id = ? AND entity = ?`),
   conflictGet: normalizeSql(`/* conflicts:get */
@@ -307,6 +446,21 @@ const expectedSql = {
     SELECT value FROM metadata WHERE owner_id = ? AND key = ?`),
   reconciliationGet: normalizeSql(`/* metadata:reconciliation:get */
     SELECT value FROM metadata WHERE owner_id = ? AND key = ?`),
+  snapshotWatermarkGet: normalizeSql(`/* metadata:snapshot-watermark:get */
+    SELECT value FROM metadata WHERE owner_id = ? AND key = ?`),
+  snapshotCursorGet: normalizeSql(`/* metadata:snapshot-cursor:get */
+    SELECT value FROM metadata WHERE owner_id = ? AND key = ?`),
+  snapshotWatermarkUpsert: normalizeSql(`/* metadata:snapshot-watermark:upsert */
+    INSERT INTO metadata (owner_id, key, value)
+    VALUES (?, ?, ?)
+    ON CONFLICT(owner_id, key) DO UPDATE SET value = excluded.value`),
+  snapshotCursorUpsert: normalizeSql(`/* metadata:snapshot-cursor:upsert */
+    INSERT INTO metadata (owner_id, key, value)
+    VALUES (?, ?, ?)
+    ON CONFLICT(owner_id, key) DO UPDATE SET value = excluded.value`),
+  snapshotResetDelete: normalizeSql(`/* metadata:snapshot-reset:delete */
+    DELETE FROM metadata
+    WHERE owner_id = ? AND key IN (?, ?)`),
   reconciliationTerminalGet: normalizeSql(`/* metadata:reconciliation-terminal:get */
     SELECT value FROM metadata WHERE owner_id = ? AND key = ?`),
   acknowledgementSequence: normalizeSql(`/* outbox:acknowledgement-sequence */
@@ -354,7 +508,8 @@ const expectedSql = {
     FROM outbox
     WHERE owner_id = ? AND state <> 'complete'`),
   bootstrapRecordsList: normalizeSql(`/* bootstrap:records:list */
-    SELECT entity, entity_id, payload_json, version, deleted, updated_at, change_seq, change_id
+    SELECT entity, entity_id, payload_json, version, deleted, updated_at,
+           change_seq, change_id, change_source
     FROM sync_bootstrap_records
     WHERE owner_id = ?`),
   bootstrapCurrentList: normalizeSql(`/* bootstrap:current:list */
@@ -520,6 +675,12 @@ class MockSQLiteDatabase {
       }
       this.state.syncChangeEvents = events
     }
+    if (source.includes('ALTER TABLE sync_bootstrap_records ADD COLUMN change_source')) {
+      this.state.bootstrapRecords = this.state.bootstrapRecords.map((row) => ({
+        ...row,
+        change_source: row.change_source ?? 'sync_changes',
+      }))
+    }
     for (const match of source.matchAll(/CREATE TABLE IF NOT EXISTS\s+(\w+)/gi)) {
       this.state.tables.add(match[1])
     }
@@ -532,6 +693,7 @@ class MockSQLiteDatabase {
         sql.includes('create table if not exists sync_bootstrap_records') ||
         sql.includes('create table if not exists sync_server_authority') ||
         sql.includes('create table if not exists sync_change_events') ||
+        sql.includes('create table if not exists quarantined_outbox') ||
         sql.includes('alter table sync_bootstrap_records add column change_id') ||
         sql.includes('alter table sync_bootstrap_records add column change_seq') ||
         /^pragma\s+user_version/.test(sql),
@@ -572,6 +734,7 @@ class MockSQLiteDatabase {
         updated_at: String(params[6]),
         change_seq: Number(params[7]),
         change_id: Number(params[8]),
+        change_source: String(params[9]) as BootstrapRecordRow['change_source'],
       }
       const index = this.state.bootstrapRecords.findIndex(
         (candidate) => candidate.owner_id === row.owner_id &&
@@ -582,7 +745,10 @@ class MockSQLiteDatabase {
         return { changes: 1, lastInsertRowId: 0 }
       }
       const existing = this.state.bootstrapRecords[index]
-      const isAtLeastAsNew = row.change_seq! >= (existing.change_seq ?? -1)
+      const isAtLeastAsNew = row.change_seq! > (existing.change_seq ?? -1) || (
+        row.change_seq === existing.change_seq &&
+        row.change_source! >= (existing.change_source ?? 'sync_changes')
+      )
       if (isAtLeastAsNew) this.state.bootstrapRecords[index] = row
       return { changes: isAtLeastAsNew ? 1 : 0, lastInsertRowId: 0 }
     }
@@ -702,6 +868,112 @@ class MockSQLiteDatabase {
       this.state.outbox.push(row)
       return { changes: 1, lastInsertRowId: row.sequence }
     }
+    if (source.includes('quarantine:insert')) {
+      requireExactSql(sql, expectedSql.quarantineInsert, 'quarantine insertion')
+      assertSql(sql.includes('(owner_id, mutation_id, sequence'), 'quarantine insert owner key')
+      const row: QuarantinedOutboxRow = {
+        owner_id: String(params[0]),
+        mutation_id: String(params[1]),
+        sequence: Number(params[2]),
+        entity: String(params[3]),
+        entity_id: String(params[4]),
+        kind: String(params[5]),
+        base_version: params[6] === null ? null : Number(params[6]),
+        payload_json: String(params[7]),
+        payload_hash: String(params[8]),
+        created_at: String(params[9]),
+        attempts: Number(params[10]),
+        reason: String(params[11]) as QuarantinedOutboxRow['reason'],
+        quarantined_at: String(params[12]),
+        superseded_by: null,
+        recovery_history_json: String(params[13]),
+      }
+      if (this.state.quarantinedOutbox.some((candidate) => (
+        candidate.owner_id === row.owner_id && (
+          candidate.mutation_id === row.mutation_id || candidate.sequence === row.sequence
+        )
+      ))) throw new Error('UNIQUE quarantine constraint failed')
+      this.state.quarantinedOutbox.push(row)
+      return { changes: 1, lastInsertRowId: row.sequence }
+    }
+    if (source.includes('quarantine:remove-source')) {
+      requireExactSql(sql, expectedSql.quarantineRemoveSource, 'quarantine source removal')
+      requireOwnerPredicate(sql)
+      const before = this.state.outbox.length
+      this.state.outbox = this.state.outbox.filter((row) => !(
+        row.owner_id === params[0] && row.mutation_id === params[1] && row.state !== 'complete'
+      ))
+      return { changes: before - this.state.outbox.length, lastInsertRowId: 0 }
+    }
+    if (source.includes('quarantine:retry')) {
+      requireExactSql(sql, expectedSql.quarantineRetry, 'quarantine retry')
+      assertSql(sql.includes('(owner_id, mutation_id, sequence'), 'quarantine retry owner key')
+      const row: OutboxRow = {
+        owner_id: String(params[0]), mutation_id: String(params[1]), sequence: Number(params[2]),
+        entity: String(params[3]), entity_id: String(params[4]), kind: String(params[5]),
+        base_version: params[6] === null ? null : Number(params[6]),
+        payload_json: String(params[7]), payload_hash: String(params[8]), created_at: String(params[9]),
+        attempts: 0, state: 'pending', last_error: null,
+      }
+      if (this.state.outbox.some((candidate) => candidate.owner_id === row.owner_id && (
+        candidate.mutation_id === row.mutation_id || candidate.sequence === row.sequence
+      ))) throw new Error('UNIQUE retry constraint failed')
+      this.state.outbox.push(row)
+      return { changes: 1, lastInsertRowId: row.sequence }
+    }
+    if (source.includes('quarantine:delete')) {
+      requireExactSql(sql, expectedSql.quarantineDelete, 'quarantine delete')
+      requireOwnerPredicate(sql)
+      const before = this.state.quarantinedOutbox.length
+      this.state.quarantinedOutbox = this.state.quarantinedOutbox.filter((row) => !(
+        row.owner_id === params[0] && row.mutation_id === params[1]
+      ))
+      return { changes: before - this.state.quarantinedOutbox.length, lastInsertRowId: 0 }
+    }
+    if (source.includes('quarantine:supersede')) {
+      requireExactSql(sql, expectedSql.quarantineSupersede, 'quarantine supersede')
+      requireOwnerPredicate(sql)
+      const row = this.state.quarantinedOutbox.find((candidate) => (
+        candidate.owner_id === params[2] && candidate.mutation_id === params[3] &&
+        candidate.superseded_by === null
+      ))
+      if (!row) return { changes: 0, lastInsertRowId: 0 }
+      row.superseded_by = String(params[0])
+      const history = JSON.parse(row.recovery_history_json) as unknown[]
+      history.push({ action: 'superseded', at: String(params[1]) })
+      row.recovery_history_json = JSON.stringify(history)
+      return { changes: 1, lastInsertRowId: 0 }
+    }
+    if (source.includes('outbox-dependencies:insert')) {
+      requireExactSql(sql, expectedSql.dependencyInsert, 'outbox dependency insert')
+      const row: OutboxDependencyRow = {
+        owner_id: String(params[0]),
+        mutation_id: String(params[1]),
+        depends_on_mutation_id: String(params[2]),
+        created_at: String(params[3]),
+      }
+      if (this.state.outboxDependencies.some((candidate) => (
+        candidate.owner_id === row.owner_id && candidate.mutation_id === row.mutation_id &&
+        candidate.depends_on_mutation_id === row.depends_on_mutation_id
+      ))) throw new Error('UNIQUE dependency constraint failed')
+      this.state.outboxDependencies.push(row)
+      return { changes: 1, lastInsertRowId: 0 }
+    }
+    if (source.includes('outbox-dependencies:repoint')) {
+      requireExactSql(sql, expectedSql.dependencyRepoint, 'outbox dependency repoint')
+      requireOwnerPredicate(sql)
+      let changes = 0
+      for (const row of this.state.outboxDependencies) {
+        if (
+          row.owner_id === params[1] && row.depends_on_mutation_id === params[2] &&
+          row.mutation_id !== params[3]
+        ) {
+          row.depends_on_mutation_id = String(params[0])
+          changes += 1
+        }
+      }
+      return { changes, lastInsertRowId: 0 }
+    }
     if (source.includes('conflicts:upsert')) {
       requireExactSql(sql, expectedSql.conflictUpsert, 'conflict upsert')
       assertSql(sql.includes('insert into conflicts'), 'conflict upsert must insert into conflicts')
@@ -745,6 +1017,22 @@ class MockSQLiteDatabase {
     }
     if (source.includes('metadata:initial-pull:upsert')) {
       requireExactSql(sql, expectedSql.initialPullUpsert, 'initial pull metadata upsert')
+      const row = { owner_id: params[0], key: params[1], value: params[2] }
+      const index = this.state.metadata.findIndex(
+        (item) => item.owner_id === params[0] && item.key === params[1],
+      )
+      if (index === -1) this.state.metadata.push(row)
+      else this.state.metadata[index] = row
+      return { changes: 1, lastInsertRowId: 0 }
+    }
+    if (source.includes('metadata:snapshot-watermark:upsert') || source.includes('metadata:snapshot-cursor:upsert')) {
+      requireExactSql(
+        sql,
+        source.includes('snapshot-watermark')
+          ? expectedSql.snapshotWatermarkUpsert
+          : expectedSql.snapshotCursorUpsert,
+        'snapshot metadata upsert',
+      )
       const row = { owner_id: params[0], key: params[1], value: params[2] }
       const index = this.state.metadata.findIndex(
         (item) => item.owner_id === params[0] && item.key === params[1],
@@ -874,7 +1162,7 @@ class MockSQLiteDatabase {
       this.state.records = this.state.records.filter((row) => row.owner_id !== params[0])
       return { changes: before - this.state.records.length, lastInsertRowId: 0 }
     }
-    if (source.includes('owner:clear:outbox')) {
+    if (source.includes('owner:clear:outbox */')) {
       requireExactSql(sql, expectedSql.outboxClear, 'outbox clear')
       assertSql(/^\/\* owner:clear:outbox \*\/ delete from outbox where owner_id = \?$/.test(sql), 'outbox clear SQL')
       if (this.control.failNextOwnerClear) {
@@ -884,6 +1172,20 @@ class MockSQLiteDatabase {
       const before = this.state.outbox.length
       this.state.outbox = this.state.outbox.filter((row) => row.owner_id !== params[0])
       return { changes: before - this.state.outbox.length, lastInsertRowId: 0 }
+    }
+    if (source.includes('owner:clear:quarantined_outbox')) {
+      requireExactSql(sql, expectedSql.quarantineClear, 'quarantine owner clear')
+      requireOwnerPredicate(sql)
+      const before = this.state.quarantinedOutbox.length
+      this.state.quarantinedOutbox = this.state.quarantinedOutbox.filter(
+        (row) => row.owner_id !== params[0],
+      )
+      return { changes: before - this.state.quarantinedOutbox.length, lastInsertRowId: 0 }
+    }
+    if (source.includes('owner:clear:outbox_dependencies')) {
+      requireExactSql(sql, expectedSql.dependenciesClear, 'outbox dependencies owner clear')
+      requireOwnerPredicate(sql)
+      return { changes: 1, lastInsertRowId: 0 }
     }
     if (source.includes('owner:clear:conflicts')) {
       requireExactSql(sql, expectedSql.conflictsClear, 'conflicts clear')
@@ -974,6 +1276,16 @@ class MockSQLiteDatabase {
       )
       return { changes: before - this.state.metadata.length, lastInsertRowId: 0 }
     }
+    if (source.includes('metadata:snapshot-reset:delete')) {
+      requireExactSql(sql, expectedSql.snapshotResetDelete, 'snapshot metadata delete')
+      requireOwnerPredicate(sql)
+      const keys = new Set([params[1], params[2]])
+      const before = this.state.metadata.length
+      this.state.metadata = this.state.metadata.filter((row) => !(
+        row.owner_id === params[0] && keys.has(row.key as BindValue)
+      ))
+      return { changes: before - this.state.metadata.length, lastInsertRowId: 0 }
+    }
     throw new Error(`Unsupported mock runAsync SQL: ${source}`)
   }
 
@@ -1050,6 +1362,73 @@ class MockSQLiteDatabase {
       )
       return (row ? { payload_hash: row.payload_hash } : null) as T | null
     }
+    if (source.includes('outbox-dependencies:find-parent')) {
+      requireExactSql(sql, expectedSql.dependencyFindParent, 'outbox dependency parent lookup')
+      const candidates = [
+        ...this.state.outbox.filter((row) => (
+          row.owner_id === params[0] && row.entity === params[1] && row.entity_id === params[2] &&
+          row.mutation_id !== params[3] && row.state !== 'complete'
+        )).map((row) => ({ mutation_id: row.mutation_id, sequence: row.sequence })),
+        ...this.state.quarantinedOutbox.filter((row) => (
+          row.owner_id === params[4] && row.entity === params[5] && row.entity_id === params[6] &&
+          row.mutation_id !== params[7] && row.superseded_by === null
+        )).map((row) => ({ mutation_id: row.mutation_id, sequence: row.sequence })),
+      ].sort((left, right) => right.sequence - left.sequence)
+      return (candidates[0] ? { mutation_id: candidates[0].mutation_id } : null) as T | null
+    }
+    if (source.includes('outbox-dependencies:blocked-count')) {
+      requireExactSql(sql, expectedSql.dependencyBlockedCount, 'blocked dependency count')
+      const count = this.state.outboxDependencies.filter((dependency) => (
+        dependency.owner_id === params[0] && dependency.depends_on_mutation_id === params[1] && (
+          this.state.outbox.some((child) => child.owner_id === dependency.owner_id &&
+            child.mutation_id === dependency.mutation_id && child.state !== 'complete') ||
+          this.state.quarantinedOutbox.some((child) => child.owner_id === dependency.owner_id &&
+            child.mutation_id === dependency.mutation_id && child.superseded_by === null)
+        )
+      )).length
+      return { count } as T
+    }
+    if (source.includes('outbox:retained-count')) {
+      requireExactSql(sql, expectedSql.retainedCount, 'retained operation count')
+      return {
+        count: this.state.outbox.filter((row) => row.owner_id === params[0] && row.state !== 'complete').length +
+          this.state.quarantinedOutbox.filter((row) => (
+            row.owner_id === params[1] && row.superseded_by === null
+          )).length,
+      } as T
+    }
+    if (source.includes('outbox:attempts')) {
+      requireExactSql(sql, expectedSql.outboxAttempts, 'outbox attempt lookup')
+      requireOwnerPredicate(sql)
+      const row = this.state.outbox.find((candidate) => (
+        candidate.owner_id === params[0] && candidate.mutation_id === params[1] &&
+        candidate.state === 'failed'
+      ))
+      return (row ? { attempts: row.attempts } : null) as T | null
+    }
+    if (source.includes('quarantine:source')) {
+      requireExactSql(sql, expectedSql.quarantineSource, 'quarantine source lookup')
+      requireOwnerPredicate(sql)
+      const row = this.state.outbox.find((candidate) => (
+        candidate.owner_id === params[0] && candidate.mutation_id === params[1] &&
+        candidate.state !== 'complete'
+      ))
+      return (row ? {
+        ...row,
+        reason: null,
+        quarantined_at: null,
+        superseded_by: null,
+        recovery_history_json: '[]',
+      } : null) as T | null
+    }
+    if (source.includes('quarantine:get')) {
+      requireExactSql(sql, expectedSql.quarantineGet, 'quarantine lookup')
+      requireOwnerPredicate(sql)
+      const row = this.state.quarantinedOutbox.find((candidate) => (
+        candidate.owner_id === params[0] && candidate.mutation_id === params[1]
+      ))
+      return (row ? { ...row } : null) as T | null
+    }
     if (source.includes('outbox:next-sequence')) {
       requireExactSql(sql, expectedSql.nextSequence, 'next sequence lookup')
       requireOwnerPredicate(sql)
@@ -1100,6 +1479,18 @@ class MockSQLiteDatabase {
     }
     if (source.includes('metadata:reconciliation:get')) {
       requireExactSql(sql, expectedSql.reconciliationGet, 'reconciliation metadata get')
+      return this.state.metadata.find(
+        (row) => row.owner_id === params[0] && row.key === params[1],
+      ) as T | undefined ?? null
+    }
+    if (source.includes('metadata:snapshot-watermark:get') || source.includes('metadata:snapshot-cursor:get')) {
+      requireExactSql(
+        sql,
+        source.includes('snapshot-watermark')
+          ? expectedSql.snapshotWatermarkGet
+          : expectedSql.snapshotCursorGet,
+        'snapshot metadata lookup',
+      )
       return this.state.metadata.find(
         (row) => row.owner_id === params[0] && row.key === params[1],
       ) as T | undefined ?? null
@@ -1216,6 +1607,31 @@ class MockSQLiteDatabase {
         .filter((row) => row.owner_id === params[0])
         .map((row) => ({ entity: row.entity, entity_id: row.entity_id })) as T[]
     }
+    if (source.includes('records:list-page:first') || source.includes('records:list-page:after')) {
+      const isAfter = source.includes('records:list-page:after')
+      requireExactSql(
+        sql,
+        isAfter ? expectedSql.recordsListPageAfter : expectedSql.recordsListPageFirst,
+        'records page',
+      )
+      assertSql(
+        /where owner_id = \? and entity = \? and deleted = 0/.test(sql),
+        'records page must lead with an owner-scoped predicate',
+      )
+      const updatedAt = isAfter ? String(params[2]) : null
+      const entityId = isAfter ? String(params[4]) : null
+      const limit = Number(params[isAfter ? 5 : 2])
+      const rows = this.state.records
+        .filter((row) => row.owner_id === params[0] && row.entity === params[1] && row.deleted === 0)
+        .filter((row) => !isAfter || row.updated_at < updatedAt! || (
+          row.updated_at === updatedAt && row.entity_id > entityId!
+        ))
+        .sort((left, right) => right.updated_at.localeCompare(left.updated_at) ||
+          left.entity_id.localeCompare(right.entity_id))
+        .slice(0, limit)
+        .map((row) => ({ ...row }))
+      return rows as T[]
+    }
     if (source.includes('records:list')) {
       requireExactSql(sql, expectedSql.recordsList, 'records list')
       requireOwnerPredicate(sql)
@@ -1240,21 +1656,37 @@ class MockSQLiteDatabase {
       }
       return result as T[]
     }
+    if (source.includes('quarantine:list')) {
+      requireExactSql(sql, expectedSql.quarantineList, 'quarantine list')
+      requireOwnerPredicate(sql)
+      return this.state.quarantinedOutbox
+        .filter((row) => row.owner_id === params[0])
+        .sort((left, right) => right.quarantined_at.localeCompare(left.quarantined_at) ||
+          left.mutation_id.localeCompare(right.mutation_id))
+        .map((row) => ({ ...row })) as T[]
+    }
     if (source.includes('outbox:list')) {
       requireExactSql(sql, expectedSql.outboxList, 'outbox list')
-      assertSql(/\bowner_id\s*=\s*\?/.test(sql), 'outbox list must include owner_id = ?')
       assertSql(
-        /where owner_id = \? and state in \('pending', 'failed'\) order by sequence asc$/.test(sql),
-        'outbox list WHERE clause and parameter order',
+        sql.includes("where candidate.owner_id = ? and candidate.state in ('pending', 'failed')"),
+        'outbox list WHERE clause must be owner scoped',
       )
       assertSql(sql.includes('from outbox'), 'outbox list must query outbox')
       assertSql(sql.includes("state in ('pending', 'failed')"), 'outbox list must retain failed FIFO heads')
       assertSql(sql.includes('payload_hash'), 'outbox list must select payload hash')
-      assertSql(sql.includes('order by sequence asc'), 'outbox list must use FIFO sequence')
+      assertSql(sql.includes('order by candidate.sequence asc'), 'outbox list must use FIFO sequence')
       const result = this.state.outbox
         .filter((row) =>
           row.owner_id === params[0] &&
-          (row.state === 'pending' || row.state === 'failed'),
+          (row.state === 'pending' || row.state === 'failed') &&
+          !this.state.outboxDependencies.some((dependency) => (
+            dependency.owner_id === row.owner_id && dependency.mutation_id === row.mutation_id &&
+            this.state.quarantinedOutbox.some((blocked) => (
+              blocked.owner_id === dependency.owner_id &&
+              blocked.mutation_id === dependency.depends_on_mutation_id &&
+              blocked.superseded_by === null
+            ))
+          )),
         )
         .sort((left, right) => left.sequence - right.sequence)
         .map((row) => ({ ...row }))

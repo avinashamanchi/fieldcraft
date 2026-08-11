@@ -12,7 +12,7 @@ const job: Job = { id: 'job-1', ownerId: 'owner-a', clientId: 'client-1', title:
 
 it('renders required reviewed fields, escaped text, and integer-cent totals only', () => {
   const html = buildInvoiceHtml({ businessName: 'FieldCraft Plumbing', client, invoice, invoiceNumber: 'INV-001', job })
-  for (const value of ['FieldCraft Plumbing', 'INV-001', 'Aug 6, 2026', 'Mina', 'Valve', 'Labor', '$150.00', '$12.38', '$162.38', 'Net 14', 'Reviewed notes']) expect(html).toContain(value)
+  for (const value of ['FieldCraft Plumbing', 'INV-001', 'Aug 6, 2026', 'Mina', 'Valve', 'Labor', '$150.00', '$12.38', '$162.38', 'Net 14', 'Reviewed notes', 'Balance', 'Created with FieldCraft']) expect(html).toContain(value)
   expect(html).not.toContain('<script>')
   expect(html).not.toContain('PRIVATE_PHONE')
   expect(html).not.toContain('PRIVATE_EMAIL')

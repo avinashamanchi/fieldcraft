@@ -23,6 +23,7 @@ it('requires authenticated HTTPS and maps auth failure without exposing a body',
   expect(String(error)).not.toContain(marker)
   expect(error).toMatchObject({ reason: 'reauthentication' })
   expect(() => createDeleteAccountClient({ functionUrl: 'http://project.test/delete-account', getAccessToken: async () => 'token' })).toThrow(/HTTPS/i)
+  expect(() => createDeleteAccountClient({ functionUrl: 'https://attacker.example/functions/v1/delete-account', getAccessToken: async () => 'token' })).toThrow(/HTTPS/i)
 })
 
 it('requires the exact phrase, suppresses duplicate taps, and reports partial local cleanup', async () => {

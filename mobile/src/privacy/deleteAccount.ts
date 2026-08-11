@@ -1,6 +1,7 @@
 import { z } from 'zod'
 
 import { getSupabaseClient } from '../auth/supabase'
+import { validateSupabaseFunctionUrl } from '../network/supabaseFunctionUrl'
 
 export type DeleteAccountErrorReason = 'invalid-response' | 'reauthentication' | 'timeout' | 'transient'
 export class DeleteAccountError extends Error {
@@ -20,12 +21,7 @@ type DeleteAccountClientOptions = {
 const ResponseSchema = z.object({ requestId: z.uuid(), status: z.literal('deleted') }).strict()
 
 const validateUrl = (value: string): string => {
-  let url: URL
-  try { url = new URL(value) } catch { throw new Error('Account deletion requires an HTTPS function URL.') }
-  if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || !url.pathname.endsWith('/functions/v1/delete-account')) {
-    throw new Error('Account deletion requires an HTTPS function URL.')
-  }
-  return url.toString()
+  return validateSupabaseFunctionUrl(value, 'delete-account', 'Account deletion requires an HTTPS function URL.')
 }
 
 export const createDeleteAccountClient = (options: DeleteAccountClientOptions) => {

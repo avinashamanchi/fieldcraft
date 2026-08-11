@@ -1,4 +1,3 @@
-import * as SecureStore from 'expo-secure-store'
 import { router } from 'expo-router'
 import { useEffect, useRef, useState } from 'react'
 import { StyleSheet, Text, View } from 'react-native'
@@ -8,11 +7,13 @@ import { FormField } from '../../src/components/FormField'
 import { PrimaryButton } from '../../src/components/PrimaryButton'
 import { Screen } from '../../src/components/Screen'
 import { useFieldCraftData } from '../../src/data/DataProvider'
+import { useSubscription } from '../../src/billing/SubscriptionProvider'
 import { tempArtifactRegistry } from '../../src/files/tempArtifactRegistry'
 import { useInvoiceSession } from '../../src/features/invoices/invoiceSession'
 import { getDeleteAccountClient } from '../../src/privacy/deleteAccount'
 import { clearLocalAuthentication, deleteLocalData, type DeleteOutcome } from '../../src/privacy/deleteLocalData'
 import { requireRecentAal2 } from '../../src/auth/requireAal2'
+import { getOwnerErasureRegistry } from '../../src/auth/ownerErasureRegistry'
 import { colors, radius, spacing, typography } from '../../src/theme/tokens'
 
 type DeleteAccountControlProps = {
@@ -75,11 +76,10 @@ export const DeleteAccountControl = ({ deleteCloud, deleteLocal, onComplete, req
   )
 }
 
-const retryKey = (ownerId: string) => `fieldcraft.delete-retry.${ownerId}`
-
 export default function DeleteAccountScreen() {
   const { owner, repository } = useFieldCraftData()
   const invoiceSession = useInvoiceSession()
+  const { clearLocalEntitlement } = useSubscription()
   const ownerId = owner.ownerId
   if (!ownerId) return <Screen><Text accessibilityRole="alert" style={styles.copy}>Sign in again before deleting this account.</Text></Screen>
   let clearPromise: Promise<void> | null = null
@@ -88,12 +88,16 @@ export default function DeleteAccountScreen() {
     clearVisibleMemory: () => { invoiceSession.reset(); repository.ownerBoundary.beginDelete(ownerId) },
     clearRepository,
     clearOutbox: clearRepository,
+    clearQuarantine: clearRepository,
     clearConflicts: clearRepository,
     clearAuth: clearLocalAuthentication,
+    clearEntitlement: async () => { clearLocalEntitlement() },
+    clearStripeLinks: clearRepository,
+    clearReminders: clearRepository,
     clearConsent: () => aiConsentStore.revoke(ownerId),
     clearArtifacts: async () => { await tempArtifactRegistry.cleanupRegistered(); await tempArtifactRegistry.cleanupOwnedDirectories() },
-    setRetryMarker: (id, failed) => SecureStore.setItemAsync(retryKey(id), JSON.stringify({ version: 1, failed })),
-    clearRetryMarker: (id) => SecureStore.deleteItemAsync(retryKey(id)),
+    setRetryMarker: (id) => getOwnerErasureRegistry().mark(id),
+    clearRetryMarker: (id) => getOwnerErasureRegistry().clear(id),
   })
   return (
     <Screen contentContainerStyle={styles.screen} scroll>
