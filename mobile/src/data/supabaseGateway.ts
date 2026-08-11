@@ -419,6 +419,10 @@ const normalizePayload = (
         ...(optionalString(raw, 'provider_event_at')
           ? { providerEventAt: requireTimestamp(raw, 'provider_event_at') }
           : {}),
+        ...(optionalString(raw, 'note') ? { note: optionalString(raw, 'note') } : {}),
+        ...(optionalString(raw, 'recorded_at')
+          ? { recordedAt: requireTimestamp(raw, 'recorded_at') }
+          : {}),
       }
     case 'reminder_schedule':
       return {

@@ -11,7 +11,7 @@ import {
 
 import { getAiClient } from '../../ai/aiClient'
 import { AI_CONSENT_VERSION } from '../../ai/contracts'
-import type { Client, InvoiceDraft, TradeType } from '../../domain/entities'
+import type { Client, InvoiceDraft, Job, TradeType } from '../../domain/entities'
 import { InvoiceDraftSchema } from '../../domain/invoice'
 import type { MutationEnvelope } from '../../domain/sync'
 import {
@@ -54,6 +54,7 @@ export type InvoiceSessionContextValue = {
   parseTranscript(transcript: string): Promise<void>
   reset(inputMode?: 'manual' | 'voice'): void
   reviewManual(draft: InvoiceDraft): void
+  reviewEstimate(draft: InvoiceDraft, client: Client, job: Job): void
   save(): Promise<void>
   setTranscript(transcript: string): void
 }
@@ -91,6 +92,7 @@ export const InvoiceSessionProvider = ({
   const generation = useRef(0)
   const activeAi = useRef<AbortController | null>(null)
   const operation = useRef<InvoiceBundleSaveOperation | null>(null)
+  const estimateSource = useRef<{ client: Client; job: Job } | null>(null)
   const savePromise = useRef<Promise<void> | null>(null)
 
   const publish = useCallback((next: InvoiceSessionState) => {
@@ -107,6 +109,7 @@ export const InvoiceSessionProvider = ({
   const reset = useCallback((inputMode: 'manual' | 'voice' = 'manual') => {
     invalidate()
     operation.current = null
+    estimateSource.current = null
     publish(entryState(inputMode))
   }, [invalidate, publish])
 
@@ -118,8 +121,20 @@ export const InvoiceSessionProvider = ({
   const reviewManual = useCallback((draft: InvoiceDraft) => {
     invalidate()
     operation.current = null
+    estimateSource.current = null
     publish({ step: 'review', draft, source: 'manual' })
   }, [invalidate, publish])
+
+  const reviewEstimate = useCallback((draft: InvoiceDraft, client: Client, job: Job) => {
+    if (!ownerId || client.ownerId !== ownerId || job.ownerId !== ownerId || job.clientId !== client.id) {
+      publish({ step: 'error', draft, code: 'owner-unavailable' })
+      return
+    }
+    invalidate()
+    operation.current = null
+    estimateSource.current = { client, job }
+    publish({ step: 'review', draft, source: 'manual' })
+  }, [invalidate, ownerId, publish])
 
   const editDraft = useCallback((draft: InvoiceDraft) => {
     invalidate()
@@ -179,10 +194,13 @@ export const InvoiceSessionProvider = ({
     const pending = (async () => {
       try {
         if (!operation.current) {
-          const clients = await repository.list<Client>('client')
+          const clients = estimateSource.current ? [] : await repository.list<Client>('client')
           if (saveGeneration !== generation.current) return
           operation.current = createInvoiceBundleSaveOperation(draft, {
-            ownerId, repository, existingClient: matchClientByName(clients, draft.clientName),
+            ownerId,
+            repository,
+            existingClient: estimateSource.current?.client ?? matchClientByName(clients, draft.clientName),
+            existingJob: estimateSource.current?.job,
           })
         }
         publish({ step: 'saving', draft, mutationId: operation.current.ids.mutationId })
@@ -200,8 +218,8 @@ export const InvoiceSessionProvider = ({
   }, [ownerId, publish, repository])
 
   const value = useMemo<InvoiceSessionContextValue>(() => ({
-    state, cancel: () => reset(), editDraft, parseTranscript, reset, reviewManual, save, setTranscript,
-  }), [editDraft, parseTranscript, reset, reviewManual, save, setTranscript, state])
+    state, cancel: () => reset(), editDraft, parseTranscript, reset, reviewEstimate, reviewManual, save, setTranscript,
+  }), [editDraft, parseTranscript, reset, reviewEstimate, reviewManual, save, setTranscript, state])
 
   return <InvoiceSessionContext.Provider value={value}>{children}</InvoiceSessionContext.Provider>
 }

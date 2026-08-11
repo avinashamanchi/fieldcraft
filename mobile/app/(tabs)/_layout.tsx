@@ -49,6 +49,14 @@ export default function TabsLayout() {
         }}
       />
       <Tabs.Screen
+        name="estimates"
+        options={{
+          title: 'Estimates',
+          tabBarButton: tabButton('tab-estimates', 'Estimates'),
+          tabBarIcon: ({ color, size }) => <Ionicons color={color} name="document-text-outline" size={size} />,
+        }}
+      />
+      <Tabs.Screen
         name="clients"
         options={{
           title: 'Clients',
@@ -56,14 +64,7 @@ export default function TabsLayout() {
           tabBarIcon: ({ color, size }) => <Ionicons color={color} name="people-outline" size={size} />,
         }}
       />
-      <Tabs.Screen
-        name="expenses"
-        options={{
-          title: 'Expenses',
-          tabBarButton: tabButton('tab-expenses', 'Expenses'),
-          tabBarIcon: ({ color, size }) => <Ionicons color={color} name="receipt-outline" size={size} />,
-        }}
-      />
+      <Tabs.Screen name="expenses" options={{ href: null }} />
       <Tabs.Screen
         name="settings"
         options={{

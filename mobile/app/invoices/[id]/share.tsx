@@ -6,13 +6,16 @@ import { ErrorState } from '../../../src/components/ErrorState'
 import { InvoiceSharePreview } from '../../../src/components/InvoiceSharePreview'
 import { Screen } from '../../../src/components/Screen'
 import { useFieldCraftData } from '../../../src/data/DataProvider'
+import { useSubscription } from '../../../src/billing/SubscriptionProvider'
 import type { Client, Invoice, Job, UserProfile } from '../../../src/domain/entities'
 import { createInvoicePdf, type InvoicePdfInput } from '../../../src/files/invoicePdf'
+import { listInvoicePaymentsPaged } from '../../../src/features/payments/paymentCommands'
 import { colors, spacing, typography } from '../../../src/theme/tokens'
 
 export default function ShareInvoiceScreen() {
   const { id } = useLocalSearchParams<{ id: string }>()
   const { owner, repository } = useFieldCraftData()
+  const { entitlement } = useSubscription()
   const [input, setInput] = useState<InvoicePdfInput | null>(null)
   const [missing, setMissing] = useState(false)
   useEffect(() => {
@@ -20,20 +23,22 @@ export default function ShareInvoiceScreen() {
     const load = async () => {
       const invoice = await repository.get<Invoice>('invoice', id)
       if (!invoice || !invoice.jobId || !owner.ownerId) { if (active) setMissing(true); return }
-      const [client, job, profile] = await Promise.all([
+      const [client, job, profile, payments] = await Promise.all([
         repository.get<Client>('client', invoice.clientId),
         repository.get<Job>('job', invoice.jobId),
         repository.get<UserProfile>('profile', owner.ownerId),
+        listInvoicePaymentsPaged(repository, id, () => repository.ownerBoundary.getSnapshot().ownerId),
       ])
       if (!client || !job) { if (active) setMissing(true); return }
       if (active) setInput({
         businessName: profile?.businessName || 'FieldCraft', client, invoice,
-        invoiceNumber: invoice.id, job,
+        invoiceNumber: invoice.number ?? invoice.id, job, payments,
+        isPro: entitlement.state === 'pro',
       })
     }
     void load().catch(() => { if (active) setMissing(true) })
     return () => { active = false }
-  }, [id, owner.ownerId, repository])
+  }, [entitlement.state, id, owner.ownerId, repository])
   if (missing) return <Screen><ErrorState message="This invoice cannot be prepared for sharing." /></Screen>
   if (!input) return <Screen><ActivityIndicator color={colors.orange} /></Screen>
   return (

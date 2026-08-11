@@ -1,5 +1,5 @@
-import { router } from 'expo-router'
-import { useEffect, useState } from 'react'
+import { router, useLocalSearchParams } from 'expo-router'
+import { useEffect, useRef, useState } from 'react'
 import { Pressable, StyleSheet, Text, View } from 'react-native'
 
 import { useAuth } from '../../src/auth/AuthProvider'
@@ -7,7 +7,8 @@ import { aiConsentStore } from '../../src/ai/consentStore'
 import { PrimaryButton } from '../../src/components/PrimaryButton'
 import { FormField } from '../../src/components/FormField'
 import { Screen } from '../../src/components/Screen'
-import type { InvoiceDraft } from '../../src/domain/entities'
+import { useFieldCraftData } from '../../src/data/DataProvider'
+import type { Client, Estimate, InvoiceDraft, Job } from '../../src/domain/entities'
 import { InvoiceEditor } from '../../src/features/invoices/InvoiceEditor'
 import { VoiceTranscriptInput } from '../../src/features/invoices/VoiceTranscriptInput'
 import { useInvoiceSession } from '../../src/features/invoices/invoiceSession'
@@ -45,17 +46,50 @@ export const draftFromLocalJobNote = (value: string): InvoiceDraft => {
 
 export default function NewInvoiceScreen() {
   const auth = useAuth()
+  const { repository } = useFieldCraftData()
+  const { estimateId } = useLocalSearchParams<{ estimateId?: string }>()
   const session = useInvoiceSession()
   const [mode, setMode] = useState<'manual' | 'voice'>('manual')
   const [draft, setDraft] = useState(initialDraft)
   const [localNote, setLocalNote] = useState('')
   const [consentPrompt, setConsentPrompt] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
+  const prefilling = useRef<string | null>(null)
   const ownerId = auth.status === 'signedIn' ? auth.userId : null
 
   useEffect(() => {
     if (session.state.step === 'review') router.replace('/invoices/review' as never)
   }, [session.state])
+
+  useEffect(() => {
+    if (!estimateId || prefilling.current === estimateId || session.state.step !== 'entry') return
+    prefilling.current = estimateId
+    void (async () => {
+      const estimate = await repository.get<Estimate>('estimate', estimateId)
+      if (!estimate || estimate.status !== 'Converted' || !estimate.convertedJobId) {
+        setNotice('The converted estimate is unavailable. You can still enter the invoice manually.')
+        return
+      }
+      const [client, job] = await Promise.all([
+        repository.get<Client>('client', estimate.clientId),
+        repository.get<Job>('job', estimate.convertedJobId),
+      ])
+      if (!client || !job) {
+        setNotice('The converted client or job is unavailable. You can still enter the invoice manually.')
+        return
+      }
+      session.reviewEstimate({
+        clientName: client.name,
+        jobTitle: estimate.title,
+        jobDescription: estimate.scope,
+        tradeType: job.tradeType ?? 'General',
+        taxBasisPoints: estimate.taxBasisPoints,
+        paymentTerms: 'Due on receipt',
+        lineItems: estimate.lineItems.map((line) => ({ ...line })),
+        ...(estimate.notes === undefined ? {} : { notes: estimate.notes }),
+      }, client, job)
+    })().catch(() => setNotice('The converted estimate could not be loaded. You can still enter the invoice manually.'))
+  }, [estimateId, repository, session])
 
   const analyze = async () => {
     if (!ownerId || session.state.step !== 'entry' || !session.state.transcript.trim()) return

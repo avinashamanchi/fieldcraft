@@ -127,6 +127,8 @@ export type Payment = VersionedEntity & {
   providerPaymentIntentId?: string
   providerChargeId?: string
   providerEventAt?: string
+  note?: string
+  recordedAt?: string
 }
 
 export type ReminderSchedule = VersionedEntity & {

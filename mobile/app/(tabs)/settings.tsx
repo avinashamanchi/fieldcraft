@@ -12,6 +12,8 @@ export default function SettingsScreen() {
   return (
     <Screen contentContainerStyle={styles.screen} scroll>
       <Text accessibilityRole="header" style={styles.heading}>Settings</Text>
+      <Text style={styles.section}>Records</Text>
+      <Pressable accessibilityRole="button" onPress={() => router.push('/(tabs)/expenses' as never)} style={styles.row}><Text style={styles.label}>Expenses</Text></Pressable>
       <Text style={styles.section}>Catalog</Text>
       <Pressable accessibilityRole="button" onPress={() => router.push('/settings/services')} style={styles.row}><Text style={styles.label}>Services</Text></Pressable>
       <Pressable accessibilityRole="button" onPress={() => router.push('/settings/inventory')} style={styles.row}><Text style={styles.label}>Inventory</Text></Pressable>
@@ -21,6 +23,7 @@ export default function SettingsScreen() {
         <Text style={styles.label}>{entitlement.state === 'pro' ? 'FieldCraft Pro — verified' : 'FieldCraft plan & purchases'}</Text>
       </Pressable>
       <Text style={styles.section}>Privacy & account</Text>
+      <Pressable accessibilityRole="button" onPress={() => router.push('/settings/export' as never)} style={styles.row}><Text style={styles.label}>Export account data</Text></Pressable>
       <Pressable accessibilityRole="button" onPress={() => router.push('/settings/ai' as never)} style={styles.row}><Text style={styles.label}>AI & consent</Text></Pressable>
       <Pressable accessibilityRole="button" onPress={() => router.push('/settings/sync-diagnostics' as never)} style={styles.row}><Text style={styles.label}>Sync diagnostics</Text></Pressable>
       <Pressable accessibilityRole="button" onPress={() => router.push('/security/mfa' as never)} style={styles.row}><Text style={styles.label}>Authenticator security</Text></Pressable>

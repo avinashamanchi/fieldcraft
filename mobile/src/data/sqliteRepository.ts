@@ -156,6 +156,8 @@ const entityPayloadSchemas: Record<EntityName, z.ZodType> = {
     providerPaymentIntentId: z.string().min(1).max(255).optional(),
     providerChargeId: z.string().min(1).max(255).optional(),
     providerEventAt: z.string().min(1).optional(),
+    note: z.string().max(1000).optional(),
+    recordedAt: z.string().min(1).optional(),
   }).superRefine((payment, context) => {
     if (payment.refundedCents > payment.amountCents) {
       context.addIssue({ code: 'custom', path: ['refundedCents'], message: 'refund exceeds payment' })
@@ -497,6 +499,126 @@ const validateBundlePayload = (
     throw new Error('Invoice bundle client, job, and invoice relationships must match')
   }
   return { client, job, invoice } as InvoiceBundlePayload
+}
+
+type LocalMutationIntent = Readonly<{
+  entity: EntityName
+  payload: Record<string, unknown>
+}>
+
+const requireObject = (value: unknown, message: string): Record<string, unknown> => {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error(message)
+  return value as Record<string, unknown>
+}
+
+const assertOptimisticVersion = (
+  serverPayload: Record<string, unknown>,
+  localPayload: Record<string, unknown>,
+): void => {
+  if (Number(localPayload.version) !== Number(serverPayload.version) + 1) {
+    throw new Error('Lifecycle optimistic version must be exactly one ahead of its server base version')
+  }
+  const normalized = {
+    ...localPayload,
+    version: serverPayload.version,
+    updatedAt: serverPayload.updatedAt,
+    syncState: serverPayload.syncState,
+  }
+  if (canonicalStringify(normalized) !== canonicalStringify(serverPayload)) {
+    throw new Error('Lifecycle optimistic payload must match its server mutation content')
+  }
+}
+
+const validateLifecycleMutationPayload = (
+  mutation: MutationEnvelope,
+): { payload: Record<string, unknown>; intents: LocalMutationIntent[] } => {
+  const raw = requireObject(mutation.payload, 'Lifecycle mutation payload must be an object')
+  if (mutation.kind === 'save_estimate') {
+    if (mutation.entity !== 'estimate') throw new Error('Estimate mutations require entity estimate')
+    const { localEstimate: localInput, ...serverInput } = raw
+    const server = validateEntityPayload('estimate', serverInput, mutation.ownerId, mutation.entityId)
+    const local = validateEntityPayload('estimate', localInput, mutation.ownerId, mutation.entityId)
+    const serverVersion = Number(server.version)
+    if ((mutation.baseVersion ?? 0) !== serverVersion) {
+      throw new Error('Estimate server version must match the mutation base version')
+    }
+    assertOptimisticVersion(server, local)
+    return { payload: { ...server, localEstimate: local }, intents: [{ entity: 'estimate', payload: local }] }
+  }
+  if (mutation.kind === 'convert_estimate') {
+    if (mutation.entity !== 'estimate') throw new Error('Estimate conversion requires entity estimate')
+    const parsed = z.object({
+      estimateId: z.uuid(), jobId: z.uuid(), baseVersion: z.number().finite().int().min(1),
+      now: z.string().min(1), estimate: z.unknown(), job: z.unknown(),
+    }).strict().parse(raw)
+    parsePreciseTimestamp(parsed.now)
+    const estimate = validateEntityPayload('estimate', parsed.estimate, mutation.ownerId, mutation.entityId)
+    const job = validateEntityPayload('job', parsed.job, mutation.ownerId, parsed.jobId)
+    if (
+      parsed.estimateId !== mutation.entityId || parsed.baseVersion !== mutation.baseVersion ||
+      estimate.status !== 'Converted' || estimate.convertedJobId !== parsed.jobId ||
+      Number(estimate.version) !== parsed.baseVersion + 1 || job.clientId !== estimate.clientId ||
+      Number(job.version) !== 1
+    ) throw new Error('Estimate conversion payload is inconsistent')
+    return { payload: { ...parsed, estimate, job }, intents: [
+      { entity: 'estimate', payload: estimate }, { entity: 'job', payload: job },
+    ] }
+  }
+  if (mutation.kind === 'issue_invoice') {
+    if (mutation.entity !== 'invoice') throw new Error('Invoice issuance requires entity invoice')
+    const parsed = z.object({
+      invoiceId: z.uuid(), baseVersion: z.number().finite().int().min(1),
+      issuedAt: z.string().min(1), dueAt: z.string().min(1), invoice: z.unknown(),
+    }).strict().parse(raw)
+    parsePreciseTimestamp(parsed.issuedAt)
+    parsePreciseTimestamp(parsed.dueAt)
+    const invoice = validateEntityPayload('invoice', parsed.invoice, mutation.ownerId, mutation.entityId)
+    if (
+      parsed.invoiceId !== mutation.entityId || parsed.baseVersion !== mutation.baseVersion ||
+      Number(invoice.version) !== parsed.baseVersion + 1 || invoice.status !== 'Issued' ||
+      invoice.issuedAt !== parsed.issuedAt || invoice.dueAt !== parsed.dueAt
+    ) throw new Error('Invoice issuance payload is inconsistent')
+    return { payload: { ...parsed, invoice }, intents: [{ entity: 'invoice', payload: invoice }] }
+  }
+  if (mutation.kind === 'record_manual_payment') {
+    if (mutation.entity !== 'payment') throw new Error('Manual payment mutations require entity payment')
+    const parsed = z.object({
+      paymentId: z.uuid(), invoiceId: z.uuid(), amountCents: MoneySchema.min(1),
+      currency: z.literal('USD'), method: z.enum(['Cash', 'Check', 'Bank Transfer', 'Other']),
+      note: z.string().max(1000).optional(), recordedAt: z.string().min(1),
+      baseVersion: z.number().finite().int().min(1), payment: z.unknown(), invoice: z.unknown(),
+    }).strict().parse(raw)
+    parsePreciseTimestamp(parsed.recordedAt)
+    const payment = validateEntityPayload('payment', parsed.payment, mutation.ownerId, mutation.entityId)
+    const invoice = validateEntityPayload('invoice', parsed.invoice, mutation.ownerId, parsed.invoiceId)
+    if (
+      parsed.paymentId !== mutation.entityId || parsed.baseVersion !== mutation.baseVersion ||
+      payment.invoiceId !== parsed.invoiceId || payment.amountCents !== parsed.amountCents ||
+      payment.currency !== 'USD' || payment.method !== parsed.method || payment.status !== 'Succeeded' ||
+      payment.manual !== true || Number(payment.version) !== 1 ||
+      Number(invoice.version) !== parsed.baseVersion + 1
+    ) throw new Error('Manual payment payload is inconsistent')
+    return { payload: { ...parsed, payment, invoice }, intents: [
+      { entity: 'payment', payload: payment }, { entity: 'invoice', payload: invoice },
+    ] }
+  }
+  throw new Error('Unsupported lifecycle mutation')
+}
+
+const mutationLocalIntents = (mutation: MutationEnvelope): LocalMutationIntent[] => {
+  if (mutation.kind === 'save_invoice_bundle') {
+    const bundle = mutation.payload as InvoiceBundlePayload
+    return (['client', 'job', 'invoice'] as const).map((entity) => ({
+      entity,
+      payload: bundle[entity] as unknown as Record<string, unknown>,
+    }))
+  }
+  if (
+    mutation.kind === 'save_estimate' || mutation.kind === 'convert_estimate' ||
+    mutation.kind === 'issue_invoice' || mutation.kind === 'record_manual_payment'
+  ) return validateLifecycleMutationPayload(mutation).intents
+  if (mutation.kind === 'delete') return []
+  return [{ entity: mutation.entity, payload: mutation.payload as Record<string, unknown> }]
 }
 
 const validateCloudBundlePayload = (
@@ -848,19 +970,7 @@ const preparedIntentRows = async (
     } catch (cause) {
       throw new OutboxCorruptionError(row.mutation_id, undefined, { cause })
     }
-    const intents: CloudRowEnvelope[] = mutation.kind === 'save_invoice_bundle'
-      ? (['client', 'job', 'invoice'] as const).map((entity) => {
-          const entityPayload = (mutation.payload as InvoiceBundlePayload)[entity]
-          return {
-            ownerId,
-            entity,
-            entityId: entityPayload.id,
-            payload: entityPayload,
-            version: entityPayload.version,
-            updatedAt: entityPayload.updatedAt,
-          }
-        })
-      : mutation.kind === 'delete'
+    const intents: CloudRowEnvelope[] = mutation.kind === 'delete'
         ? [{
             ownerId,
             entity: mutation.entity,
@@ -870,14 +980,14 @@ const preparedIntentRows = async (
             updatedAt: mutation.createdAt,
             deleted: true,
           }]
-        : [{
+        : mutationLocalIntents(mutation).map(({ entity, payload }) => ({
             ownerId,
-            entity: mutation.entity,
-            entityId: mutation.entityId,
-            payload: mutation.payload,
-            version: Number((mutation.payload as Record<string, unknown>).version),
-            updatedAt: String((mutation.payload as Record<string, unknown>).updatedAt),
-          }]
+            entity,
+            entityId: String(payload.id),
+            payload,
+            version: Number(payload.version),
+            updatedAt: String(payload.updatedAt),
+          }))
     for (const intent of intents) latestByKey.set(recordKey(intent.entity, intent.entityId), intent)
   }
   return prepareCloudRows([...latestByKey.values()], ownerId)
@@ -1395,6 +1505,13 @@ export const validateMutationEnvelope = (input: MutationEnvelope): MutationEnvel
     }
   }
 
+  if (
+    mutation.kind === 'save_estimate' || mutation.kind === 'convert_estimate' ||
+    mutation.kind === 'issue_invoice' || mutation.kind === 'record_manual_payment'
+  ) {
+    return { ...mutation, payload: validateLifecycleMutationPayload(mutation).payload }
+  }
+
   return {
     ...mutation,
     payload: validateEntityPayload(
@@ -1766,18 +1883,10 @@ export class SQLiteFieldCraftRepository implements FieldCraftRepository {
           throw new RangeError(`OUTBOX_QUEUE_LIMIT: maximum ${MAX_RETAINED_MUTATIONS} retained operations`)
         }
 
-        const records = mutation.kind === 'save_invoice_bundle'
-          ? [
-              { entity: 'client' as const, payload: (mutation.payload as InvoiceBundlePayload).client },
-              { entity: 'job' as const, payload: (mutation.payload as InvoiceBundlePayload).job },
-              { entity: 'invoice' as const, payload: (mutation.payload as InvoiceBundlePayload).invoice },
-            ]
-          : [
-              {
-                entity: mutation.entity,
-                payload: mutation.payload as Record<string, unknown> | null,
-              },
-            ]
+        const records: { entity: EntityName; payload: Record<string, unknown> | null }[] =
+          mutation.kind === 'delete'
+            ? [{ entity: mutation.entity, payload: null }]
+            : mutationLocalIntents(mutation)
         for (const record of records) {
           const deleted = mutation.kind === 'delete' ? 1 : 0
           const entityId = deleted ? mutation.entityId : String(record.payload?.id)
