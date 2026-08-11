@@ -3,6 +3,8 @@ import { deleteLocalData } from '../src/privacy/deleteLocalData'
 const dependencies = () => ({
   clearVisibleMemory: jest.fn(),
   clearRepository: jest.fn(async () => {}), clearOutbox: jest.fn(async () => {}), clearConflicts: jest.fn(async () => {}),
+  clearQuarantine: jest.fn(async () => {}), clearEntitlement: jest.fn(async () => {}),
+  clearStripeLinks: jest.fn(async () => {}), clearReminders: jest.fn(async () => {}),
   clearAuth: jest.fn(async () => {}), clearConsent: jest.fn(async () => {}), clearArtifacts: jest.fn(async () => {}),
   setRetryMarker: jest.fn(async () => {}), clearRetryMarker: jest.fn(async () => {}),
 })
@@ -14,7 +16,7 @@ it('clears visible memory first, attempts every subsystem, and removes the retry
   deps.clearRepository.mockImplementation(async () => { order.push('repository') })
   await expect(deleteLocalData('owner-a', deps)).resolves.toEqual({ ok: true })
   expect(order[0]).toBe('memory')
-  for (const operation of ['clearRepository', 'clearOutbox', 'clearConflicts', 'clearAuth', 'clearConsent', 'clearArtifacts'] as const) expect(deps[operation]).toHaveBeenCalledTimes(1)
+  for (const operation of ['clearRepository', 'clearOutbox', 'clearQuarantine', 'clearConflicts', 'clearAuth', 'clearEntitlement', 'clearStripeLinks', 'clearReminders', 'clearConsent', 'clearArtifacts'] as const) expect(deps[operation]).toHaveBeenCalledTimes(1)
   expect(deps.clearRetryMarker).toHaveBeenCalledWith('owner-a')
 })
 

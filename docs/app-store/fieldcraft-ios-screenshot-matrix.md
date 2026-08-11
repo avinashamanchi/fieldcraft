@@ -1,12 +1,12 @@
 # FieldCraft iOS screenshot matrix
 
-Official Apple screenshot specifications rechecked 2026-08-09. App Store Connect accepts 1–10 screenshots per device size, in PNG/JPEG without alpha.
+Official Apple screenshot specifications rechecked 2026-08-11. App Store Connect requires at least one screenshot and accepts up to ten for the required iPhone display set, in PNG/JPEG without alpha.
 
 ## Required device set for the first iPhone-only build
 
 | Set | Accepted portrait pixels | Status | Required scenes |
 |---|---:|---|---|
-| iPhone 6.9-inch | 1260×2736, 1290×2796, or 1320×2868 | Not captured | Dashboard; local job entry; invoice review; jobs/offline state; privacy controls |
+| iPhone 6.9-inch | 1260×2736, 1290×2796, or 1320×2868 | Not captured | Dashboard; estimate-to-job; invoice/payment history; reminders/payment link; offline recovery; privacy/export controls |
 
 If iPhone 6.9-inch images are not supplied, Apple currently requires the 6.5-inch set (1284×2778 or 1242×2688). FieldCraft will supply 6.9-inch rather than rely on scaling. The first release sets `supportsTablet` to false because an iPad layout and physical-device matrix have not been validated. iPad support can be enabled in a later tested version.
 
@@ -23,10 +23,12 @@ If iPhone 6.9-inch images are not supplied, Apple currently requires the 6.5-inc
 ## Scene copy draft
 
 1. `Your field work, organized` — Dashboard with synthetic metrics and visible sync state.
-2. `Draft locally. Review every detail.` — Quick local note and editable invoice fields.
-3. `Invoices that stay under your control` — Review screen with local calculations and terms.
-4. `Keep working offline` — Jobs list with explicit pending/current states.
-5. `Privacy choices in the app` — AI consent, sync diagnostics, deletion, and policy links.
+2. `Estimate. Schedule. Get the job done.` — A synthetic estimate and its explicit conversion path.
+3. `Know what is paid—and what is not` — Invoice total, partial payment, refund/dispute provenance, and balance.
+4. `Share a secure way to pay` — Provider-hosted payment-link controls with honest pending confirmation; never promise Apple Pay.
+5. `Reminders you control` — Consent state, due occurrence, and disable control using fictional customer data.
+6. `Keep working offline` — Paged jobs plus explicit queued/current/conflict states.
+7. `Export or delete on your terms` — Export, privacy links, sync diagnostics, local deletion, and account deletion.
 
 Every final image remains blocked until it is captured from the signed build and visually reviewed at exact pixel dimensions.
 

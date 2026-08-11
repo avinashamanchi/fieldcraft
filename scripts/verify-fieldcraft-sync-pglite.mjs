@@ -306,6 +306,7 @@ try {
   await db.exec(await readMigration('202608070003_fieldcraft_business_lifecycle.sql'))
   await db.exec(await readMigration('202608070004_fieldcraft_sync_retention.sql'))
   await db.exec(await readMigration('202608070005_fieldcraft_pro_services.sql'))
+  await db.exec(await readMigration('202608070006_fieldcraft_observability.sql'))
   // Supabase grants its service role platform-level table and sequence access.
   // Model that runtime privilege here without changing production migrations or
   // granting user-facing RPCs that the migration intentionally withholds.
@@ -2192,18 +2193,17 @@ try {
     await withRole('service_role', async () => {
       await db.query(`
         insert into public.fieldcraft_operational_events
-          (user_id, event_type, outcome, dimensions, occurred_at)
+          (event_type, outcome, dimensions, occurred_at)
         values
-          ($1, 'sync_pull', 'ok', '{"page_count":1}'::jsonb, '2026-06-01T00:00:00Z'),
-          ($1, 'sync_pull', 'ok', '{"page_count":1}'::jsonb, '2026-08-01T00:00:00Z')
-      `, [ownerId])
+          ('sync_pull', 'ok', '{"route":"sync-pull"}'::jsonb, '2026-06-01T00:00:00Z'),
+          ('sync_pull', 'ok', '{"route":"sync-pull"}'::jsonb, '2026-08-01T00:00:00Z')
+      `)
       await db.query(
         `select public.prune_fieldcraft_operational_data('2026-08-10T12:00:00Z')`,
       )
     })
     const events = await db.query(
-      'select occurred_at from public.fieldcraft_operational_events where user_id = $1 order by occurred_at',
-      [ownerId],
+      'select occurred_at from public.fieldcraft_operational_events order by occurred_at',
     )
     if (events.rows.length !== 1 || new Date(events.rows[0].occurred_at).toISOString() !== '2026-08-01T00:00:00.000Z') {
       throw new Error(`operational retention left ${JSON.stringify(events.rows)}`)
@@ -2216,6 +2216,89 @@ try {
     if (!receiptConstraint.rows[0]?.definition.includes("'400 days'")) {
       throw new Error(`receipt retention was ${JSON.stringify(receiptConstraint.rows[0] ?? null)}`)
     }
+  })
+
+  await verify('account deletion invalidates new writes and revokes service work before auth removal', async () => {
+    const deletionOwnerId = lifecycleOwnerId
+    const deletionInvoiceId = lifecycleInvoiceId
+    const scheduleId = '84000000-0000-4000-8000-000000000001'
+    const deliveryId = '84100000-0000-4000-8000-000000000001'
+    await db.exec('begin')
+    await db.query('select public.fieldcraft_lock_sync_owner($1, null)', [deletionOwnerId])
+    await db.query(`
+      insert into public.reminder_schedules (
+        id, user_id, invoice_id, recipient_email, has_reminder_consent,
+        occurrences
+      ) values ($1, $2, $3, 'customer@example.test', true, '["due"]'::jsonb)
+    `, [scheduleId, deletionOwnerId, deletionInvoiceId])
+    await db.query(`
+      insert into public.reminder_deliveries (
+        id, user_id, invoice_id, schedule_id, due_occurrence
+      ) values ($1, $2, $3, $4, 'due')
+    `, [deliveryId, deletionOwnerId, deletionInvoiceId, scheduleId])
+    await db.exec('commit')
+    await withRole('service_role', async () => {
+      await db.query(`
+        insert into public.stripe_connected_accounts (
+          user_id, connected_account_id, requirements_state
+        ) values ($1, 'acct_deletefixture', 'pending')
+        on conflict (user_id) do nothing
+      `, [deletionOwnerId])
+      await db.query(`
+        insert into public.invoice_payment_links (
+          user_id, invoice_id, token_hash, expires_at
+        ) values ($1, $2, decode($3, 'hex'), statement_timestamp() + interval '1 day')
+      `, [deletionOwnerId, deletionInvoiceId, 'a'.repeat(64)])
+      const firstInvalidation = await db.query('select public.fieldcraft_invalidate_owner_work($1) as generation', [deletionOwnerId])
+      const retryInvalidation = await db.query('select public.fieldcraft_invalidate_owner_work($1) as generation', [deletionOwnerId])
+      if (Number(firstInvalidation.rows[0]?.generation) !== 1 || Number(retryInvalidation.rows[0]?.generation) !== 1) throw new Error('deletion invalidation was not retry-safe')
+      await db.query('select public.fieldcraft_revoke_owner_payment_links($1)', [deletionOwnerId])
+      await db.query('select public.fieldcraft_cancel_owner_reminders($1)', [deletionOwnerId])
+    })
+    await expectSqlState(
+      () => db.query('select public.fieldcraft_lock_sync_owner($1, null)', [deletionOwnerId]),
+      '42501',
+    )
+    const state = await db.query(`
+      select
+        (select generation from public.fieldcraft_owner_deletion_state where user_id = $1) as generation,
+        (select revoked_at is not null from public.invoice_payment_links where user_id = $1) as link_revoked,
+        (select not active from public.reminder_schedules where id = $2) as reminder_disabled,
+        (select status from public.reminder_deliveries where id = $3) as delivery_status
+    `, [deletionOwnerId, scheduleId, deliveryId])
+    const row = state.rows[0]
+    if (
+      Number(row?.generation) !== 1 || row?.link_revoked !== true ||
+      row?.reminder_disabled !== true || row?.delivery_status !== 'Cancelled'
+    ) throw new Error(`deletion state was ${JSON.stringify(row ?? null)}`)
+  })
+
+  await verify('operational telemetry is service-only, digest-only, and rejects content fields', async () => {
+    const grants = await db.query(`
+      select
+        has_function_privilege('authenticated', 'public.record_fieldcraft_operational_event(text,text,jsonb,text,integer)', 'execute') as owner_records,
+        has_function_privilege('service_role', 'public.record_fieldcraft_operational_event(text,text,jsonb,text,integer)', 'execute') as service_records,
+        has_table_privilege('authenticated', 'public.fieldcraft_owner_deletion_state', 'select') as owner_reads_deletion
+    `)
+    const grant = grants.rows[0]
+    if (grant?.owner_records !== false || grant?.service_records !== true || grant?.owner_reads_deletion !== false) {
+      throw new Error(`observability grants were ${JSON.stringify(grant ?? null)}`)
+    }
+    await withRole('service_role', () => db.query(`
+      select public.record_fieldcraft_operational_event(
+        'account_deletion', 'ok', '{"route":"delete-account","status":"completed"}'::jsonb,
+        $1, 1
+      )
+    `, ['b'.repeat(64)]))
+    await withRole('service_role', () => expectSqlState(
+      () => db.query(`
+        select public.record_fieldcraft_operational_event(
+          'sync_failure', 'failed', '{"email":"private@example.test"}'::jsonb,
+          null, null
+        )
+      `),
+      '23514',
+    ))
   })
 
   await verify('connected payments expose owner reads while provider mutations remain service-only', async () => {

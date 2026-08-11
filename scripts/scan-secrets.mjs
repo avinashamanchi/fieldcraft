@@ -21,11 +21,13 @@ const DEFAULT_BUNDLE_DIRECTORIES = ['dist', 'mobile/dist', 'supabase/functions/d
 export const SECRET_RULES = [
   { id: 'private-key', pattern: /-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----/g },
   { id: 'provider-api-key', pattern: /\b(?:gsk_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,})\b/g },
+  { id: 'stripe-secret', pattern: /\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9_]{16,}\b/g },
+  { id: 'webhook-secret', pattern: /\bwhsec_[A-Za-z0-9_]{16,}\b/g },
   { id: 'bearer-token', pattern: /\bBearer[ \t]+(?!\$\{|<|REDACTED\b)[A-Za-z0-9._~+\/-]{24,}={0,2}\b/g },
   { id: 'jwt-token', pattern: /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g },
   {
     id: 'private-env-assignment',
-    pattern: /\b(?:GROQ_API_KEY|OPENAI_API_KEY|SUPABASE_SERVICE_ROLE_KEY|AI_RATE_LIMIT_HMAC_SECRET|REVENUECAT_WEBHOOK_SECRET|REVENUECAT_WEBHOOK_SIGNING_SECRET|EXPO_TOKEN|APPLE_APP_SPECIFIC_PASSWORD)\b[ \t]*[:=][ \t]*["']?(?!\$\{|process\.env|Deno\.env|<|REDACTED\b|replace-me\b)[A-Za-z0-9._~+\/-]{12,}/g,
+    pattern: /\b(?:GROQ_API_KEY|OPENAI_API_KEY|SUPABASE_SERVICE_ROLE_KEY|AI_RATE_LIMIT_HMAC_SECRET|REVENUECAT_WEBHOOK_SECRET|REVENUECAT_WEBHOOK_SIGNING_SECRET|STRIPE_SECRET_KEY|STRIPE_WEBHOOK_SECRET|REMINDER_PROVIDER_API_KEY|REMINDER_PROVIDER_WEBHOOK_SECRET|FIELDCRAFT_OBSERVABILITY_HMAC_SECRET|EXPO_TOKEN|APPLE_APP_SPECIFIC_PASSWORD)\b[ \t]*[:=][ \t]*["']?(?!\$\{|process\.env|Deno\.env|<|REDACTED\b|replace-me\b|set-in-\b|set-a-\b)[A-Za-z0-9._~+\/-]{12,}/g,
   },
 ]
 
@@ -65,7 +67,7 @@ export const scanRepository = ({
   bundleDirectories = DEFAULT_BUNDLE_DIRECTORIES,
   publicBundleValues = [],
 } = {}) => {
-  const tracked = execFileSync('git', ['ls-files', '-z'], { cwd: root, encoding: 'utf8' }).split('\0').filter(Boolean)
+  const tracked = execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard', '-z'], { cwd: root, encoding: 'utf8' }).split('\0').filter(Boolean)
   const bundleFiles = bundleDirectories.flatMap((directory) => walk(resolve(root, directory), root))
   const files = [...new Set([...tracked, ...bundleFiles])].filter((path) => !EXACT_EXCLUSIONS.has(path))
   return files.flatMap((path) => {

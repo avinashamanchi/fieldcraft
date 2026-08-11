@@ -30,6 +30,7 @@ jobs:
           npm run lint
           npm run build
           npm run scan:secrets
+          npm run check:load-scenarios
           npm audit --audit-level=high
 
       - name: Mobile gates

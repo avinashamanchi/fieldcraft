@@ -1,6 +1,6 @@
 # FieldCraft iOS App Store metadata draft
 
-Last reviewed: 2026-08-10. This is a credential-free draft, not proof of an App Store Connect submission. The first release is iPhone-only; iPad support is deferred until its layout and device matrix are validated. The complete applicability record is `apple-review-guideline-applicability.md`.
+Last reviewed: 2026-08-11. This is a credential-free draft, not proof of an App Store Connect submission. The first release is iPhone-only; iPad support is deferred until its layout and device matrix are validated. The complete applicability record is `apple-review-guideline-applicability.md`.
 
 ## Listing
 
@@ -18,13 +18,15 @@ Last reviewed: 2026-08-10. This is a credential-free draft, not proof of an App 
 
 ## Promotional text
 
-Keep field-service work organized with editable job, client, invoice, expense, service, and inventory records that remain usable offline.
+Take a job from estimate to invoice, partial payment, reminder, and export—with an offline workspace that keeps the source of truth visible.
 
 ## Description
 
 FieldCraft is a business-management workspace for independent tradespeople and small field-service teams.
 
-Log jobs and clients, prepare editable invoices, record expenses, maintain a service and inventory catalog, and keep working with an on-device offline cache. FieldCraft calculates invoice amounts locally and queues authenticated cloud sync when a connection is available.
+Create clients, estimates, jobs, and editable invoices; record manual or provider-confirmed partial payments; schedule consented invoice reminders; export account data; track expenses; and maintain service and inventory catalogs. Bounded lists and an on-device cache keep the workspace usable offline while authenticated changes queue for cloud sync.
+
+FieldCraft Pro expands creation capacity and enables connected Stripe-hosted payment links and scheduled reminders. Customer payments are only for real-world trade services, never digital app access. Payment state remains pending until a signed provider webhook confirms it, and Apple Pay appears on hosted checkout only when available and eligible.
 
 Optional AI can turn a transcript you review into an editable invoice draft or suggest an expense category. AI stays off until you consent, and manual entry remains available without AI. On-device speech recognition and receipt text recognition are available in the native iOS build when supported.
 
@@ -47,7 +49,7 @@ FieldCraft does not guarantee savings, revenue, payment, delivery, tax treatment
 
 - A provider-owned temporary review account must be supplied privately in App Store Connect; never add it to this repository.
 - Keep that review account active for the full review window, pre-complete onboarding with synthetic business data, and include any MFA/recovery steps plus a direct support contact in App Review Information.
-- Reviewer path: sign in with the private review account; create a client and job; use **Quick local job note** or typed invoice entry; review and save; open Settings for AI consent, privacy, sync, subscription, local deletion, and account deletion.
+- Reviewer path: sign in with the private review account; open the prepared estimate; convert it to a job; issue the prepared invoice; record a partial manual payment; inspect the payment history; create/revoke the sandbox customer payment link; enable/disable the consented reminder; export account data; then open Settings for AI consent, privacy, sync, subscription, local deletion, and account deletion.
 - Manual local job and invoice entry works without AI. The `Quick local job note` flow creates an editable deterministic draft on device.
 - Optional AI is off until the signed-in user explicitly grants consent. Requests pass through authenticated Supabase functions; no provider key is shipped in the app.
 - Apple Speech and Vision require the native FieldCraft development/App Store build and cannot be validated in Expo Go. Typed invoice and expense entry remains available.
@@ -55,7 +57,7 @@ FieldCraft does not guarantee savings, revenue, payment, delivery, tax treatment
 - Cloud sync and account deletion require the release operator's configured Supabase project.
 - Authentication uses email and password only. FieldCraft offers no social or third-party login provider.
 - The paywall exposes Restore Purchases, Apple subscription management, Privacy Policy, Terms of Use, FieldCraft Support, and Apple's purchase/refund-help page. Apple determines refund eligibility. Deleting a FieldCraft account does not cancel an Apple subscription.
-- `fieldcraft_pro_monthly` and `fieldcraft_pro_annual` unlock digital FieldCraft capacity and therefore use Apple IAP only. Invoice/payment records concern the user's real-world trade services; they do not unlock app features and are not an alternative checkout for Pro.
+- `fieldcraft_pro_monthly` and `fieldcraft_pro_annual` unlock digital FieldCraft capacity and therefore use Apple IAP only. Stripe-hosted invoice payments concern the user's real-world trade services; they never unlock app features, never alter the RevenueCat entitlement, and are not an alternative checkout for Pro. The app never treats the checkout redirect as payment truth.
 - Offer codes, win-back offers, promoted IAP, Family Sharing, and alternative digital payments are disabled for v1 unless separately configured, documented, and tested in the exact signed candidate.
 
 ## App Privacy draft for App Store Connect
@@ -68,11 +70,13 @@ Confirm this against the deployed production configuration immediately before su
 - User content: jobs, invoices, expenses, notes, service/inventory records, and a selected business logo; linked to the authenticated account; used for app functionality.
 - Identifiers: Supabase account/user ID; linked to the user; used for authentication, security, deletion, and sync.
 - Purchase history: product, entitlement, purchase, and expiration information is linked to the FieldCraft account ID and used for Analytics and App Functionality, including offering, restoring, and verifying Pro through Apple and RevenueCat. It is not used for tracking. Recheck the final SDK manifests and App Store definitions.
-- Diagnostics/other data: content-free request ID, route, status, rate-limit digest, and coarse latency/security metadata only if retained by the deployed function logs; used for security and app functionality, never tracking.
+- Purchases/financial information for customer invoices: invoice amount, currency, payment/refund/dispute state, and provider identifiers are linked to the business account and used for App Functionality. Full card and bank-account details entered only on Stripe-hosted checkout are not accessible to FieldCraft; confirm the final App Privacy answer against the deployed Stripe integration.
+- Contact information used for reminders: a recipient email and business reply-to address are linked to the business account and sent to the configured reminder provider for App Functionality only after recorded consent.
+- Diagnostics/other data: content-free request ID, route/provider/deployment label, rotating owner digest, status/reason, and coarse latency/security metadata only if retained by the deployed function logs; used for security and app functionality, never tracking.
 - Photos: receipt images stay local and are deleted from FieldCraft temporary storage after processing; the explicitly selected business logo can be uploaded to the account's owner-only Storage path.
 - Audio: raw audio is processed for on-device transcription and is not uploaded by FieldCraft.
 - Optional processor: a reviewed transcript or minimized reviewed expense fields can be sent to Groq through FieldCraft's authenticated function only after consent.
-- Payment-card details, contacts address book, advertising data, precise location, health, fitness, browsing history, and search history: not collected by FieldCraft.
+- Payment-card/bank numbers, contacts address book, advertising data, precise location, health, fitness, browsing history, and search history: not collected by FieldCraft. Card/bank data entered on Stripe's hosted surface stays with Stripe.
 
 ## Age rating and compliance draft
 
@@ -84,4 +88,4 @@ Confirm this against the deployed production configuration immediately before su
 
 ## Truthful release status
 
-The source package is prepared only. On 2026-08-09 the public Privacy, Terms, and Support URLs returned HTTP 404. Supabase migrations/functions, RevenueCat products/offering/webhook, the production EAS environment, signed native Speech/Vision and purchase tests, screenshots, App Store Connect forms, upload, review, acceptance, and publication remain pending.
+The source package and legal-site update are prepared only. The previously published Privacy, Terms, and Support pages returned HTTPS 200 on 2026-08-10, but the August 11 Stripe/reminder/retention revisions must be published and rechecked byte for byte after merge. Supabase migrations/functions, RevenueCat products/offering/webhook, Stripe/reminder-provider configuration, the production EAS environment, signed native/provider/purchase tests, live staging load, screenshots, App Store Connect forms, upload, review, acceptance, and publication remain pending.

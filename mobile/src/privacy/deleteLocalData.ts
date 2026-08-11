@@ -1,21 +1,30 @@
 import { getSupabaseClient } from '../auth/supabase'
 
-export type DeleteSubsystem = 'repository' | 'outbox' | 'conflicts' | 'auth' | 'consent' | 'artifacts' | 'memory'
+export type DeleteSubsystem =
+  | 'repository' | 'outbox' | 'quarantine' | 'conflicts' | 'auth'
+  | 'entitlement' | 'stripe-links' | 'reminders' | 'consent' | 'artifacts' | 'memory'
 export type DeleteOutcome = { ok: true } | { ok: false; failed: DeleteSubsystem[] }
 
 export type DeleteLocalDataDependencies = {
   clearVisibleMemory(): void
   clearRepository(): Promise<void>
   clearOutbox(): Promise<void>
+  clearQuarantine(): Promise<void>
   clearConflicts(): Promise<void>
   clearAuth(): Promise<void>
+  clearEntitlement(): Promise<void>
+  clearStripeLinks(): Promise<void>
+  clearReminders(): Promise<void>
   clearConsent(): Promise<void>
   clearArtifacts(): Promise<void>
   setRetryMarker(ownerId: string, failed: DeleteSubsystem[]): Promise<void>
   clearRetryMarker(ownerId: string): Promise<void>
 }
 
-const ORDER: DeleteSubsystem[] = ['repository', 'outbox', 'conflicts', 'auth', 'consent', 'artifacts', 'memory']
+const ORDER: DeleteSubsystem[] = [
+  'repository', 'outbox', 'quarantine', 'conflicts', 'auth', 'entitlement',
+  'stripe-links', 'reminders', 'consent', 'artifacts', 'memory',
+]
 
 export const clearLocalAuthentication = async (): Promise<void> => {
   const { error } = await getSupabaseClient().auth.signOut({ scope: 'local' })
@@ -30,8 +39,12 @@ export const deleteLocalData = async (ownerId: string, dependencies: DeleteLocal
   const operations: [DeleteSubsystem, () => Promise<void>][] = [
     ['repository', dependencies.clearRepository],
     ['outbox', dependencies.clearOutbox],
+    ['quarantine', dependencies.clearQuarantine],
     ['conflicts', dependencies.clearConflicts],
     ['auth', dependencies.clearAuth],
+    ['entitlement', dependencies.clearEntitlement],
+    ['stripe-links', dependencies.clearStripeLinks],
+    ['reminders', dependencies.clearReminders],
     ['consent', dependencies.clearConsent],
     ['artifacts', dependencies.clearArtifacts],
   ]

@@ -242,6 +242,7 @@ type SubscriptionContextValue = Readonly<{
   purchase(packageId: string): Promise<void>
   restore(): Promise<void>
   manage(): Promise<void>
+  clearLocalEntitlement(): void
 }>
 
 const SubscriptionContext = createContext<SubscriptionContextValue | null>(null)
@@ -308,6 +309,7 @@ export const SubscriptionProvider = ({
         : 'No active verified FieldCraft Pro subscription was found.')
     }),
     manage: () => perform(() => coordinator.openManageSubscriptions()),
+    clearLocalEntitlement: () => coordinator.invalidateBeforeTeardown(),
   }), [busy, coordinator, entitlement, message, packages])
 
   return <SubscriptionContext.Provider value={value}>{children}</SubscriptionContext.Provider>
