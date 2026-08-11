@@ -24,6 +24,20 @@ describe('redacted secret scanner', () => {
     const fixture = 'GROQ_API_KEY=${GROQ_API_KEY}\nSUPABASE_SERVICE_ROLE_KEY=replace-me\nconst key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")'
     expect(scanSecretText('safe.env.example', fixture)).toEqual([])
   })
+
+  it('allows only an exact declared public browser key in generated bundles', () => {
+    const publicBrowserKey = 'eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoiYW5vbiIsInJlZiI6ImZpZWxkY3JhZnQifQ.public-signature'
+    const unrelatedToken = 'eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoic2VydmljZSJ9.private-signature'
+    const options = { publicBundleValues: [publicBrowserKey] }
+
+    expect(scanSecretText('dist/assets/app.js', publicBrowserKey, options)).toEqual([])
+    expect(scanSecretText('src/config.ts', publicBrowserKey, options)).toEqual([
+      { path: 'src/config.ts', ruleId: 'jwt-token', count: 1 },
+    ])
+    expect(scanSecretText('dist/assets/app.js', unrelatedToken, options)).toEqual([
+      { path: 'dist/assets/app.js', ruleId: 'jwt-token', count: 1 },
+    ])
+  })
 })
 
 describe('release workflow contracts', () => {
@@ -43,6 +57,7 @@ describe('release workflow contracts', () => {
     expect(workflow).toContain('needs: [web-gates, mobile-gates, backend-gates]')
     for (const command of requiredCommands) expect(workflow).toContain(command)
     expect(workflow).toContain('check-mobile-audit.mjs')
+    expect(workflow).toMatch(/name: Scan built app[^]*VITE_SUPABASE_ANON_KEY: \$\{\{ secrets\.VITE_SUPABASE_ANON_KEY \}\}[^]*run: npm run scan:secrets/)
   })
 
   it('keeps release readiness manual-only and unable to deploy or submit', () => {
