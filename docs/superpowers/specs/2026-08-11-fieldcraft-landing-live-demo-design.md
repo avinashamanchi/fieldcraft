@@ -1,7 +1,7 @@
 # FieldCraft landing and live-demo design
 
 **Date:** 2026-08-11
-**Status:** Design approved; pending written-spec review
+**Status:** Approved for implementation
 
 ## Product frame
 
