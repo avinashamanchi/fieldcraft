@@ -34,7 +34,7 @@ FieldCraft does not guarantee savings, revenue, payment, delivery, tax treatment
 
 ## Keywords
 
-`contractor,field,service,clients,inventory,estimates,offline,work,trade`
+`contractor,billing,service,clients,inventory,estimates,offline,work,trade`
 
 ## Subscription listing draft
 

@@ -4,7 +4,7 @@ Last updated: 2026-08-11. `PASS` means directly observed evidence for the curren
 
 ## Local implementation and CI
 
-- [x] The current `codex/app-store-finalization-20260810` candidate was verified in its isolated worktree; this evidence does not infer deployment, upload, submission, or publication.
+- [x] The current `codex/fieldcraft-release-sweep-20260811` candidate was verified in its isolated worktree; this evidence does not infer deployment, upload, submission, or publication.
 - [x] Root tests, typecheck, lint, web build, and redacted secret scan passed under Node 22.
 - [x] Mobile Jest, typecheck, lint, Expo Doctor, and iOS export passed under Node 22.
 - [x] Supabase migration boundary and 53 PGlite database checks passed; the mobile suite includes a real SQLite grammar test for every migration.
@@ -35,7 +35,7 @@ Last updated: 2026-08-11. `PASS` means directly observed evidence for the curren
 | Mobile tests | 62 suites, 618 tests passed |
 | Database | Migration boundary and 53 PGlite checks passed; Node's real SQLite parser accepted the complete mobile migration chain |
 | Edge | Deno 2.9.5 format/lint checked 27 TypeScript files; 30 tests passed; all 9 dynamic function entrypoints passed `deno check` |
-| Expo | Doctor 18/18; the exact checkout exported a 7.5 MB Hermes iOS bundle. Earlier production prebuild evidence with sanitized public test values contained no Bonjour/local-network declarations, arbitrary ATS loads, or localhost transport exception |
+| Expo | Doctor 18/18; the exact checkout exported a 7.5 MB Hermes iOS bundle. A fresh production prebuild with sanitized public test values contained no Face ID purpose string, Bonjour/local-network declarations, arbitrary ATS loads, localhost transport exception, or entitlement |
 | Security | Root production audit: 0; CodeQL extended analysis is enabled for Actions and JavaScript/TypeScript; the strict mobile gate accepted only the 12 transitive Expo/Metro findings rooted in the two reviewed advisories and rejects any new high/critical advisory; tracked/export secret scan passed; exact icon: 1024×1024 PNG, RGB, no alpha |
 | Capacity contracts | Static k6 scenario/evaluator gate passed; no live 1,000-user or 2,500-session success claim is made |
 | Workflows | CI now runs the load-scenario contract gate; release-readiness remains manual-only and has no deploy/submit command |

@@ -74,6 +74,10 @@ it('uses the exact FieldCraft iOS identity', () => {
   expect(config.ios?.supportsTablet).toBe(false)
   expect(config.ios?.infoPlist?.ITSAppUsesNonExemptEncryption).toBe(false)
   expect(config.updates).toEqual({ enabled: false })
+  expect(config.plugins).toContainEqual([
+    'expo-secure-store',
+    { faceIDPermission: false },
+  ])
   expect(config.plugins).toContain('./plugins/withReleaseNetworkPolicy.cjs')
   expect(config.extra).toMatchObject({
     privacyPolicyUrl: 'https://avinashamanchi.github.io/fieldcraft/privacy.html',
