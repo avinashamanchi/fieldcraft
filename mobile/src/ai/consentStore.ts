@@ -15,7 +15,11 @@ const keyFor = (ownerId: string): string => {
 }
 
 export const createAiConsentStore = (backend: AiConsentStoreBackend = SecureStore): AiConsentStore => ({
-  async grant(ownerId) { await backend.setItemAsync(keyFor(ownerId), AI_CONSENT_VERSION) },
+  async grant(ownerId) {
+    await backend.setItemAsync(keyFor(ownerId), AI_CONSENT_VERSION, {
+      keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+    })
+  },
   async hasConsent(ownerId) { return await backend.getItemAsync(keyFor(ownerId)) === AI_CONSENT_VERSION },
   async revoke(ownerId) { await backend.deleteItemAsync(keyFor(ownerId)) },
 })

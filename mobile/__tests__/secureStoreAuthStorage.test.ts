@@ -1,3 +1,5 @@
+import * as SecureStore from 'expo-secure-store'
+
 import {
   createSecureStoreAuthStorage,
   SecureAuthStorageError,
@@ -6,6 +8,7 @@ import {
 
 class MemorySecureStore implements SecureStoreBackend {
   readonly values = new Map<string, string>()
+  readonly writeOptions: Array<Parameters<typeof SecureStore.setItemAsync>[2]> = []
   failGet = false
   failSet: ((key: string) => boolean) | null = null
   failDelete: ((key: string) => boolean) | null = null
@@ -15,8 +18,13 @@ class MemorySecureStore implements SecureStoreBackend {
     return this.values.get(key) ?? null
   }
 
-  async setItemAsync(key: string, value: string): Promise<void> {
+  async setItemAsync(
+    key: string,
+    value: string,
+    options?: Parameters<typeof SecureStore.setItemAsync>[2],
+  ): Promise<void> {
     if (this.failSet?.(key)) throw new Error('interrupted write: provider-secret')
+    this.writeOptions.push(options)
     this.values.set(key, value)
   }
 
@@ -25,6 +33,21 @@ class MemorySecureStore implements SecureStoreBackend {
     this.values.delete(key)
   }
 }
+
+it('stores every authentication fragment in the unlocked, device-only keychain class', async () => {
+  const backend = new MemorySecureStore()
+  const storage = createSecureStoreAuthStorage({
+    backend,
+    createGeneration: () => 'device-only',
+  })
+
+  await storage.setItem('session', 'access-and-refresh-token')
+
+  expect(backend.writeOptions.length).toBeGreaterThan(0)
+  expect(backend.writeOptions.every((options) => (
+    options?.keychainAccessible === SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY
+  ))).toBe(true)
+})
 
 const sequentialGenerations = (...generations: string[]) => {
   let index = 0

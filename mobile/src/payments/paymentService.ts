@@ -34,7 +34,26 @@ type Options = Readonly<{
   deadlineMs?: number
 }>
 
-const TimedUrlSchema = z.object({ url: z.url().refine((value) => value.startsWith('https://')), expiresAt: z.iso.datetime() }).passthrough()
+const trustedStripeUrl = (allowedHosts: readonly string[]) => z.url().refine((value) => {
+  try {
+    const url = new URL(value)
+    return url.protocol === 'https:'
+      && url.username === ''
+      && url.password === ''
+      && url.port === ''
+      && allowedHosts.includes(url.hostname.toLowerCase())
+  } catch {
+    return false
+  }
+})
+const ConnectUrlSchema = z.object({
+  url: trustedStripeUrl(['connect.stripe.com']),
+  expiresAt: z.iso.datetime(),
+}).passthrough()
+const PaymentUrlSchema = z.object({
+  url: trustedStripeUrl(['buy.stripe.com', 'checkout.stripe.com']),
+  expiresAt: z.iso.datetime(),
+}).passthrough()
 const StatusSchema = z.object({ state: z.enum(['not-connected', 'pending', 'restricted', 'complete']), chargesEnabled: z.boolean(), payoutsEnabled: z.boolean() }).passthrough()
 const SuccessSchema = z.object({ status: z.string().min(1) }).passthrough()
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
@@ -100,12 +119,12 @@ export const createPaymentService = (options: Options): PaymentService => {
     } finally { clearTimeout(timer) }
   }
   return {
-    createConnectOnboarding: () => call('stripe-connect', { action: 'onboard' }, TimedUrlSchema),
+    createConnectOnboarding: () => call('stripe-connect', { action: 'onboard' }, ConnectUrlSchema),
     refreshConnectStatus: () => call('stripe-connect', { action: 'status' }, StatusSchema),
     async disconnectConnect() { await call('stripe-connect', { action: 'disconnect' }, SuccessSchema) },
     createPaymentLink(invoiceId) {
       if (!uuidPattern.test(invoiceId)) return Promise.reject(new PaymentServiceError('invalid-response'))
-      return call('payment-link', { action: 'issue', invoiceId }, TimedUrlSchema)
+      return call('payment-link', { action: 'issue', invoiceId }, PaymentUrlSchema)
     },
     async revokePaymentLink(invoiceId) {
       if (!uuidPattern.test(invoiceId)) throw new PaymentServiceError('invalid-response')

@@ -1,10 +1,12 @@
 # FieldCraft iOS release checklist
 
-Last updated: 2026-08-11. `PASS` means directly observed evidence for the current scoped candidate. `BLOCKED` means credentials, provider state, hardware, a missing local tool, or App Store Connect are still required. Blank boxes are not complete.
+Last updated: 2026-08-14. `PASS` means directly observed evidence for the current scoped candidate. `BLOCKED` means credentials, provider state, hardware, a missing local tool, or App Store Connect are still required. Blank boxes are not complete.
 
 ## Local implementation and CI
 
-- [x] The current `codex/fieldcraft-release-sweep-20260811` candidate was verified in its isolated worktree; this evidence does not infer deployment, upload, submission, or publication.
+- [x] The current `codex/security-release-20260814` candidate passed its repository-controlled verification in an isolated worktree; this evidence does not infer deployment, upload, submission, or publication.
+- [x] Apple's June 2026 review changes were rechecked. FieldCraft's prepared age-rating answer for social-media capabilities is `No`: it has no social feed/discovery or many-user redistribution of user content. The account holder must enter that answer in App Store Connect, and any future community feature reopens the review.
+- [x] Expo SDK 54 is deliberately retained for the tested iOS 15.1+ surface. Expo's current `sdk-54` EAS image uses Xcode 26.0 and can meet Apple's iOS 26 SDK upload floor; the exact EAS build log and processed archive remain required proof. Expo Go is not production validation.
 - [x] Root tests, typecheck, lint, web build, and redacted secret scan passed under Node 22.
 - [x] Mobile Jest, typecheck, lint, Expo Doctor, and iOS export passed under Node 22.
 - [x] Supabase migration boundary and 53 PGlite database checks passed; the mobile suite includes a real SQLite grammar test for every migration.
@@ -12,7 +14,7 @@ Last updated: 2026-08-11. `PASS` means directly observed evidence for the curren
 - [x] CI, deploy, release-readiness, and Maestro YAML parsed; release readiness is manual-only and has no deploy/submit command.
 - [x] Root production dependency audit reported zero vulnerabilities.
 - [x] GitHub Dependabot alerts and automated security fixes are enabled. CodeQL default setup uses the extended query suite for Actions and JavaScript/TypeScript, workflow actions are pinned to immutable commit SHAs, and the release candidate rejects off-domain Supabase function URLs before sending an authorization token. The default-branch CodeQL run passed and its open inventory is zero after production fixes plus four evidence-commented false-positive dispositions for signed Supabase verification inputs and build-time-only validated function configuration.
-- [x] Mobile CI fails closed on any high/critical advisory except the two explicitly reviewed `image-size` parser advisories (GitHub sources `1138808` and `1138809`) through Expo/Metro. The 2026-08-09 report has 12 transitive findings; npm proposes only breaking Expo/React Native downgrades, so the gate records the exception instead of forcing that remediation.
+- [x] Mobile CI fails closed on any high/critical advisory except the two explicitly reviewed `image-size` parser advisories (GitHub sources `1138808` and `1138809`) through Expo/Metro. The current report has 12 transitive findings; npm proposes only breaking Expo/React Native downgrades, so the gate records the exception instead of forcing that remediation. The separate 2026-08-14 `nanoid` advisory was remediated to `3.3.18` in both web and mobile dependency trees rather than allowlisted.
 - [x] 1024×1024 opaque RGB icon validated and configured.
 - [x] First release is explicitly iPhone-only; the unverified iPad target and 13-inch screenshot obligation were removed from the v1 configuration.
 - [x] Authentication is email/password only; no third-party or social login is offered, and the iOS config explicitly declares that Sign in with Apple is not used.
@@ -22,6 +24,7 @@ Last updated: 2026-08-11. `PASS` means directly observed evidence for the curren
 - [x] `apple-review-guideline-applicability.md` records every Apple Safety, Performance, Business, Design, and Legal family as implemented, externally gated, or not applicable; absent UGC, Kids, gambling, VPN, MDM, social login, Apple Pay, and downloaded-code features cannot be silently added after review.
 - [x] Delete Account checks the recent-authenticator guard before any destructive request, routes to the delete-account step-up screen, and offers authenticator setup when no verified factor exists; the server independently enforces recent AAL2.
 - [x] A production-only Expo config plugin strips development Bonjour/local-network discovery declarations, disables arbitrary ATS loads, and removes localhost transport exceptions from the generated release Info.plist.
+- [x] The app target now generates a valid source privacy manifest with tracking disabled, no tracking domains, and conservative linked app-data declarations matching the existing privacy draft. The exact archive privacy report and every CocoaPods SDK manifest remain signed-build gates.
 - [x] Account deletion atomically invalidates new owner writes, revokes active payment links and queued reminders, retries safely, treats Stripe unlinking as best effort, deletes owner cloud/auth data, and clears local repository/outbox/quarantine/conflicts/auth/entitlement/link/reminder/consent/artifact state before removing the durable erasure marker.
 - [x] Operational logging is restricted to content-free allowlisted fields and rotating HMAC owner digests; PostgreSQL rejects raw identity/content dimensions and prunes operational events separately from 400-day idempotency/provider receipts.
 - [x] Versioned k6 staging scenarios define 250 pull RPS plus 100 mutation RPS for 10 minutes, 25 signed webhook RPS for 10 minutes with 20% duplicates, 2,500 realtime sessions for 30 minutes, strict latency/error thresholds, and zero-tolerance isolation/duplicate/lost-ack counters. The local gate validates the scenarios and boundary evaluators only; live staging execution remains blocked.
@@ -31,11 +34,11 @@ Last updated: 2026-08-11. `PASS` means directly observed evidence for the curren
 | Gate | Observed result |
 |---|---|
 | Runtime | Node `22.23.2` used for the fresh local gates; workflows retain their pinned Node 22 runner |
-| Root tests | 5 files, 25 tests passed |
-| Mobile tests | 62 suites, 618 tests passed |
+| Root tests | 8 files, 33 tests passed |
+| Mobile tests | 63 suites, 626 tests passed |
 | Database | Migration boundary and 53 PGlite checks passed; Node's real SQLite parser accepted the complete mobile migration chain |
 | Edge | Deno 2.9.5 format/lint checked 27 TypeScript files; 30 tests passed; all 9 dynamic function entrypoints passed `deno check` |
-| Expo | Doctor 18/18; the exact checkout exported a 7.5 MB Hermes iOS bundle. A fresh production prebuild with sanitized public test values contained no Face ID purpose string, Bonjour/local-network declarations, arbitrary ATS loads, localhost transport exception, or entitlement |
+| Expo | Doctor 18/18; the exact checkout exported a 7.5 MB Hermes iOS bundle. A fresh production prebuild with sanitized public test values contained no Face ID purpose string, Bonjour/local-network declarations, arbitrary ATS loads, localhost transport exception, or entitlement; its app-target `PrivacyInfo.xcprivacy` passed `plutil` validation |
 | Security | Root production audit: 0; CodeQL extended analysis is enabled for Actions and JavaScript/TypeScript; the strict mobile gate accepted only the 12 transitive Expo/Metro findings rooted in the two reviewed advisories and rejects any new high/critical advisory; tracked/export secret scan passed; exact icon: 1024×1024 PNG, RGB, no alpha |
 | Capacity contracts | Static k6 scenario/evaluator gate passed; no live 1,000-user or 2,500-session success claim is made |
 | Workflows | CI now runs the load-scenario contract gate; release-readiness remains manual-only and has no deploy/submit command |
@@ -60,7 +63,7 @@ Observed warnings/limitations: Vite reported a web chunk above 500 kB after mini
 - [ ] Functions deploy and synthetic consented requests pass with content-free logs.
 - [ ] EAS public environment contains the production Supabase URL/publishable key; no service-role/provider secret is present in the app or web bundles.
 - [ ] Account deletion removes the authenticated user, owner-scoped logo, synced records, local cache, outbox, conflicts, session, consent, and temporary artifacts.
-- [x] Merge commit `703b3ef5a4ac5f9369e976c9969facb5173ab682` deployed successfully through GitHub Pages. Privacy, Terms, and Support each returned HTTPS 200 anonymously on 2026-08-11 and matched the tracked `public/` release file byte for byte.
+- [x] Merge commit `703b3ef5a4ac5f9369e976c9969facb5173ab682` deployed successfully through GitHub Pages. Privacy, Terms, and Support each returned HTTPS 200 anonymously again on 2026-08-14 and matched the tracked `public/` release file byte for byte.
 - [ ] Reconcile those published pages once more against the final deployed Supabase functions, provider retention settings, deletion behavior, and product limits immediately before submission.
 - [ ] App Store privacy answers match the final production binary and deployed services.
 - [ ] RevenueCat App Store app, `FieldCraft Pro` subscription group, exact products, `pro` entitlement, `default` offering, webhook secret, and restore-transfer behavior are configured and directly verified.
@@ -77,6 +80,7 @@ Observed warnings/limitations: Vite reported a web chunk above 500 kB after mini
 - [ ] Production archive built with Xcode 26+ and iOS 26 SDK+ (requirement recheck observed 2026-08-06; recheck again on build day).
 - [ ] Required-reason API/privacy manifest report passes for the archive.
 - [ ] Export compliance and Apple's updated age-rating questionnaire completed for the exact submitted version.
+- [ ] The age-rating form's social-media-capability response is entered as `No`, matching the submitted binary; change it only after a fresh capability/policy review.
 - [ ] App Privacy including Purchase History, support URL, privacy URL, Terms of Use, description, keywords, review notes, and private review account completed.
 - [ ] Accessibility Nutrition Label answers are based on the signed-device VoiceOver, Voice Control, Larger Text, contrast, and Reduce Motion results above; no unverified support is claimed.
 - [ ] Product page name, icon, subtitle, description, promotional text, keywords, and 1–10 screenshots are complete, accurate, localized where offered, and contain no placeholder or private data.
@@ -93,4 +97,4 @@ Observed warnings/limitations: Vite reported a web chunk above 500 kB after mini
 
 ## Current stop condition
 
-The repository-controlled gates for the current candidate pass, and the deployed legal/support pages match the tracked release files. EAS reported `Not logged in` on 2026-08-10, Supabase CLI has no authorized project session, and this Mac has Command Line Tools rather than full Xcode (CocoaPods 1.17.0 alone is insufficient). Provider deployment, live staging load, signed-device native/provider validation, sandbox purchases, TestFlight, and App Store submission stop at authorized Supabase, RevenueCat, Stripe, reminder-provider, Expo, Apple, and hardware prompts. No credential should be pasted into chat, source, shell history, CI logs, or this checklist.
+The repository-controlled gates for the current candidate pass, and the deployed legal/support pages match the tracked release files. EAS reported `Not logged in` on 2026-08-14, Supabase CLI has no authorized project session, and this Mac has Command Line Tools rather than full Xcode (CocoaPods 1.17.0 alone is insufficient). Provider deployment, live staging load, signed-device native/provider validation, sandbox purchases, TestFlight, and App Store submission stop at authorized Supabase, RevenueCat, Stripe, reminder-provider, Expo, Apple, and hardware prompts. No credential should be pasted into chat, source, shell history, CI logs, or this checklist.

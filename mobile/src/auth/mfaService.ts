@@ -89,7 +89,9 @@ const pendingMfaEnrollmentStore: PendingMfaEnrollmentStore = {
   }),
   set: (factorId) => serializeSecureStore(async () => {
     try {
-      await SecureStore.setItemAsync(PENDING_ENROLLMENT_KEY, requireFactorId(factorId))
+      await SecureStore.setItemAsync(PENDING_ENROLLMENT_KEY, requireFactorId(factorId), {
+        keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+      })
     } catch {
       throw new MfaOperationError('MFA_UNAVAILABLE')
     }

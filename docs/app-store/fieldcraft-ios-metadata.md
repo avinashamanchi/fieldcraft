@@ -1,6 +1,6 @@
 # FieldCraft iOS App Store metadata draft
 
-Last reviewed: 2026-08-11. This is a credential-free draft, not proof of an App Store Connect submission. The first release is iPhone-only; iPad support is deferred until its layout and device matrix are validated. The complete applicability record is `apple-review-guideline-applicability.md`.
+Last reviewed: 2026-08-14. This is a credential-free draft, not proof of an App Store Connect submission. The first release is iPhone-only; iPad support is deferred until its layout and device matrix are validated. The complete applicability record is `apple-review-guideline-applicability.md`.
 
 ## Listing
 
@@ -88,4 +88,4 @@ Confirm this against the deployed production configuration immediately before su
 
 ## Truthful release status
 
-The source package is prepared only. Privacy, Terms, and Support returned HTTPS 200 anonymously on 2026-08-11 after the final `main` merge, and each response matched its tracked `public/` release file byte for byte. Recheck all three URLs immediately before submission. Supabase migrations/functions, RevenueCat products/offering/webhook, Stripe/reminder-provider configuration, the production EAS environment, signed native/provider/purchase tests, live staging load, screenshots, App Store Connect forms, upload, review, acceptance, and publication remain pending.
+The source package is prepared only. Privacy, Terms, and Support returned HTTPS 200 anonymously again on 2026-08-14, and each response matched its tracked `public/` release file byte for byte. Recheck all three URLs immediately before submission. Supabase migrations/functions, RevenueCat products/offering/webhook, Stripe/reminder-provider configuration, the production EAS environment, signed native/provider/purchase tests, live staging load, screenshots, App Store Connect forms, upload, review, acceptance, and publication remain pending.

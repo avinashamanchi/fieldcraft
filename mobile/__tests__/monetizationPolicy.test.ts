@@ -91,9 +91,9 @@ describe('FieldCraft production purchase configuration', () => {
 
   const configureValidProduction = () => {
     process.env.EAS_BUILD_PROFILE = 'production'
-    process.env.EXPO_PUBLIC_REVENUECAT_APPLE_API_KEY = 'appl_public_fieldcraft_example'
+    process.env.EXPO_PUBLIC_REVENUECAT_APPLE_API_KEY = 'appl_Q7mP2xR9kL4vN8sT6yW3'
     process.env.EXPO_PUBLIC_SUPABASE_URL = 'https://project-ref.supabase.co'
-    process.env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_fieldcraft_example'
+    process.env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_Q7mP2xR9kL4vN8sT6yW3'
   }
 
   it('fails a production build without a valid public RevenueCat iOS key', () => {
@@ -101,6 +101,8 @@ describe('FieldCraft production purchase configuration', () => {
     delete process.env.EXPO_PUBLIC_REVENUECAT_APPLE_API_KEY
     expect(() => appConfig({ config: {} } as never)).toThrow('EXPO_PUBLIC_REVENUECAT_APPLE_API_KEY')
     process.env.EXPO_PUBLIC_REVENUECAT_APPLE_API_KEY = 'not-a-public-ios-key'
+    expect(() => appConfig({ config: {} } as never)).toThrow('EXPO_PUBLIC_REVENUECAT_APPLE_API_KEY')
+    process.env.EXPO_PUBLIC_REVENUECAT_APPLE_API_KEY = 'appl_replace_with_revenuecat_public_sdk_key'
     expect(() => appConfig({ config: {} } as never)).toThrow('EXPO_PUBLIC_REVENUECAT_APPLE_API_KEY')
   })
 
@@ -110,12 +112,15 @@ describe('FieldCraft production purchase configuration', () => {
   })
 
   it.each([
-    ['missing URL', undefined, 'sb_publishable_fieldcraft_example'],
-    ['insecure URL', 'http://project-ref.supabase.co', 'sb_publishable_fieldcraft_example'],
-    ['URL with credentials', 'https://user:pass@project-ref.supabase.co', 'sb_publishable_fieldcraft_example'],
-    ['placeholder URL', 'https://your-project-id.supabase.co', 'sb_publishable_fieldcraft_example'],
+    ['missing URL', undefined, 'sb_publishable_Q7mP2xR9kL4vN8sT6yW3'],
+    ['insecure URL', 'http://project-ref.supabase.co', 'sb_publishable_Q7mP2xR9kL4vN8sT6yW3'],
+    ['URL with credentials', 'https://user:pass@project-ref.supabase.co', 'sb_publishable_Q7mP2xR9kL4vN8sT6yW3'],
+    ['placeholder URL', 'https://your-project-id.supabase.co', 'sb_publishable_Q7mP2xR9kL4vN8sT6yW3'],
+    ['non-Supabase host', 'https://data.attacker.invalid', 'sb_publishable_Q7mP2xR9kL4vN8sT6yW3'],
+    ['URL path', 'https://project-ref.supabase.co/rest/v1', 'sb_publishable_Q7mP2xR9kL4vN8sT6yW3'],
     ['missing key', 'https://project-ref.supabase.co', undefined],
     ['placeholder key', 'https://project-ref.supabase.co', 'your-anon-key-here'],
+    ['placeholder publishable key', 'https://project-ref.supabase.co', 'sb_publishable_fieldcraft_example'],
     ['service-role-like key', 'https://project-ref.supabase.co', 'service_role_super_secret_value'],
   ] as const)('fails a production build for unsafe Supabase configuration: %s', (_label, url, key) => {
     configureValidProduction()

@@ -3,10 +3,19 @@ import type { ConfigContext, ExpoConfig } from 'expo/config'
 const SUPABASE_EXAMPLE_URL = 'https://your-project-id.supabase.co'
 const SUPABASE_EXAMPLE_KEY = 'your-anon-key-here'
 const MODERN_SUPABASE_KEY = /^sb_publishable_[A-Za-z0-9_-]+$/
+const SUPABASE_CLOUD_HOST = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.supabase\.co$/
 const JWT_SEGMENT = /^[A-Za-z0-9_-]+$/
+const REVENUECAT_APPLE_PUBLIC_KEY = /^appl_[A-Za-z0-9_-]{12,}$/
+
+const isRevenueCatApplePublicKey = (key: string): boolean => (
+  REVENUECAT_APPLE_PUBLIC_KEY.test(key)
+  && !/(?:example|placeholder|replace|your|test)/i.test(key)
+)
 
 const isAnonSupabaseKey = (key: string): boolean => {
-  if (MODERN_SUPABASE_KEY.test(key)) return true
+  if (MODERN_SUPABASE_KEY.test(key)) {
+    return !/(?:example|placeholder|replace_with|your[-_])/i.test(key)
+  }
   const segments = key.split('.')
   if (segments.length !== 3 || segments.some((segment) => !JWT_SEGMENT.test(segment))) return false
   try {
@@ -28,8 +37,10 @@ const hasSafeSupabaseConfiguration = (url: string, key: string): boolean => {
     return parsed.protocol === 'https:'
       && parsed.username === ''
       && parsed.password === ''
+      && parsed.pathname === '/'
       && parsed.search === ''
       && parsed.hash === ''
+      && SUPABASE_CLOUD_HOST.test(parsed.hostname.toLowerCase())
   } catch {
     return false
   }
@@ -42,7 +53,7 @@ export default function appConfig(_context: ConfigContext): ExpoConfig {
   const supabasePublishableKey = process.env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY?.trim() ?? ''
   if (
     process.env.EAS_BUILD_PROFILE === 'production' &&
-    !/^appl_[A-Za-z0-9_-]{8,}$/.test(revenueCatAppleApiKey)
+    !isRevenueCatApplePublicKey(revenueCatAppleApiKey)
   ) {
     throw new Error('EXPO_PUBLIC_REVENUECAT_APPLE_API_KEY is required for production builds')
   }
@@ -69,6 +80,35 @@ export default function appConfig(_context: ConfigContext): ExpoConfig {
       icon: './assets/icon.png',
       supportsTablet: false,
       usesAppleSignIn: false,
+      privacyManifests: {
+        NSPrivacyTracking: false,
+        NSPrivacyTrackingDomains: [],
+        NSPrivacyAccessedAPITypes: [],
+        NSPrivacyCollectedDataTypes: ([
+          'NSPrivacyCollectedDataTypeName',
+          'NSPrivacyCollectedDataTypeEmailAddress',
+          'NSPrivacyCollectedDataTypePhoneNumber',
+          'NSPrivacyCollectedDataTypePhysicalAddress',
+          'NSPrivacyCollectedDataTypeOtherUserContactInfo',
+          'NSPrivacyCollectedDataTypeUserID',
+          'NSPrivacyCollectedDataTypePurchaseHistory',
+          'NSPrivacyCollectedDataTypeOtherFinancialInfo',
+          'NSPrivacyCollectedDataTypeOtherUserContent',
+          'NSPrivacyCollectedDataTypeProductInteraction',
+          'NSPrivacyCollectedDataTypePerformanceData',
+          'NSPrivacyCollectedDataTypeOtherDiagnosticData',
+        ] as const).map((NSPrivacyCollectedDataType) => ({
+          NSPrivacyCollectedDataType,
+          NSPrivacyCollectedDataTypeLinked: true,
+          NSPrivacyCollectedDataTypeTracking: false,
+          NSPrivacyCollectedDataTypePurposes: NSPrivacyCollectedDataType === 'NSPrivacyCollectedDataTypePurchaseHistory'
+            ? [
+              'NSPrivacyCollectedDataTypePurposeAppFunctionality',
+              'NSPrivacyCollectedDataTypePurposeAnalytics',
+            ]
+            : ['NSPrivacyCollectedDataTypePurposeAppFunctionality'],
+        })),
+      },
       infoPlist: {
         ITSAppUsesNonExemptEncryption: false,
         NSMicrophoneUsageDescription: 'FieldCraft uses the microphone only while you record a job description for an editable invoice draft.',
