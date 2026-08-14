@@ -99,7 +99,9 @@ export const createOwnerErasureRegistry = (
       await backend.setItemAsync(STORAGE_KEY, JSON.stringify({
         version: 1,
         ownerIds: [...journal.ownerIds, canonicalOwnerId],
-      } satisfies OwnerErasureJournal))
+      } satisfies OwnerErasureJournal), {
+        keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+      })
     } catch {
       throw stableFailure()
     }
@@ -117,7 +119,9 @@ export const createOwnerErasureRegistry = (
         await backend.setItemAsync(STORAGE_KEY, JSON.stringify({
           version: 1,
           ownerIds: remaining,
-        } satisfies OwnerErasureJournal))
+        } satisfies OwnerErasureJournal), {
+          keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+        })
       }
     } catch {
       throw stableFailure()

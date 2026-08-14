@@ -1,4 +1,12 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native'
+import * as SecureStore from 'expo-secure-store'
+
+jest.mock('expo-secure-store', () => ({
+  WHEN_UNLOCKED_THIS_DEVICE_ONLY: 'when-unlocked-device-only',
+  getItemAsync: jest.fn(),
+  setItemAsync: jest.fn(),
+  deleteItemAsync: jest.fn(),
+}))
 
 import type { AuthenticatedOwnerLease } from '../src/auth/AuthProvider'
 import { createMfaService } from '../src/auth/mfaService'
@@ -36,6 +44,39 @@ const emptyPendingEnrollmentStore = () => ({
   get: jest.fn().mockResolvedValue(null),
   set: jest.fn().mockResolvedValue(undefined),
   clear: jest.fn().mockResolvedValue(undefined),
+})
+
+it('stores an unverified MFA factor only in the unlocked, device-only keychain class', async () => {
+  jest.mocked(SecureStore.setItemAsync).mockResolvedValue(undefined)
+  const service = createMfaService({
+    auth: {
+      mfa: {
+        enroll: jest.fn().mockResolvedValue({
+          data: {
+            id: 'factor-device-only',
+            totp: {
+              qr_code: 'data:image/svg+xml;utf8,%3Csvg%3E%3C/svg%3E',
+              secret: 'JBSWY3DPEHPK3PXP',
+              uri: 'otpauth://totp/FieldCraft?secret=JBSWY3DPEHPK3PXP',
+            },
+          },
+          error: null,
+        }),
+        challenge: jest.fn(),
+        verify: jest.fn(),
+        listFactors: jest.fn(),
+        unenroll: jest.fn(),
+      },
+    },
+  })
+
+  await service.enrollTotp()
+
+  expect(SecureStore.setItemAsync).toHaveBeenCalledWith(
+    'fieldcraft.pending-mfa-enrollment.v1',
+    'factor-device-only',
+    { keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY },
+  )
 })
 
 it('uses Supabase TOTP enrollment and challenge-and-verify without exposing provider errors', async () => {

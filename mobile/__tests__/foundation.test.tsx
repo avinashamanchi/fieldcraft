@@ -73,6 +73,27 @@ it('uses the exact FieldCraft iOS identity', () => {
   expect(config.ios?.usesAppleSignIn).toBe(false)
   expect(config.ios?.supportsTablet).toBe(false)
   expect(config.ios?.infoPlist?.ITSAppUsesNonExemptEncryption).toBe(false)
+  expect(config.ios?.privacyManifests?.NSPrivacyTracking).toBe(false)
+  expect(config.ios?.privacyManifests?.NSPrivacyTrackingDomains).toEqual([])
+  expect(config.ios?.privacyManifests?.NSPrivacyCollectedDataTypes?.map(
+    (entry) => entry.NSPrivacyCollectedDataType,
+  )).toEqual([
+    'NSPrivacyCollectedDataTypeName',
+    'NSPrivacyCollectedDataTypeEmailAddress',
+    'NSPrivacyCollectedDataTypePhoneNumber',
+    'NSPrivacyCollectedDataTypePhysicalAddress',
+    'NSPrivacyCollectedDataTypeOtherUserContactInfo',
+    'NSPrivacyCollectedDataTypeUserID',
+    'NSPrivacyCollectedDataTypePurchaseHistory',
+    'NSPrivacyCollectedDataTypeOtherFinancialInfo',
+    'NSPrivacyCollectedDataTypeOtherUserContent',
+    'NSPrivacyCollectedDataTypeProductInteraction',
+    'NSPrivacyCollectedDataTypePerformanceData',
+    'NSPrivacyCollectedDataTypeOtherDiagnosticData',
+  ])
+  expect(config.ios?.privacyManifests?.NSPrivacyCollectedDataTypes?.every(
+    (entry) => entry.NSPrivacyCollectedDataTypeTracking === false,
+  )).toBe(true)
   expect(config.updates).toEqual({ enabled: false })
   expect(config.plugins).toContainEqual([
     'expo-secure-store',

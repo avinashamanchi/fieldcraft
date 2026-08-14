@@ -20,9 +20,23 @@ type CleanupJournal = { version: 1; generations: CleanupGeneration[] }
 
 export type SecureStoreBackend = {
   getItemAsync(key: string): Promise<string | null>
-  setItemAsync(key: string, value: string): Promise<void>
+  setItemAsync(
+    key: string,
+    value: string,
+    options?: Parameters<typeof SecureStore.setItemAsync>[2],
+  ): Promise<void>
   deleteItemAsync(key: string): Promise<void>
 }
+
+const DEVICE_ONLY_KEYCHAIN_OPTIONS = Object.freeze({
+  keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+})
+
+const setDeviceOnlyItem = (
+  backend: SecureStoreBackend,
+  key: string,
+  value: string,
+): Promise<void> => backend.setItemAsync(key, value, DEVICE_ONLY_KEYCHAIN_OPTIONS)
 
 export class SecureAuthStorageError extends Error {
   constructor() {
@@ -138,7 +152,7 @@ const persistCleanupJournal = async (
     return
   }
   const journal: CleanupJournal = { version: 1, generations: deduped }
-  await backend.setItemAsync(cleanupKey(key), JSON.stringify(journal))
+  await setDeviceOnlyItem(backend, cleanupKey(key), JSON.stringify(journal))
 }
 
 const retryCleanup = async (backend: SecureStoreBackend, key: string): Promise<void> => {
@@ -244,12 +258,13 @@ export const createSecureStoreAuthStorage = (
 
           try {
             for (let index = 0; index < chunks; index += 1) {
-              await backend.setItemAsync(
+              await setDeviceOnlyItem(
+                backend,
                 chunkKey(key, generation, index),
                 value.slice(index * CHUNK_CODE_UNITS, (index + 1) * CHUNK_CODE_UNITS),
               )
             }
-            await backend.setItemAsync(manifestKey(key), JSON.stringify(next))
+            await setDeviceOnlyItem(backend, manifestKey(key), JSON.stringify(next))
           } catch {
             try {
               await retryCleanup(backend, key)
